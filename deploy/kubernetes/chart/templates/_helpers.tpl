@@ -271,6 +271,8 @@ http {
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
+            proxy_buffering off;
+            proxy_request_buffering off;
             proxy_read_timeout 7206s;
             proxy_send_timeout 7206s;
 
