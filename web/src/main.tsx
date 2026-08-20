@@ -13,6 +13,7 @@ import { ThemeProvider } from '@/components/ThemeProvider';
 import OverviewPage from '@/pages/Overview';
 import SandboxesPage from '@/pages/Sandboxes';
 import SandboxDetailPage from '@/pages/SandboxDetail';
+import SandboxTerminalPage from '@/pages/SandboxTerminal';
 import SandboxNewPage from '@/pages/SandboxNew';
 import TemplatesPage from '@/pages/Templates';
 import NodesPage from '@/pages/Nodes';
@@ -52,6 +53,7 @@ const App = () => (
                 <Route path="/sandboxes" element={<SandboxesPage />} />
                 <Route path="/sandboxes/new" element={<SandboxNewPage />} />
                 <Route path="/sandboxes/:sandboxID" element={<SandboxDetailPage />} />
+                <Route path="/sandboxes/:sandboxID/terminal" element={<SandboxTerminalPage />} />
                 <Route path="/templates" element={<TemplatesPage />} />
                 <Route path="/templates/:templateID" element={<TemplateDetailPage />} />
                 <Route path="/nodes" element={<NodesPage />} />

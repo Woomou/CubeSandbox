@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 
 import { Skeleton } from '@/components/ui/skeleton';
-import { ArrowLeft, Pause, Play, Trash2, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Pause, Play, Trash2, RefreshCw, SquareTerminal } from 'lucide-react';
 import { cn, formatBytes, formatRelative } from '@/lib/utils';
 import { formatSandboxActionError } from '@/lib/sandboxActionError';
 import { SandboxActionErrorBanner } from '@/components/SandboxActionErrorBanner';
@@ -219,6 +219,13 @@ export default function SandboxDetailPage() {
         </div>
         {data ? (
           <div className="flex gap-2">
+            {state === 'running' ? (
+              <Button variant="default" asChild>
+                <Link to={`/sandboxes/${encodeURIComponent(sandboxID)}/terminal`}>
+                  <SquareTerminal size={14} /> {t('actions.terminal')}
+                </Link>
+              </Button>
+            ) : null}
             {state === 'paused' ? (
               <Button variant="outline" onClick={() => resume.mutate()} disabled={resume.isPending}>
                 <Play size={14} /> {t('actions.resume')}

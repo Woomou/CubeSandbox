@@ -205,6 +205,8 @@ export const sandboxApi = {
     limit?: number;
   }) => api<ListedSandboxDto[]>('/v2/sandboxes', { params }).then((items) => items.map(mapSandbox)),
   get: (id: string) => api<SandboxDetailDto>(`/sandboxes/${id}`).then(mapSandboxDetail),
+  connect: (id: string) =>
+    api<SandboxSessionDto>(`/sandboxes/${id}/connect`, { method: 'POST', body: '{}' }),
   kill: (id: string) => api<void>(`/sandboxes/${id}`, { method: 'DELETE' }),
   pause: (id: string) => api<void>(`/sandboxes/${id}/pause`, { method: 'POST' }),
   resume: (id: string, body: SandboxResumeRequest = DEFAULT_RESUME_BODY) =>
