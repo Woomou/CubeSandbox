@@ -695,6 +695,7 @@ export interface LoginResponseDto {
 
 export const authApi = {
   session: () => ops<SessionDto>('/auth/session'),
+  sso: () => ops<LoginResponseDto>('/auth/sso', { method: 'POST' }),
   login: (body: { username: string; password: string }) =>
     ops<LoginResponseDto>('/auth/login', { method: 'POST', body: JSON.stringify(body) }).then(
       (resp) => {

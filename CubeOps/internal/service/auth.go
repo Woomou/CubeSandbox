@@ -115,6 +115,32 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (*Lo
 	}, nil
 }
 
+// LoginTrustedIdentity issues a CubeOps session for an identity that was
+// authenticated by a trusted reverse proxy. The HTTP layer must only call
+// this method with a value from a proxy-controlled header.
+func (s *AuthService) LoginTrustedIdentity(ctx context.Context, username string) (*LoginResult, error) {
+	if username == "" {
+		return nil, errors.New("trusted identity is required")
+	}
+	accessToken, err := s.jm.GenerateAccessToken(username)
+	if err != nil {
+		return nil, fmt.Errorf("generate access token: %w", err)
+	}
+	refreshToken, tokenID, err := s.jm.GenerateRefreshToken(username)
+	if err != nil {
+		return nil, fmt.Errorf("generate refresh token: %w", err)
+	}
+	if err := s.store.CreateRefreshToken(ctx, tokenID, username); err != nil {
+		return nil, fmt.Errorf("persist refresh token: %w", err)
+	}
+	return &LoginResult{
+		AccessToken:   accessToken,
+		RefreshToken:  refreshToken,
+		Username:      username,
+		ExpiresInSecs: int64(s.jm.AccessTTL().Seconds()),
+	}, nil
+}
+
 // Refresh exchanges a refresh token for a new access token AND a new refresh
 // token (rotation). The old refresh token is revoked, so a stolen token
 // cannot be replayed after the legitimate user refreshes.
