@@ -21,9 +21,6 @@ func init() { gin.SetMode(gin.TestMode) }
 // field controls one method; nil fields return an error so tests fail loud
 // if a handler calls a method the test didn't set up.
 type fakeCM struct {
-	getNodes                    func(ctx context.Context) (json.RawMessage, error)
-	clusterVersions             func(ctx context.Context) (json.RawMessage, error)
-	getNode                     func(ctx context.Context, nodeID string) (json.RawMessage, error)
 	listSandboxes               func(ctx context.Context) (json.RawMessage, error)
 	getSandbox                  func(ctx context.Context, sandboxID, instanceType string) (json.RawMessage, error)
 	createSandbox               func(ctx context.Context, body interface{}) (json.RawMessage, error)
@@ -36,6 +33,7 @@ type fakeCM struct {
 	listSandboxesWithBody       func(ctx context.Context, body interface{}) (json.RawMessage, error)
 	createSnapshot              func(ctx context.Context, body interface{}) (json.RawMessage, error)
 	listSnapshots               func(ctx context.Context, params map[string]string) (json.RawMessage, error)
+	getSnapshot                 func(ctx context.Context, snapshotID string) (json.RawMessage, error)
 	deleteSnapshot              func(ctx context.Context, snapshotID string) (json.RawMessage, error)
 	rollbackSandbox             func(ctx context.Context, sandboxID string, body interface{}) (json.RawMessage, error)
 	listTemplates               func(ctx context.Context, templateID string, includeRequest bool) (json.RawMessage, error)
@@ -48,24 +46,6 @@ type fakeCM struct {
 	adoptTemplateCompatBaseline func(ctx context.Context, body interface{}) (json.RawMessage, error)
 }
 
-func (f *fakeCM) GetNodes(ctx context.Context) (json.RawMessage, error) {
-	if f.getNodes == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.getNodes(ctx)
-}
-func (f *fakeCM) ClusterVersions(ctx context.Context) (json.RawMessage, error) {
-	if f.clusterVersions == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.clusterVersions(ctx)
-}
-func (f *fakeCM) GetNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
-	if f.getNode == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.getNode(ctx, nodeID)
-}
 func (f *fakeCM) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	if f.listSandboxes == nil {
 		return nil, errFakeNotConfigured
@@ -147,6 +127,12 @@ func (f *fakeCM) ListSnapshots(ctx context.Context, params map[string]string) (j
 		return nil, errFakeNotConfigured
 	}
 	return f.listSnapshots(ctx, params)
+}
+func (f *fakeCM) GetSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error) {
+	if f.getSnapshot == nil {
+		return nil, errFakeNotConfigured
+	}
+	return f.getSnapshot(ctx, snapshotID)
 }
 func (f *fakeCM) DeleteSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error) {
 	if f.deleteSnapshot == nil {

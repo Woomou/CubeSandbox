@@ -6,11 +6,11 @@ from __future__ import annotations
 import json
 import logging
 import struct
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, Literal, Union, overload
 
 logger = logging.getLogger(__name__)
 
-from ._commands import DEFAULT_ENVD_USER, ENVD_PORT, MAX_CONNECT_ENVELOPE_SIZE
+from ._commands import DEFAULT_ENVD_USER, ENVD_PORT, MAX_CONNECT_ENVELOPE_SIZE, _user_headers
 from ._exceptions import FilesystemNotFoundError, PartialWriteError
 
 if TYPE_CHECKING:
@@ -37,15 +37,24 @@ class Filesystem:
             headers["X-Access-Token"] = access_token
         return headers
 
-    def _filesystem_rpc(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _filesystem_rpc(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        user: str | None = None,
+    ) -> dict[str, Any]:
         self._ensure_client()
         headers = self._base_headers()
         headers["Content-Type"] = "application/json"
         headers["Connect-Protocol-Version"] = CONNECT_PROTOCOL_VERSION
 
+        req_payload = dict(payload)
+        headers.update(_user_headers(user))
+
         resp = self._sandbox._client.post(
             f"http://{self._sandbox.get_host(ENVD_PORT)}/filesystem.Filesystem/{method}",
-            json=payload,
+            json=req_payload,
             headers=headers,
         )
         if resp.status_code >= 400:
@@ -65,8 +74,47 @@ class Filesystem:
             return {}
         return resp.json()
 
-    def read(self, path: str, *, user: str | None = None) -> str:
-        """Read a file through envd's HTTP file API."""
+    @overload
+    def read(
+        self,
+        path: str,
+        *,
+        format: Literal["text"] = "text",
+        user: str | None = None,
+    ) -> str: ...
+
+    @overload
+    def read(
+        self,
+        path: str,
+        *,
+        format: Literal["bytes"],
+        user: str | None = None,
+    ) -> bytearray: ...
+
+    @overload
+    def read(
+        self,
+        path: str,
+        *,
+        format: Literal["stream"],
+        user: str | None = None,
+    ) -> Iterator[bytes]: ...
+
+    def read(
+        self,
+        path: str,
+        *,
+        format: Literal["text", "bytes", "stream"] = "text",
+        user: str | None = None,
+    ) -> Union[str, bytearray, Iterator[bytes]]:
+        """Read a file through envd's HTTP file API.
+
+        Matches the e2b Python SDK surface: ``format`` is ``text`` (default),
+        ``bytes`` (``bytearray``), or ``stream`` (``Iterator[bytes]``). Without
+        ``format="bytes"``, a binary file is UTF-8-decoded and corrupted — a
+        PNG's ``0x89`` magic becomes the U+FFFD replacement character.
+        """
         self._ensure_client()
         effective_user = user or DEFAULT_ENVD_USER
 
@@ -85,6 +133,25 @@ class Filesystem:
                 body = {}
             message = body.get("message") or body.get("detail") or message
             raise IOError(f"Failed to read {path}: {message}")
+
+        # Mirror e2b: an explicit zero-length response short-circuits.
+        if resp.headers.get("content-length") == "0":
+            if format == "bytes":
+                return bytearray()
+            if format == "stream":
+                return iter(())
+            return ""
+
+        if format == "bytes":
+            return bytearray(resp.content)
+        if format == "stream":
+            data = resp.content
+
+            def _chunks() -> Iterator[bytes]:
+                if data:
+                    yield bytes(data)
+
+            return _chunks()
         return resp.text
 
     def write(self, path: str, data: str | bytes, *, user: str | None = None) -> None:
@@ -140,36 +207,36 @@ class Filesystem:
                 ) from e
         return len(files)
 
-    def list(self, path: str) -> list[dict[str, Any]]:
+    def list(self, path: str, *, user: str | None = None) -> list[dict[str, Any]]:
         """List entries in a directory."""
-        result = self._filesystem_rpc("ListDir", {"path": path})
+        result = self._filesystem_rpc("ListDir", {"path": path}, user=user)
         return result.get("entries", [])
 
-    def stat(self, path: str) -> dict[str, Any]:
+    def stat(self, path: str, *, user: str | None = None) -> dict[str, Any]:
         """Return metadata for a file or directory."""
-        result = self._filesystem_rpc("Stat", {"path": path})
+        result = self._filesystem_rpc("Stat", {"path": path}, user=user)
         return result.get("entry", {})
 
-    def exists(self, path: str) -> bool:
+    def exists(self, path: str, *, user: str | None = None) -> bool:
         """Return True if the path exists inside the sandbox."""
         try:
-            self.stat(path)
+            self.stat(path, user=user)
             return True
         except FilesystemNotFoundError:
             return False
 
-    def remove(self, path: str) -> None:
+    def remove(self, path: str, *, user: str | None = None) -> None:
         """Delete a file or directory inside the sandbox."""
-        self._filesystem_rpc("Remove", {"path": path})
+        self._filesystem_rpc("Remove", {"path": path}, user=user)
 
-    def rename(self, old_path: str, new_path: str) -> dict[str, Any]:
+    def rename(self, old_path: str, new_path: str, *, user: str | None = None) -> dict[str, Any]:
         """Move or rename a file or directory."""
-        result = self._filesystem_rpc("Move", {"source": old_path, "destination": new_path})
+        result = self._filesystem_rpc("Move", {"source": old_path, "destination": new_path}, user=user)
         return result.get("entry", {})
 
-    def make_dir(self, path: str) -> dict[str, Any]:
+    def make_dir(self, path: str, *, user: str | None = None) -> dict[str, Any]:
         """Create a directory inside the sandbox."""
-        result = self._filesystem_rpc("MakeDir", {"path": path})
+        result = self._filesystem_rpc("MakeDir", {"path": path}, user=user)
         return result.get("entry", {})
 
     def watch_dir(self, path: str) -> Watcher:

@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use container_mgr::{ContainerInfo, ContainerState, TaskState};
 use containerd_shim::protos::protobuf::MessageDyn;
 use containerd_shim::{Error, Result};
-use exec::{Exec, Tty};
+use exec::{resolve_pty_size, Exec, Tty};
 use oci_spec::runtime::{LinuxResources, Mount, Process, Spec};
 use protoc::{agent, agent_ttrpc, oci};
 use serde_json;
@@ -115,6 +115,21 @@ impl LogForwardHandle {
         }
     }
 
+    /// Signal the current task to stop without awaiting it: pause needs the
+    /// loops dead after the VM teardown but must not pay their exit wait (one
+    /// 200 ms retry sleep).  A later drain() still awaits the signalled task,
+    /// so start_log_forward's drain-before-reopen guarantee is unaffected.
+    async fn cancel_detached(&self) {
+        let _lifecycle = self.acquire().await;
+        let cancel = {
+            let mut slot = self.slot.lock().await;
+            slot.cancel.take()
+        };
+        if let Some(tx) = cancel {
+            let _ = tx.send(true);
+        }
+    }
+
     /// Install a freshly started task.  Caller must hold the lifecycle permit
     /// and must have already drained any previous task.
     async fn store(
@@ -135,6 +150,56 @@ fn validate_log_path_component(id: &str) -> CResult<()> {
     Ok(())
 }
 
+/// Host directory for regular-sandbox init logs. Template builds stay under
+/// `/data/log/template`. cubecli reads this path without entering a mount ns.
+pub const SANDBOX_LOG_ROOT: &str = "/data/cubelet/log";
+
+pub fn sandbox_log_dir(sandbox_id: &str) -> CResult<PathBuf> {
+    validate_log_path_component(sandbox_id)?;
+    Ok(PathBuf::from(SANDBOX_LOG_ROOT).join(sandbox_id))
+}
+
+pub async fn create_sandbox_log_paths(sandbox_id: &str) -> CResult<(String, String)> {
+    let dir = sandbox_log_dir(sandbox_id)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("create log dir {}: {}", dir.display(), e))?;
+    let stdout = dir.join("stdout");
+    let stderr = dir.join("stderr");
+    // Pause reaps the previous shim via binary delete and removes this
+    // directory. Resume is a new shim and must recreate the files.
+    for path in [&stdout, &stderr] {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| format!("create log file {}: {}", path.display(), e))?;
+    }
+    Ok((
+        stdout.to_string_lossy().into_owned(),
+        stderr.to_string_lossy().into_owned(),
+    ))
+}
+
+/// Sync cleanup used by the shim `delete` subcommand (`clean_sandbox_resource`)
+/// so a crashed shim still drops `/data/cubelet/log/<id>` when containerd
+/// reaps the leftover task.
+pub fn remove_sandbox_log_dir_sync(sandbox_id: &str) -> CResult<()> {
+    let dir = sandbox_log_dir(sandbox_id)?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("del {} failed:{}", dir.display(), e)),
+    }
+}
+
+pub async fn remove_sandbox_log_dir(sandbox_id: &str, log: &Log) {
+    if let Err(e) = remove_sandbox_log_dir_sync(sandbox_id) {
+        warnf!(log, "remove sandbox log dir: {}", e);
+    }
+}
+
 #[derive(Clone)]
 pub struct Container {
     sandbox_id: String,
@@ -151,8 +216,8 @@ pub struct Container {
     execs: Arc<Mutex<HashMap<String, Exec>>>,
     app_snapshot: bool,
     /// Background task forwarding container stdout/stderr to log files.
-    /// Template creation: /data/log/template/<id>/stdout|stderr (755 dir).
-    /// Normal sandbox: ./stdout and ./stderr relative to the bundle directory.
+    /// Template creation: /data/log/template/<id>/stdout|stderr.
+    /// Normal sandbox: /data/cubelet/log/<sandbox-id>/stdout|stderr.
     /// Clones share the task ownership so exactly one caller takes and awaits
     /// it; start/stop are serialized across clones by an internal semaphore.
     log_forward: LogForwardHandle,
@@ -244,12 +309,20 @@ impl Container {
         Ok(())
     }
 
-    /// Stop init log forwarding (stdout/stderr).  Wakes the select! loops in
-    /// forward_init_log_stdout/stderr and awaits the background task so vsock
-    /// reads are finished before pause, snapshot, or destroy proceeds.
+    /// Stop init log forwarding (stdout/stderr): wakes the select! loops in
+    /// forward_init_log_stdout/stderr and awaits the task.  Destroy and
+    /// rollback call this before touching the VM; pause uses
+    /// stop_log_forward_detached after the VM is torn down.
     pub async fn stop_log_forward(&mut self) {
         let _lifecycle = self.log_forward.acquire().await;
         self.log_forward.drain().await;
+    }
+
+    /// Signal the init log forwarders to stop without awaiting them: pause
+    /// stops them only after the VM is torn down (their connections cross the
+    /// freeze) and must not pay the drain wait.
+    pub async fn stop_log_forward_detached(&mut self) {
+        self.log_forward.cancel_detached().await;
     }
 
     pub async fn unset_client(&mut self) {
@@ -260,6 +333,24 @@ impl Container {
             self.state = None;
         }
         self.client = None;
+    }
+
+    /// unset_client without the wait / log-forwarder teardown (the pause path
+    /// has already handled both).
+    pub fn clear_client(&mut self) {
+        self.client = None;
+    }
+
+    /// Pause-time teardown that keeps the agent client and its fwd log conns
+    /// alive across the VM freeze (the guest is told via RST-on-restore; see
+    /// SandBox::quiesce_agent_for_pause). The fwd tasks are stopped after the
+    /// VM teardown and restart on resume.
+    pub async fn quiesce_for_pause(&mut self) {
+        //terminate the wait req
+        if self.state.is_some() {
+            self.state.as_ref().unwrap().notify_vm_pause().await;
+            self.state = None;
+        }
     }
 
     fn get_storages(&mut self) -> CResult<Vec<agent::Storage>> {
@@ -359,7 +450,7 @@ impl Container {
             .map_err(|e| format!("deserialize spec failed:{}", e))?;
 
         let proc = spec.mut_process();
-        proc.set_noNewPrivileges(false);
+        // Keep the caller's no_new_privs: the Cubelet already defaults it to false.
         proc.set_selinuxLabel(String::new());
 
         let res = spec.mut_linux().mut_resources();
@@ -506,16 +597,23 @@ impl Container {
         )
     }
 
+    /// True when the guest has no process for this container yet, so the agent
+    /// must create and start it. A memory restore (pause resume / FromSnap)
+    /// reconnects to the running process instead. The guest container id is not
+    /// a safe signal: after a cold restart it equals the sandbox id, which made
+    /// resume call StartContainer on a process that was already running.
     fn is_cold_start(&self) -> bool {
-        self.id == self.real_id
+        !self.sb_conf.app_snapshot_restore
     }
 
-    /// Template creation writes stdout/stderr to regular files under
-    /// /data/log/template. Regular files cannot be registered with epoll, so
-    /// keep that path on the legacy RPC log forwarder even when passfd is the
-    /// sandbox default.
+    /// Passfd stays compiled in but is opt-in. Cubelet must set
+    /// `cube.use_passfd_io=true` and publish nonempty stdout/stderr paths.
+    /// Template builds and the default cubelet path keep the RPC log forwarder.
     fn passfd_io_enabled(&self) -> bool {
-        self.sb_conf.use_passfd_io && !self.sb_conf.app_snapshot_create
+        self.sb_conf.use_passfd_io
+            && !self.sb_conf.app_snapshot_create
+            && !self.info.stdout.is_empty()
+            && !self.info.stderr.is_empty()
     }
 
     pub async fn create_container(&mut self) -> CResult<()> {
@@ -641,14 +739,13 @@ impl Container {
     /// Spawn a background task that streams container stdout/stderr from the
     /// agent (via a fresh vsock connection) and appends them to log files.
     /// Template creation writes to `/data/log/template/<id>/stdout|stderr`;
-    /// normal sandbox restore writes to `./stdout` and `./stderr` relative
-    /// to the shim's current working directory (the bundle directory).
+    /// normal sandboxes write to `/data/cubelet/log/<sandbox-id>/stdout|stderr`.
     ///
-    /// The task exits cleanly when `stop_log_forward` is called (pause /
-    /// snapshot / kill / destroy): a watch cancel signal is sent first so the
-    /// forwarding loops
-    /// wake immediately, then the caller awaits the handle to confirm the vsock
-    /// read has stopped before proceeding.
+    /// The task exits cleanly when `stop_log_forward` is called (kill /
+    /// destroy / rollback; pause signals via `stop_log_forward_detached`
+    /// after the VM is torn down): a watch cancel signal is sent first so the
+    /// forwarding loops wake immediately, then the caller awaits the handle
+    /// to confirm the vsock read has stopped before proceeding.
     pub async fn start_log_forward(&mut self) -> CResult<()> {
         // Cancel and await any previous instance before starting a new one.
         let _lifecycle = self.log_forward.acquire().await;
@@ -675,7 +772,7 @@ impl Container {
 
         // Write log files:
         //   - template creation: /data/log/template/<id>/stdout|stderr
-        //   - sandbox (restore): current working directory (bundle dir)
+        //   - regular sandbox: /data/cubelet/log/<sandbox-id>/stdout|stderr
         let (stdout_path, stderr_path) = if self.sb_conf.app_snapshot_create {
             validate_log_path_component(&self.info.id)?;
             let log_dir = format!("/data/log/template/{}", self.info.id);
@@ -688,7 +785,7 @@ impl Container {
             // already restrictive enough for log files.
             (format!("{}/stdout", log_dir), format!("{}/stderr", log_dir))
         } else {
-            ("stdout".to_string(), "stderr".to_string())
+            create_sandbox_log_paths(&self.sandbox_id).await?
         };
 
         // Init log forwarding is separate from exec I/O relay (forward_std).
@@ -715,11 +812,12 @@ impl Container {
         );
 
         // Create a watch cancel channel.  The tx is stored in the log_forward
-        // slot; on stop (pause / snapshot / kill / destroy) `stop_log_forward`
-        // calls `LogForwardHandle::drain()`, which takes the tx and sends true.
-        // The rx is cloned into each of forward_init_log_stdout and
-        // forward_init_log_stderr so both loops wake and exit immediately via
-        // tokio::select!.
+        // slot; on stop (kill / destroy / rollback) `stop_log_forward` calls
+        // `LogForwardHandle::drain()`, which takes the tx and sends true; pause
+        // signals it without waiting (stop_log_forward_detached, after the VM
+        // is torn down).  The rx is cloned into each of forward_init_log_stdout
+        // and forward_init_log_stderr so both loops wake and exit immediately
+        // via tokio::select!.
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let handle = log_exec
@@ -788,6 +886,76 @@ impl Container {
             return Err(Error::Other(format!("close_io failed: {}", err_msg)));
         }
 
+        Ok(())
+    }
+
+    async fn do_tty_win_resize(
+        &self,
+        client: &agent_ttrpc::AgentServiceClient,
+        exec_id: &String,
+        height: u32,
+        width: u32,
+    ) -> Result<()> {
+        let req = agent::TtyWinResizeRequest {
+            container_id: self.id.clone(),
+            exec_id: exec_id.clone(),
+            row: height,
+            column: width,
+            ..Default::default()
+        };
+        client
+            .tty_win_resize(self.ctx.clone(), &req)
+            .await
+            .map_err(|e| Error::Other(format!("tty_win_resize execid:{} failed:{}", exec_id, e)))?;
+        Ok(())
+    }
+
+    pub async fn resize_pty(&self, exec_id: &String, height: u32, width: u32) -> Result<()> {
+        if height == 0 || width == 0 {
+            return Ok(());
+        }
+        if !exec_id.is_empty() {
+            let mut execs = self.execs.lock().await;
+            match execs.get_mut(exec_id) {
+                Some(exec) => {
+                    exec.tty.height = height;
+                    exec.tty.width = width;
+                }
+                None => {
+                    return Err(Error::NotFoundError(format!(
+                        "Exec id:{} not found, container:{}",
+                        exec_id, &self.real_id
+                    )));
+                }
+            }
+        }
+
+        let client = match &self.client {
+            Some(c) => c.lock().await,
+            None => return Ok(()),
+        };
+        if let Err(e) = self
+            .do_tty_win_resize(&client, exec_id, height, width)
+            .await
+        {
+            let msg = e.to_string();
+            // Guest has no exec TTY yet before Start; keep the cached size.
+            if msg.contains("no tty")
+                || msg.contains("invalid argument")
+                || msg.contains("Invalid exec")
+                || msg.contains("not found")
+                || msg.contains("UNAVAILABLE")
+            {
+                warnf!(
+                    self.log,
+                    "resize_pty deferred, exec:{}, err:{}",
+                    exec_id,
+                    msg
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1005,6 +1173,21 @@ impl Container {
         proc.set_env(exec.proc.env().clone().unwrap_or(Vec::new()).into());
         proc.set_cwd(exec.proc.cwd().clone().to_str().unwrap_or("").to_string());
 
+        // HandleConsoleResize often arrives before Start; overlay the cached size.
+        let pty_size = {
+            let execs = self.execs.lock().await;
+            execs
+                .get(exec_id)
+                .and_then(|e| resolve_pty_size(&e.tty, e.proc.console_size()))
+                .or_else(|| resolve_pty_size(&exec.tty, exec.proc.console_size()))
+        };
+        if let Some((height, width)) = pty_size {
+            let mut console = oci::Box::new();
+            console.set_height(height);
+            console.set_width(width);
+            proc.set_consoleSize(console);
+        }
+
         let (stdin_port, stdout_port, stderr_port) = if self.passfd_io_enabled() {
             let (i, o, e) = crate::common::utils::AsyncUtils::setup_passfd_streams(
                 &self.sandbox_id,
@@ -1053,6 +1236,25 @@ impl Container {
             .exec_process(self.ctx.clone(), &req)
             .await
             .map_err(|e| Error::Other(format!("start execid:{} failed:{}", exec_id, e)))?;
+        if let Some((height, width)) = {
+            let execs = self.execs.lock().await;
+            execs
+                .get(exec_id)
+                .and_then(|e| resolve_pty_size(&e.tty, e.proc.console_size()))
+        } {
+            // rustjail openpty uses console_size; ioctl again for a pre-Start resize.
+            if let Err(e) = self
+                .do_tty_win_resize(&client, exec_id, height, width)
+                .await
+            {
+                warnf!(
+                    self.log,
+                    "tty_win_resize after start exec:{} failed:{}",
+                    exec_id,
+                    e
+                );
+            }
+        }
         let mut state = exec.state.clone().unwrap();
         let client_wait = client.clone();
         let cid = self.id.clone();
@@ -1249,6 +1451,27 @@ mod log_forward_tests {
         );
     }
 
+    /// cancel_detached signals without waiting; a later drain() must still
+    /// observe the clean exit (cancel_detached leaves the handle in the slot
+    /// so the await is not silently dropped).
+    #[tokio::test]
+    async fn cancel_detached_then_drain_observes_clean_exit() {
+        let handle = LogForwardHandle::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+
+        install_task(&handle, drained.clone()).await;
+
+        handle.cancel_detached().await;
+        let _permit = handle.acquire().await;
+        handle.drain().await;
+
+        assert_eq!(
+            drained.load(Ordering::SeqCst),
+            1,
+            "drain after cancel_detached must still observe the exit"
+        );
+    }
+
     /// A stop arriving while a start holds the permit mid-connect must wait for
     /// the start to install its task, then drain that task to completion — never
     /// racing the half-built slot. This is the interleaving the semaphore
@@ -1294,5 +1517,33 @@ mod log_forward_tests {
             observed, 1,
             "stop must drain the task the start installed, not abort it"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_log_path_tests {
+    use super::{sandbox_log_dir, SANDBOX_LOG_ROOT};
+
+    #[test]
+    fn sandbox_log_dir_joins_root() {
+        let dir = sandbox_log_dir("aabbccddeeff00112233445566778899").unwrap();
+        assert_eq!(
+            dir,
+            std::path::Path::new(SANDBOX_LOG_ROOT).join("aabbccddeeff00112233445566778899")
+        );
+    }
+
+    #[test]
+    fn sandbox_log_dir_rejects_traversal() {
+        assert!(sandbox_log_dir("../etc").is_err());
+        assert!(sandbox_log_dir("a/b").is_err());
+        assert!(sandbox_log_dir("").is_err());
+    }
+
+    #[test]
+    fn remove_sandbox_log_dir_sync_rejects_traversal() {
+        assert!(super::remove_sandbox_log_dir_sync("../etc").is_err());
+        assert!(super::remove_sandbox_log_dir_sync("a/b").is_err());
+        assert!(super::remove_sandbox_log_dir_sync("").is_err());
     }
 }

@@ -54,6 +54,10 @@ MKCERT_BIN_ASSET="${ONE_CLICK_MKCERT_BIN:-${SCRIPT_DIR}/assets/bin/mkcert-v1.4.4
 CUBE_KERNEL_VMLINUX="${ONE_CLICK_CUBE_KERNEL_VMLINUX:-${RAW_ARTIFACTS_DIR}/vmlinux}"
 KERNEL_ARTIFACT_ZIP="${WORK_ROOT}/cube-kernel-scf.zip"
 
+# Validate the host WebUI toolchain before guest-image generation or packaging.
+# A caller supplying a prebuilt dist does not need npm.
+require_web_build_prerequisites "${WEB_DIST_OVERRIDE}"
+
 CUBE_VERSION_FROM_ENV="${CUBE_VERSION:-}"
 LATEST_RELEASE_TAG="$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
 : "${CUBE_VERSION:=${LATEST_RELEASE_TAG:-0.0.0-dev}}"
@@ -75,14 +79,20 @@ CUBELET_BUILD_MODE="${ONE_CLICK_CUBELET_BUILD_MODE:-local}"
 API_BUILD_MODE="${ONE_CLICK_CUBE_API_BUILD_MODE:-local}"
 CUBE_OPS_BUILD_MODE="${ONE_CLICK_CUBE_OPS_BUILD_MODE:-local}"
 CUBEVSMAPDUMP_BUILD_MODE="${ONE_CLICK_CUBEVSMAPDUMP_BUILD_MODE:-local}"
+VOLUME_S3_BUILD_MODE="${ONE_CLICK_VOLUME_S3_BUILD_MODE:-local}"
 
 CUBEMASTER_BIN_OVERRIDE="${ONE_CLICK_CUBEMASTER_BIN:-}"
 CUBEMASTERCLI_BIN_OVERRIDE="${ONE_CLICK_CUBEMASTERCLI_BIN:-}"
+TEMPLATECENTER_BIN_OVERRIDE="${ONE_CLICK_TEMPLATECENTER_BIN:-}"
 CUBELET_BIN_OVERRIDE="${ONE_CLICK_CUBELET_BIN:-}"
 CUBECLI_BIN_OVERRIDE="${ONE_CLICK_CUBECLI_BIN:-}"
 API_BIN_OVERRIDE="${ONE_CLICK_CUBE_API_BIN:-}"
 CUBE_OPS_BIN_OVERRIDE="${ONE_CLICK_CUBE_OPS_BIN:-}"
+CUBE_OPS_CLI_BIN_OVERRIDE="${ONE_CLICK_CUBE_OPS_CLI_BIN:-}"
+OPS_AGENT_BIN_OVERRIDE="${ONE_CLICK_OPS_AGENT_BIN:-}"
 CUBEVSMAPDUMP_BIN_OVERRIDE="${ONE_CLICK_CUBEVSMAPDUMP_BIN:-}"
+VOLUME_S3_BIN_OVERRIDE="${ONE_CLICK_VOLUME_S3_BIN:-}"
+S3LVOL_DIR="${ONE_CLICK_S3LVOL_DIR:-}"
 
 go_version_ldflags() {
   local version_pkg="$1"
@@ -97,7 +107,8 @@ build_go_binary() {
   local mode="$2"
   local output="$3"
   local version_pkg="$4"
-  shift 4
+  local static_linux="${5:-}"
+  shift 5
 
   local ldflags="-s -w"
   if [[ -n "${version_pkg}" ]]; then
@@ -107,7 +118,16 @@ build_go_binary() {
   case "${mode}" in
     local)
       require_cmd go
-      (cd "${workdir}" && go mod download && go build -ldflags "${ldflags}" -o "${output}" "$@") >&2
+
+      # cube-volume-s3 must be statically linked: one-click hosts are Ubuntu
+      # 20.04 / glibc 2.31. cubelet and cubecli need cgo (nsenter, cubecow).
+      if [[ "${static_linux}" == "static_linux" ]]; then
+        (cd "${workdir}" && go mod download && \
+          CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "${ldflags}" -o "${output}" "$@") >&2
+      else
+        (cd "${workdir}" && go mod download && \
+          go build -trimpath -ldflags "${ldflags}" -o "${output}" "$@") >&2
+      fi
       ;;
     *)
       die "unsupported build mode: ${mode}"
@@ -141,6 +161,7 @@ build_or_copy_go_binary() {
   local output="$5"
   local package="$6"
   local version_pkg="${7:-}"  # optional: Go import path for ldflags injection
+  local static_linux="${8:-}"  # optional: "static_linux" → CGO_ENABLED=0 GOOS=linux
 
   if [[ -n "${override_path}" ]]; then
     log "using prebuilt ${name}: ${override_path}"
@@ -149,7 +170,7 @@ build_or_copy_go_binary() {
   fi
 
   log "building ${name}"
-  build_go_binary "${workdir}" "${mode}" "${output}" "${version_pkg}" "${package}"
+  build_go_binary "${workdir}" "${mode}" "${output}" "${version_pkg}" "${static_linux}" "${package}"
 }
 
 build_or_copy_rust_binary() {
@@ -276,12 +297,17 @@ PY
   # Shim + runtime binaries: already copied to RUNTIME_LAYOUT_DIR by build-vm-assets.sh.
   local shim_bin="${RUNTIME_LAYOUT_DIR}/cube-shim/bin/containerd-shim-cube-rs"
   local runtime_bin="${RUNTIME_LAYOUT_DIR}/cube-shim/bin/cube-runtime"
+  local s3lvol_bin=""
+  if [[ -n "${S3LVOL_DIR}" ]]; then
+    s3lvol_bin="${S3LVOL_DIR}/bin/s3lvol_tgt"
+  fi
 
   python3 - "${output}" "${release_version}" "${cube_version}" "${cube_commit}" "${cube_build_time}" \
       "${guest_image_version}" "${guest_agent_version}" "${kernel_version}" "${kernel_pvm_version}" \
       "${CORE_BIN_DIR}" \
       "${agent_artifact}" "${shim_bin}" "${runtime_bin}" \
-      "${guest_image_path}" "${kernel_vmlinux}" "${kernel_pvm_vmlinux}" <<'PY'
+      "${guest_image_path}" "${kernel_vmlinux}" "${kernel_pvm_vmlinux}" \
+      "${s3lvol_bin}" <<'PY'
 import json, os, sys, hashlib
 
 output_path       = sys.argv[1]
@@ -300,6 +326,7 @@ runtime_bin       = sys.argv[13]
 guest_image_path  = sys.argv[14]
 kernel_vmlinux    = sys.argv[15]
 kernel_pvm_vmlinux = sys.argv[16] if len(sys.argv) > 16 else ""
+s3lvol_bin        = sys.argv[17] if len(sys.argv) > 17 else ""
 
 def sha256_hex(path):
     """Return sha256:hexdigest for an existing file."""
@@ -325,7 +352,9 @@ def optional_sha256(path):
 components = {}
 
 # ── Go binaries from CORE_BIN_DIR ──
-for name in ["cubemaster", "cubemastercli", "cubelet", "cubecli"]:
+# templatecenter ships in every package (CubeMaster has no in-process build
+# fallback), so it must be manifest-tracked like every other Go component.
+for name in ["cubemaster", "cubemastercli", "templatecenter", "cubelet", "cubecli"]:
     path = os.path.join(core_bin_dir, name)
     components[name] = {
         "version": cube_version,
@@ -348,6 +377,22 @@ components["cubeops"] = {
     "commit": cube_commit,
     "build_time": cube_build_time,
     "digest_sha256": required_sha256(os.path.join(core_bin_dir, "cubeops")),
+}
+
+# ── cubeopscli from CORE_BIN_DIR ──
+components["cubeopscli"] = {
+    "version": cube_version,
+    "commit": cube_commit,
+    "build_time": cube_build_time,
+    "digest_sha256": required_sha256(os.path.join(core_bin_dir, "cubeopscli")),
+}
+
+# ── ops-agent from CORE_BIN_DIR ──
+components["ops-agent"] = {
+    "version": cube_version,
+    "commit": cube_commit,
+    "build_time": cube_build_time,
+    "digest_sha256": required_sha256(os.path.join(core_bin_dir, "ops-agent")),
 }
 
 # ── Rust binaries from build-vm-assets.sh ──
@@ -381,6 +426,16 @@ components["cube-lifecycle-manager"] = {
     "commit": cube_commit,
     "build_time": cube_build_time,
 }
+
+# ── CubeS3lvol (s3lvol release directory; present only when the builder
+#    wrapper supplied ONE_CLICK_S3LVOL_DIR) ──
+if s3lvol_bin and os.path.isfile(s3lvol_bin):
+    components["s3lvol"] = {
+        "version": cube_version,
+        "commit": cube_commit,
+        "build_time": cube_build_time,
+        "digest_sha256": required_sha256(s3lvol_bin),
+    }
 
 # ── Guest image ──
 guest_image = {
@@ -673,6 +728,12 @@ build_or_copy_go_binary \
   "cubemastercli" "${CUBEMASTERCLI_BIN_OVERRIDE}" \
   "${ROOT_DIR}/CubeMaster" "${CUBEMASTER_BUILD_MODE}" \
   "${CORE_BIN_DIR}/cubemastercli" ./cmd/cubemastercli "${CUBEMASTER_VERSION_PKG}"
+# Separate module, but its ldflags target CubeMaster's version package because
+# that is what its go.mod pulls in for version reporting.
+build_or_copy_go_binary \
+  "templatecenter" "${TEMPLATECENTER_BIN_OVERRIDE}" \
+  "${ROOT_DIR}/CubeTemplateCenter" "${CUBEMASTER_BUILD_MODE}" \
+  "${CORE_BIN_DIR}/templatecenter" ./cmd/templatecenter "${CUBEMASTER_VERSION_PKG}"
 build_or_copy_go_binary \
   "cubelet" "${CUBELET_BIN_OVERRIDE}" \
   "${ROOT_DIR}/Cubelet" "${CUBELET_BUILD_MODE}" \
@@ -689,7 +750,15 @@ build_or_copy_go_binary \
   "cubeops" "${CUBE_OPS_BIN_OVERRIDE}" \
   "${ROOT_DIR}/CubeOps" "${CUBE_OPS_BUILD_MODE}" \
   "${CORE_BIN_DIR}/cubeops" ./cmd/cubeops "${CUBEOPS_VERSION_PKG}"
-
+build_or_copy_go_binary \
+  "cubeopscli" "${CUBE_OPS_CLI_BIN_OVERRIDE}" \
+  "${ROOT_DIR}/CubeOps" "${CUBE_OPS_BUILD_MODE}" \
+  "${CORE_BIN_DIR}/cubeopscli" ./cmd/cubeopscli "${CUBEOPS_VERSION_PKG}"
+OPSAgent_VERSION_PKG="github.com/tencentcloud/CubeSandbox/OpsAgent/internal/version"
+build_or_copy_go_binary \
+  "ops-agent" "${OPS_AGENT_BIN_OVERRIDE}" \
+  "${ROOT_DIR}/OpsAgent" "${OPS_AGENT_BUILD_MODE:-local}" \
+  "${CORE_BIN_DIR}/ops-agent" ./cmd/ops-agent "${OPSAgent_VERSION_PKG}" static_linux
 build_or_copy_go_binary \
   "cubevsmapdump" "${CUBEVSMAPDUMP_BIN_OVERRIDE}" \
   "${ROOT_DIR}/CubeNet/cubevs" "${CUBEVSMAPDUMP_BUILD_MODE}" \
@@ -700,10 +769,13 @@ mkdir -p \
   "${PACKAGE_ROOT}/CubeOps/bin" \
   "${PACKAGE_ROOT}/CubeMaster/bin" \
   "${PACKAGE_ROOT}/CubeMaster/plugin" \
+  "${PACKAGE_ROOT}/CubeTemplateCenter/bin" \
   "${PACKAGE_ROOT}/Cubelet/bin" \
   "${PACKAGE_ROOT}/Cubelet/plugin" \
   "${PACKAGE_ROOT}/Cubelet/config" \
   "${PACKAGE_ROOT}/Cubelet/dynamicconf" \
+  "${PACKAGE_ROOT}/ops-agent/bin" \
+  "${PACKAGE_ROOT}/ops-agent/conf" \
   "${PACKAGE_ROOT}/cubeproxy" \
   "${PACKAGE_ROOT}/cube-lifecycle-manager" \
   "${PACKAGE_ROOT}/coredns" \
@@ -714,8 +786,11 @@ mkdir -p \
   "${PACKAGE_ROOT}/systemd" \
   "${PACKAGE_ROOT}/cube-vs/network/bin" \
   "${PACKAGE_ROOT}/cube-snapshot" \
+  "${PACKAGE_ROOT}/CubeS3lvol" \
   "${PACKAGE_ROOT}/scripts/one-click" \
   "${PACKAGE_ROOT}/scripts/systemd" \
+  "${PACKAGE_ROOT}/scripts/cube-jfs" \
+  "${PACKAGE_ROOT}/scripts/logrotate" \
   "${PACKAGE_ROOT}/scripts/cube-egress" \
   "${PACKAGE_ROOT}/cube-egress" \
   "${PACKAGE_ROOT}/terraform/tencentcloud"
@@ -733,6 +808,12 @@ copy_file "${CORE_BIN_DIR}/cube-api" "${PACKAGE_ROOT}/CubeAPI/bin/cube-api"
 # extracted sandbox-package without the full source tree.
 copy_dir_contents "${SCRIPT_DIR}/CubeOps" "${PACKAGE_ROOT}/CubeOps"
 copy_file "${CORE_BIN_DIR}/cubeops" "${PACKAGE_ROOT}/CubeOps/bin/cubeops"
+copy_file "${CORE_BIN_DIR}/cubeopscli" "${PACKAGE_ROOT}/CubeOps/bin/cubeopscli"
+
+# ops-agent: node-local agent binary plus the config template. The runtime
+# config is generated per node by prepare-compute-role.sh.
+copy_file "${CORE_BIN_DIR}/ops-agent" "${PACKAGE_ROOT}/ops-agent/bin/ops-agent"
+copy_file "${ROOT_DIR}/OpsAgent/config/config.example.yaml" "${PACKAGE_ROOT}/ops-agent/conf/config.example.yaml"
 
 # Same ordering for CubeMaster so cubemaster/cubemastercli binaries survive the
 # copy_dir_contents wipe and coexist with the one-click CubeMaster assets.
@@ -744,6 +825,23 @@ copy_file "${ROOT_DIR}/configs/single-node/cubemaster.yaml" "${PACKAGE_ROOT}/Cub
 copy_file "${ROOT_DIR}/deploy/scripts/docker-install-volume-deps.sh" \
   "${PACKAGE_ROOT}/CubeMaster/docker-install-volume-deps.sh"
 chmod +x "${PACKAGE_ROOT}/CubeMaster/docker-install-volume-deps.sh"
+
+# CubeTemplateCenter. Shipped in every package and enabled by default:
+# cube-sandbox-control.target Wants cube-sandbox-cube-templatecenter.service
+# and install.sh enables it explicitly, because CubeMaster no longer builds
+# templates in-process (every template-from-image build is forwarded to TC,
+# with no local fallback) -- a disabled TC would fail every build.
+# Same ordering as CubeMaster: the package Dockerfile lands first so the
+# copy_dir_contents wipe cannot remove the binary copied on top, and
+# terraform/tencentcloud/build_images.sh can build cube-templatecenter from
+# the extracted sandbox-package without the full source tree.
+copy_dir_contents "${SCRIPT_DIR}/CubeTemplateCenter" "${PACKAGE_ROOT}/CubeTemplateCenter"
+copy_file "${CORE_BIN_DIR}/templatecenter" "${PACKAGE_ROOT}/CubeTemplateCenter/bin/templatecenter"
+# The repo-root CubeTemplateCenter/conf.yaml is the Helm template (its db/redis/
+# port fields are {{ }} placeholders that are never rendered on a bare host), so
+# ship the single-node template, which install.sh resolves the same way it does
+# CubeMaster's.
+copy_file "${ROOT_DIR}/configs/single-node/templatecenter.yaml" "${PACKAGE_ROOT}/CubeTemplateCenter/conf.yaml"
 
 copy_file "${CORE_BIN_DIR}/cubelet" "${PACKAGE_ROOT}/Cubelet/bin/cubelet"
 copy_file "${CORE_BIN_DIR}/cubecli" "${PACKAGE_ROOT}/Cubelet/bin/cubecli"
@@ -773,6 +871,33 @@ copy_file "${VOLUME_COS_CONF_EXAMPLE}" "${PACKAGE_ROOT}/Cubelet/plugin/volume-co
 copy_file "${VOLUME_COS_INSTALL_DEPS}" "${PACKAGE_ROOT}/CubeMaster/plugin/install-deps.sh"
 copy_file "${VOLUME_COS_INSTALL_DEPS}" "${PACKAGE_ROOT}/Cubelet/plugin/install-deps.sh"
 chmod +x "${PACKAGE_ROOT}/CubeMaster/plugin/install-deps.sh" "${PACKAGE_ROOT}/Cubelet/plugin/install-deps.sh"
+
+# The S3 plugin is a Go binary: it talks to the endpoint over HTTP, so control
+# nodes need no S3 command line tool. Build once and install into both plugin
+# directories.
+VOLUME_S3_SRC_DIR="${ROOT_DIR}/examples/volume/s3"
+VOLUME_S3_CONF_EXAMPLE="${VOLUME_S3_SRC_DIR}/volume-s3.conf.example"
+VOLUME_S3_INSTALL_DEPS="${VOLUME_S3_SRC_DIR}/install-deps.sh"
+ensure_file "${VOLUME_S3_SRC_DIR}/cmd/cube-volume-s3/main.go"
+ensure_file "${VOLUME_S3_CONF_EXAMPLE}"
+ensure_file "${VOLUME_S3_INSTALL_DEPS}"
+# CGO_ENABLED=0 GOOS=linux: one-click hosts are Ubuntu 20.04 / glibc 2.31.
+build_or_copy_go_binary \
+  "cube-volume-s3" \
+  "${VOLUME_S3_BIN_OVERRIDE}" \
+  "${VOLUME_S3_SRC_DIR}" \
+  "${VOLUME_S3_BUILD_MODE}" \
+  "${PACKAGE_ROOT}/CubeMaster/plugin/cube-volume-s3" \
+  "./cmd/cube-volume-s3" \
+  "" \
+  "static_linux"
+copy_file "${PACKAGE_ROOT}/CubeMaster/plugin/cube-volume-s3" "${PACKAGE_ROOT}/Cubelet/plugin/cube-volume-s3"
+chmod +x "${PACKAGE_ROOT}/CubeMaster/plugin/cube-volume-s3" "${PACKAGE_ROOT}/Cubelet/plugin/cube-volume-s3"
+copy_file "${VOLUME_S3_CONF_EXAMPLE}" "${PACKAGE_ROOT}/CubeMaster/plugin/volume-s3.conf.example"
+copy_file "${VOLUME_S3_CONF_EXAMPLE}" "${PACKAGE_ROOT}/Cubelet/plugin/volume-s3.conf.example"
+copy_file "${VOLUME_S3_INSTALL_DEPS}" "${PACKAGE_ROOT}/CubeMaster/plugin/install-s3-deps.sh"
+copy_file "${VOLUME_S3_INSTALL_DEPS}" "${PACKAGE_ROOT}/Cubelet/plugin/install-s3-deps.sh"
+chmod +x "${PACKAGE_ROOT}/CubeMaster/plugin/install-s3-deps.sh" "${PACKAGE_ROOT}/Cubelet/plugin/install-s3-deps.sh"
 
 copy_dir_contents "${CUBE_PROXY_TEMPLATE_DIR}" "${PACKAGE_ROOT}/cubeproxy"
 copy_dir_contents "${CUBE_COREDNS_TEMPLATE_DIR}" "${PACKAGE_ROOT}/coredns"
@@ -811,6 +936,8 @@ fi
 # siblings), so the runtime needs every script in this directory.
 copy_dir_contents "${SCRIPT_DIR}/scripts/one-click" "${PACKAGE_ROOT}/scripts/one-click"
 copy_dir_contents "${SCRIPT_DIR}/scripts/systemd" "${PACKAGE_ROOT}/scripts/systemd"
+copy_dir_contents "${SCRIPT_DIR}/scripts/cube-jfs" "${PACKAGE_ROOT}/scripts/cube-jfs"
+copy_dir_contents "${SCRIPT_DIR}/scripts/logrotate" "${PACKAGE_ROOT}/scripts/logrotate"
 # scripts/{one-click,systemd}/common.sh both `source ../common/validation.sh`,
 # so the shared scripts/common helpers must ship alongside them in the package.
 copy_dir_contents "${SCRIPT_DIR}/scripts/common" "${PACKAGE_ROOT}/scripts/common"
@@ -823,14 +950,29 @@ copy_dir_contents "${SCRIPT_DIR}/scripts/cube-diag" "${PACKAGE_ROOT}/scripts/cub
 # rather than the whole dir so we don't pull in the legacy
 # cube-proxy-net.service unit that conflicts with our deploy/one-click
 # integration.
-copy_file "${CUBE_EGRESS_SOURCE_DIR}/scripts/cube-proxy-iptables-init.sh" \
-          "${PACKAGE_ROOT}/scripts/cube-egress/cube-proxy-iptables-init.sh"
+copy_file "${CUBE_EGRESS_SOURCE_DIR}/scripts/cube-egress-iptables-init.sh" \
+          "${PACKAGE_ROOT}/scripts/cube-egress/cube-egress-iptables-init.sh"
 
 # Host-side version marker for cube-egress: cubelet's versioninfo.Collector
 # detects the component by the presence of cube-egress/version and reports
 # the content as the installed version. Must match cube_version so the
 # declared-vs-actual comparison in CubeMaster's version matrix works.
 printf '%s\n' "${DIST_VERSION}" > "${PACKAGE_ROOT}/cube-egress/version"
+
+# CubeS3lvol (s3lvol) ships as a self-contained release directory
+# (bin/s3lvol_tgt statically linked against SPDK/DPDK/AWS CRT, scripts/,
+# VERSION) produced by track_s3lvol into .work/prebuilt/s3lvol. When the
+# prebuilt is absent (e.g. a direct build-release-bundle.sh invocation
+# without the builder wrapper), skip it with a warning instead of failing
+# the whole build -- mirroring how the optional *_BIN overrides behave.
+if [[ -n "${S3LVOL_DIR}" ]]; then
+  copy_dir_contents "${S3LVOL_DIR}" "${PACKAGE_ROOT}/CubeS3lvol"
+  ensure_file "${PACKAGE_ROOT}/CubeS3lvol/bin/s3lvol_tgt"
+  # Host-side version marker, same convention as cube-egress/version above.
+  printf '%s\n' "${DIST_VERSION}" > "${PACKAGE_ROOT}/CubeS3lvol/version"
+else
+  log "WARN: ONE_CLICK_S3LVOL_DIR not set; CubeS3lvol omitted from sandbox-package"
+fi
 
 copy_dir_contents "${SCRIPT_DIR}/terraform/tencentcloud" "${PACKAGE_ROOT}/terraform/tencentcloud"
 # Strip any developer-local terraform state / kubeconfig / SSH keys / TLS
@@ -870,6 +1012,8 @@ done
 find "${PACKAGE_ROOT}" -type f -path "*/bin/*" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/one-click" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/systemd" -type f -name "*.sh" -exec chmod +x {} \;
+find "${PACKAGE_ROOT}/scripts/cube-jfs" -type f -name "*.sh" -exec chmod +x {} \;
+find "${PACKAGE_ROOT}/scripts/logrotate" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/common" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/cube-diag" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/cube-egress" -type f -name "*.sh" -exec chmod +x {} \;

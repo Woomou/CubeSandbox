@@ -3,11 +3,27 @@ common:
   http_readtimeout: 120
   http_writetimeout: 360
   http_idletimeout: 360
-  sync_meta_data_interval: 30s
+  {{- if or .Values.cubeOps.enabled .Values.externalControlPlane.enabled }}
+  cube_ops_addr: "http://{{ include "cube.opsEndpoint" . }}"
+  {{- end }}
+  sync_meta_data_interval: 1s
   sync_metric_data_interval: 1s
   collect_metric_interval: 1s
-  default_headless_service_nodes_num: 1
+  # Tracks the master replica count.
+  default_headless_service_nodes_num: {{ .Values.controlPlane.master.replicas | default 1 }}
   enable_check_com_net_id_param: false
+  # Per-call max concurrency for rootfs artifact distribution. Default 4.
+  # distribution_workers: 4
+  # Template build wiring: CubeMaster no longer has a templatecenter_enabled
+  # switch. Every template-from-image build is forwarded to CubeTemplateCenter.
+  #
+  # CubeTemplateCenter's address can be set here (persistent, per-deployment)
+  # or overridden by the CUBE_TEMPLATE_CENTER_ADDR environment variable
+  # (ad-hoc debugging). Env wins over yaml. Both empty means "not configured"
+  # and all template builds will fail.
+  {{- if .Values.controlPlane.enabled }}
+  template_center_addr: "{{ include "cube.templateCenterEndpoint" . }}"
+  {{- end }}
 
 log:
   module: "cubemaster"
@@ -21,6 +37,8 @@ cubelet_conf:
     grpc_port: 9999
   common_timeout_insec: 30
   create_image_timeout_insec: 300
+  app_snapshot_timeout_insec: {{ .Values.controlPlane.master.appSnapshotTimeoutSeconds }}
+  create_timeout_insec: 600
   create_concurrent_limit: 100
   destroy_concurent_limit: 100
   enable_exposed_port: true
@@ -30,6 +48,13 @@ cubelet_conf:
 
 auth:
   enable: false
+
+# CubeProxy admin cache invalidation on sandbox resume. admin_token must match
+# the release Secret key cube-admin-token (what CubeProxy validates as
+# X-Cube-Admin-Token). Rendered from the chart helper; see cube.adminToken.
+# admin_port/heartbeat_ttl_ms fall back to defaults (8082 / 15000).
+cube_proxy_conf:
+  admin_token: {{ include "cube.adminToken" . | quote }}
 
 req_template_conf:
   whitelist_req_tag:
@@ -58,10 +83,11 @@ instance_db_config:
 redis:
   nodes: {{ include "cube.redisNodes" . | quote }}
   master_name: {{ .Values.redis.masterName | default "" | quote }}
+  cluster_nodes: {{ .Values.redis.clusterNodes | default "" | quote }}
   sentinel_nodes: {{ .Values.redis.sentinelNodes | default "" | quote }}
   sentinel_password: {{ .Values.redis.sentinelPassword | default "" | quote }}
   password: {{ .Values.redis.password | quote }}
-  db_no: 0
+  db_no: {{ include "cube.redisDB" . }}
   max_idle: 8
   max_active: 32
   idle_timeout: 30
@@ -78,9 +104,13 @@ scheduler:
       - "template_locality"
       - "realtime_create_num"
 
-# Volume plugin (COS binary). Credentials: Secret-mounted volume-cos.conf
-# next to the binary (see values.volumeCos).
+# Volume plugin (S3 / COS binary). Credentials: Secret-mounted.
+# List order sets the default driver when Volume.create() omits `driver`;
+# S3 is first so the default install (bundled MinIO) works out of the box.
 volume_plugins:
+  - name: s3
+    type: binary
+    binary_path: /usr/local/services/cubetoolbox/CubeMaster/plugin/cube-volume-s3
   - name: cos
     type: binary
     binary_path: /usr/local/services/cubetoolbox/CubeMaster/plugin/cube-volume-cos

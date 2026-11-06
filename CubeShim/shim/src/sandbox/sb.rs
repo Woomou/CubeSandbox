@@ -29,6 +29,10 @@ use super::config::{Fs, ANNO_VMM_FS, VIRTIO_FS_ID, VIRTIO_FS_TAG};
 use super::device;
 use super::disk::Disk;
 use super::pmem::Pmem;
+use super::snapshot_mode::{
+    SnapshotMode, ERR_FREEZE_FAILED, ERR_FREEZE_UNSUPPORTED, ERR_ROOTFS_UNSUPPORTED,
+    ERR_THAW_FAILED,
+};
 use crate::common::types::PropagationMount;
 use crate::common::utils::{self, AsyncUtils, CPath, Utils};
 use crate::common::{
@@ -39,7 +43,7 @@ use crate::container::container_mgr::ContainerInfo;
 use crate::container::{exec::Tty, Container, GUEST_DEV_SHM};
 use crate::hypervisor::config::{HypConfig, VmConfig};
 use crate::hypervisor::cube_hypervisor as CH;
-use crate::hypervisor::snapshot::{enable_snapshot, SnapshotInfo};
+use crate::hypervisor::snapshot::SnapshotInfo;
 use crate::log::{stat_defer, Log};
 use crate::sandbox::config;
 use crate::{debugf, errf, infof, warnf};
@@ -50,11 +54,88 @@ const ANNO_SANDBOX_DNS: &str = "cube.sandbox.dns";
 const ANNO_ENABLE_IVSHMEM: &str = "cube.master.enable_ivshmem";
 const IVSHMEM_DEFAULT_SIZE: usize = 1 * 1024 * 1024; // 1MB
 
+/// Bounded reconnects for the restore-thaw window: a freshly restored guest
+/// transiently refuses or resets the first connections until its runtime
+/// settles. Both steps are safe to repeat (fresh channel; idempotent RPCs).
+const RECONNECT_ATTEMPTS: u32 = 5;
+const RECONNECT_BACKOFF_MS: u64 = 200;
+/// Overall deadline for the retry loop: bounds the sequence even when a
+/// single attempt parks (connect_agent has no internal timeout). With the
+/// 3 s RPC timeout, a hung agent gets ~3 attempts rather than all 5.
+/// Fast-failing attempts exhaust RECONNECT_ATTEMPTS in ~1 s; this deadline
+/// only binds when an attempt hangs.
+const RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How often the snapshot recovery task re-checks the lease and retries a
+/// release that failed.
+const SNAPSHOT_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+/// Upper bound on release attempts after the lease expired without a renewal;
+/// the sandbox is destroyed beyond it.
+const SNAPSHOT_RECOVERY_ATTEMPTS: u32 = 6;
+/// Deadline for the guest freeze RPC; must exceed the agent's own 30 s timeout.
+const FREEZE_RPC_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// RPC context for guest freeze/thaw calls; the ttrpc client applies the
+/// context timeout to the response wait, so this bounds the call.
+fn freeze_rpc_context() -> Context {
+    context::with_timeout(FREEZE_RPC_TIMEOUT.as_nanos() as i64)
+}
+
+/// Outer `tokio::time::timeout` backstop for the same calls; must sit strictly
+/// above [`FREEZE_RPC_TIMEOUT`], which is the timer that normally ends the call.
+const FREEZE_CALL_BACKSTOP: Duration = Duration::from_secs(FREEZE_RPC_TIMEOUT.as_secs() + 2);
+
 #[derive(PartialEq, Eq)]
 enum SandBoxState {
     Normal,
     Paused,
     Exited,
+}
+
+/// What the capture window is holding still. `Rootfs` keeps the VM running;
+/// only the guest filesystem is frozen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotHold {
+    VmPaused,
+    Rootfs { mount_point: String },
+}
+
+enum SnapshotFreezeState {
+    Idle,
+    Frozen {
+        id: String,
+        deadline: Instant,
+        hold: SnapshotHold,
+    },
+    Expired {
+        id: String,
+    },
+}
+
+impl SnapshotFreezeState {
+    /// Records a failed hold. The state is only cleared once a thaw proves
+    /// the guest is writable again; until then the recovery task owns the disk.
+    fn failed_hold(&mut self, released: bool) {
+        if released {
+            *self = Self::Idle;
+            return;
+        }
+        if let Self::Frozen { deadline, .. } = self {
+            // No renewal is coming: let the recovery task start releasing now.
+            *deadline = Instant::now();
+        }
+    }
+
+    fn resume_needed(&self, snapshot_id: &str) -> CResult<bool> {
+        match self {
+            Self::Idle => Ok(false),
+            Self::Frozen { id, .. } if id == snapshot_id => Ok(true),
+            Self::Expired { id } if id == snapshot_id => {
+                Err("snapshot freeze lease expired; the shim released the sandbox itself".into())
+            }
+            _ => Err("snapshot id does not match frozen VM".into()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -73,8 +154,13 @@ pub struct SandBox {
     tx_containerd: Sender<(String, Box<dyn MessageDyn>)>,
     debug: bool,
     state: Arc<Mutex<SandBoxState>>,
+    snapshot_frozen: Arc<Mutex<SnapshotFreezeState>>,
     tx_monitor_exited: Option<Sender<()>>,
     monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    /// Keeps the monitor's connection alive across stop_watchers' abort (the
+    /// task's clone would close it); the checks are disabled, so the point
+    /// is the port it keeps reserved.
+    monitor_conn: Option<Client>,
     tx_oom_exited: Option<Sender<()>>,
     oom_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -113,8 +199,10 @@ impl SandBox {
             tx_containerd,
             debug,
             state: Arc::new(Mutex::new(SandBoxState::Normal)),
+            snapshot_frozen: Arc::new(Mutex::new(SnapshotFreezeState::Idle)),
             tx_monitor_exited: None,
             monitor_handle: None,
+            monitor_conn: None,
             tx_oom_exited: None,
             oom_handle: None,
         }
@@ -131,10 +219,25 @@ impl SandBox {
     /// True when Cubelet recreates the same sandbox from a pause snapshot.
     /// Guest mounts (virtiofs + binds) are already in restored memory.
     pub fn pause_resume(&self) -> bool {
+        self.annotation_present(config::ANNO_PAUSE_SNAPSHOT_ID)
+    }
+
+    /// True when Cubelet creates a new sandbox from a runtime snapshot.
+    /// Guest mounts are already in restored memory, same as pause_resume.
+    pub fn from_snapshot(&self) -> bool {
+        self.annotation_present(config::ANNO_RUNTIME_SNAPSHOT_ID)
+    }
+
+    /// Pause resume or FromSnap: reconnect host virtiofs, do not remount guest.
+    pub fn guest_mount_restore(&self) -> bool {
+        self.pause_resume() || self.from_snapshot()
+    }
+
+    fn annotation_present(&self, key: &str) -> bool {
         self.spec
             .annotations()
             .as_ref()
-            .and_then(|anno| anno.get(config::ANNO_PAUSE_SNAPSHOT_ID))
+            .and_then(|anno| anno.get(key))
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
     }
@@ -204,6 +307,69 @@ impl SandBox {
         )
     }
 
+    /// Connect + reset with bounded retries. Restores are retried because
+    /// the guest is thawed from a snapshot with its connections just RST and
+    /// transiently refuses or resets the first connections while its runtime
+    /// settles -- every restored guest, including an ordinary create from a
+    /// template snapshot. A VM booted from scratch (snapshot == false) gets
+    /// a single attempt: a booted guest has no carried connection state, so
+    /// a failure there is permanent. Every error class is retried: the
+    /// transient surfaces both at the connect handshake and at the first
+    /// RPC. What follows the first RPC is not retried: it is not idempotent,
+    /// and reset_guest passing is the signal that the guest can serve again.
+    /// A restored guest whose agent is dead pays the full 10 s deadline
+    /// before the create or resume fails.
+    async fn connect_agent_with_retry(&mut self, restore: bool) -> CResult<()> {
+        // One stat for the whole sequence: a failed attempt that a later one
+        // supersedes must not record an Err.
+        let mut stat =
+            restore.then(|| self.new_create_stat(stat_defer::CALLEE_ACT_RESET_VM.to_string()));
+        let mut last_err: Option<String> = None;
+        let retry = async {
+            let max_attempts = if restore { RECONNECT_ATTEMPTS } else { 1 };
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let res: CResult<()> = async {
+                    self.connect_agent().await?;
+                    if restore {
+                        self.reset_guest().await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                match res {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts => {
+                        last_err = Some(e.clone());
+                        warnf!(
+                            self.log,
+                            "reconnect attempt {}/{} failed: {}, retrying",
+                            attempt,
+                            max_attempts,
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+        let res = match tokio::time::timeout(RECONNECT_DEADLINE, retry).await {
+            Ok(res) => res,
+            Err(_) => Err(format!(
+                "agent reconnect exceeded the deadline (last attempt: {})",
+                last_err.unwrap_or_else(|| "still in flight".to_string())
+            )),
+        };
+        if res.is_ok() {
+            if let Some(stat) = stat.as_mut() {
+                stat.set_ok();
+            }
+        }
+        res
+    }
+
     async fn connect_agent(&mut self) -> CResult<()> {
         let conn = AsyncUtils::connect_agent(&self.id).await?;
         let client = agent_ttrpc::AgentServiceClient::new(conn.clone());
@@ -222,56 +388,64 @@ impl SandBox {
         }
         false
     }
-    async fn disconnect_agent(&mut self, from_rollback: bool) -> CResult<()> {
-        //stop monitor
-
-        if let Some(tx) = self.tx_monitor_exited.as_ref() {
-            let _ = tx.try_send(());
-        }
-
-        if let Some(handle) = self.monitor_handle.take() {
-            handle.abort();
-        }
-
-        //stop watch oom event
-        if let Some(tx) = self.tx_oom_exited.as_ref() {
-            let _ = tx.try_send(());
-        }
-
-        if let Some(handle) = self.oom_handle.take() {
-            handle.abort();
-        }
+    async fn disconnect_agent(&mut self) -> CResult<()> {
+        self.stop_watchers().await;
 
         let mut containers = self.containers.lock().await;
         for (_, c) in containers.iter_mut() {
             c.unset_client().await;
         }
-        if !from_rollback {
-            // Yield briefly so aborted monitor / oom tasks can be scheduled and
-            // drop their cloned `Arc<Client>` before we check ref counts below.
-            // Empirically 50ms is enough for the tokio runtime to make progress.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if let Some(client) = self.client.take() {
-            if Arc::strong_count(&client) != 1 {
-                errf!(
-                    self.log,
-                    "client ref count is {}",
-                    Arc::strong_count(&client)
-                );
-                //return Err(format!("disconnect_agent: client ref count is not 1").into());
-            }
-            drop(client)
-        }
-
-        if let Some(conn) = self.conn.take() {
-            if Arc::strong_count(&conn) != 1 {
-                errf!(self.log, "conn ref count is {}", Arc::strong_count(&conn));
-                //return Err(format!("disconnect_agent: conn ref count is not 1").into());
-            }
-            drop(conn)
-        }
+        self.client = None;
+        self.conn = None;
+        self.monitor_conn = None;
         Ok(())
+    }
+
+    /// Pause-time teardown that leaves the agent channel and the fwd log conns
+    /// alive across the freeze (the guest learns of them via the restore-side
+    /// RST). A connection should not be closed here: a close that races the
+    /// freeze leaves a stale socket in the guest that collides with the first
+    /// reconnection after resume. The monitor's health connection is carried
+    /// too (monitor_conn holds it open through the abort); carried ports
+    /// stay reserved in the restored muxer. disconnect_agent remains for
+    /// rollback.
+    async fn quiesce_agent_for_pause(&mut self) {
+        self.stop_watchers().await;
+        let mut containers = self.containers.lock().await;
+        for (_, c) in containers.iter_mut() {
+            c.quiesce_for_pause().await;
+        }
+    }
+
+    /// Stop the monitor / oom watcher tasks; shared by quiesce (pause) and
+    /// disconnect (rollback): whatever holds a clone of the agent client must
+    /// be stopped before the connection is dealt with.
+    async fn stop_watchers(&mut self) {
+        //stop monitor
+        if let Some(tx) = self.tx_monitor_exited.as_ref() {
+            let _ = tx.try_send(());
+        }
+        if let Some(handle) = self.monitor_handle.take() {
+            handle.abort();
+        }
+        //stop watch oom event
+        if let Some(tx) = self.tx_oom_exited.as_ref() {
+            let _ = tx.try_send(());
+        }
+        if let Some(handle) = self.oom_handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// Signal every container's init log forwarders to stop without waiting:
+    /// pause keeps them across the freeze, and once the VM is torn down their
+    /// reads fail -- without this they retry until the shim is reaped. Slot
+    /// reuse drains via start_log_forward.
+    async fn stop_log_forward_detached(&self) {
+        let mut containers = self.containers.lock().await;
+        for (_, c) in containers.iter_mut() {
+            c.stop_log_forward_detached().await;
+        }
     }
 
     fn get_storages(&mut self) -> CResult<Vec<agent::Storage>> {
@@ -291,9 +465,9 @@ impl SandBox {
                 storages.push(virtiofs);
             }
         }
-        // Pause resume: keep virtiofs devices (restore_virtiofs_configs) but do
-        // not ask the agent to remount — guest mountpoints are already live.
-        let skip_virtiofs_guest_mount = self.app_snapshot_restore() && self.pause_resume();
+        // Pause / FromSnap: keep virtiofs devices (restore_virtiofs_configs)
+        // but do not ask the agent to remount — guest mountpoints are already live.
+        let skip_virtiofs_guest_mount = self.app_snapshot_restore() && self.guest_mount_restore();
         if !self.app_snapshot_create() && !skip_virtiofs_guest_mount {
             for fs in self.conf.virtiofs.iter() {
                 debugf!(self.log, "add virtiofs: {:?}", fs.id.clone());
@@ -316,7 +490,7 @@ impl SandBox {
         } else if skip_virtiofs_guest_mount {
             infof!(
                 self.log,
-                "pause resume: skip virtio-fs storages for agent (guest mounts kept)"
+                "memory restore: skip virtio-fs storages for agent (guest mounts kept)"
             );
         }
 
@@ -426,7 +600,6 @@ impl SandBox {
             return Err(format!("client is None"));
         }
         let client = self.client.as_ref().unwrap().lock().await;
-        let mut stat = self.new_create_stat(stat_defer::CALLEE_ACT_RESET_VM.to_string());
         let tm = Utc::now();
 
         let req = agent::SetGuestDateTimeRequest {
@@ -450,7 +623,6 @@ impl SandBox {
             .reseed_random_dev(self.ctx.clone(), &req)
             .await
             .map_err(|e| format!("reset reseed random dev failed:{}", e))?;
-        stat.set_ok();
         Ok(())
     }
 
@@ -464,13 +636,9 @@ impl SandBox {
             }
         }
 
-        self.connect_agent().await?;
+        self.connect_agent_with_retry(snapshot).await?;
 
         infof!(self.log, "agent is ready");
-
-        if snapshot {
-            self.reset_guest().await?;
-        }
 
         //add vfio device
         if !self.app_snapshot_restore() {
@@ -539,7 +707,7 @@ impl SandBox {
 
     //this function must be called after CreateSandbox
     async fn monitor_vm(
-        &self,
+        &mut self,
         check_agent: bool,
     ) -> CResult<(Sender<()>, tokio::task::JoinHandle<()>)> {
         let mut arc_ch: Option<Arc<Mutex<CH::CubeHypervisor>>> = self.ch.clone();
@@ -550,6 +718,7 @@ impl SandBox {
         let arc_conainers = self.containers.clone();
         let arc_state = self.state.clone();
         let conn = AsyncUtils::connect_agent(&self.id).await?;
+        self.monitor_conn = Some(conn.clone());
         let client = health_ttrpc::HealthClient::new(conn);
         let log = self.log.clone();
         let handle = tokio::spawn(async move {
@@ -842,9 +1011,6 @@ impl SandBox {
                 return false;
             }
         }
-        if !enable_snapshot() {
-            return false;
-        }
 
         !self.conf.app_snapshot_create
     }
@@ -871,6 +1037,12 @@ impl SandBox {
                     }
                 }
             }
+        } else if self.conf.app_snapshot_restore {
+            return Err(
+                "app snapshot restore requested but snapshot is unavailable on this node \
+                 (cube.snapshot.disable set or selinux label set)"
+                    .to_string(),
+            );
         }
 
         if !snapshot {
@@ -1054,12 +1226,37 @@ impl SandBox {
         container.unwrap().close_io(exec_id).await
     }
 
+    pub async fn resize_pty(
+        &self,
+        id: &String,
+        exec_id: &String,
+        height: u32,
+        width: u32,
+    ) -> Result<()> {
+        let mut containers = self.containers.lock().await;
+        let container = containers.get_mut(id);
+        if container.is_none() {
+            return Err(Error::NotFoundError(format!("not found container:{}", id)));
+        }
+
+        container.unwrap().resize_pty(exec_id, height, width).await
+    }
+
     pub async fn delete_container(&mut self, id: &String) -> Result<(u32, DateTime<Utc>)> {
         let mut container = {
             let mut containers = self.containers.lock().await;
             match containers.get_mut(id) {
                 Some(c) => c.clone(),
-                None => return Err(Error::NotFoundError(format!("not found container:{}", id))),
+                None => {
+                    let should_clean = id == &self.id && !self.conf.app_snapshot_create;
+                    drop(containers);
+                    if should_clean {
+                        crate::container::remove_sandbox_log_dir(&self.id, &self.log).await;
+                    }
+                    // Keep NotFound: cubelet already treats it as success on
+                    // destroy. Changing the RPC contract is out of scope.
+                    return Err(Error::NotFoundError(format!("not found container:{}", id)));
+                }
             }
         };
         let (code, tm) = container
@@ -1067,9 +1264,16 @@ impl SandBox {
             .await
             .map_err(|e| Error::Other(format!("{}", e)))?;
 
-        let mut containers = self.containers.lock().await;
-        if containers.remove(id).is_none() {
-            warnf!(self.log, "remove container:{} failed from map", id);
+        {
+            let mut containers = self.containers.lock().await;
+            if containers.remove(id).is_none() {
+                warnf!(self.log, "remove container:{} failed from map", id);
+            }
+        }
+        // Live Task.Delete. Crash leftover is cleaned by the delete subcommand
+        // (`clean_sandbox_resource`). Pause-to-snapshot returns before here.
+        if id == &self.id && !self.conf.app_snapshot_create {
+            crate::container::remove_sandbox_log_dir(&self.id, &self.log).await;
         }
         Ok((code, tm))
     }
@@ -1302,6 +1506,340 @@ impl SandBox {
             .await?;
         ch.resume_vm().await
     }
+
+    /// Capture a reusable snapshot while leaving this MicroVM frozen for
+    /// Cubelet's rootfs CoW snapshot. The shim retains a bounded recovery path
+    /// if Cubelet exits before sending SnapshotResume.
+    pub async fn capture_snapshot_frozen(
+        &mut self,
+        snapshot_id: &str,
+        spec_dir: &str,
+        memory_vol_url: Option<String>,
+        snapshot_type: SnapshotType,
+        mode: SnapshotMode,
+        rootfs_host_path: Option<&str>,
+    ) -> CResult<()> {
+        if snapshot_id.is_empty() || !std::path::Path::new(spec_dir).is_absolute() {
+            return Err("snapshot id and absolute destination are required".into());
+        }
+        if !self.normal().await
+            || matches!(
+                &*self.snapshot_frozen.lock().await,
+                SnapshotFreezeState::Frozen { .. }
+            )
+        {
+            return Err("sandbox is not available for snapshot capture".into());
+        }
+        if !mode.has_memory() && memory_vol_url.is_some() {
+            return Err("filesystem-only snapshot must not carry a memory volume".into());
+        }
+
+        let ch = self.ch.as_ref().ok_or("hypervisor is unavailable")?.clone();
+        // Every deterministic precondition is checked before the recovery
+        // window is armed: only the freeze itself may leave the guest in a
+        // state that has to be released.
+        let hold = match mode {
+            SnapshotMode::Full => SnapshotHold::VmPaused,
+            SnapshotMode::FsOnly => {
+                let mount_point = self.rootfs_guest_mount_point(rootfs_host_path)?;
+                // Checks run before the VM is touched.
+                self.ensure_filesystem_freeze_supported().await?;
+                SnapshotHold::Rootfs { mount_point }
+            }
+        };
+
+        // Arm the recovery window before touching the guest.
+        *self.snapshot_frozen.lock().await = SnapshotFreezeState::Frozen {
+            id: snapshot_id.to_string(),
+            deadline: Instant::now() + Duration::from_secs(300),
+            hold: hold.clone(),
+        };
+        self.arm_snapshot_recovery(snapshot_id, ch.clone());
+        let hold_result = match &hold {
+            SnapshotHold::VmPaused => ch.lock().await.pause_vm().await,
+            SnapshotHold::Rootfs { mount_point } => self.freeze_rootfs(mount_point).await,
+        };
+        if let Err(error) = hold_result {
+            let released = match &hold {
+                // A failed pause leaves no disk frozen.
+                SnapshotHold::VmPaused => true,
+                SnapshotHold::Rootfs { mount_point } => {
+                    // Only a successful thaw proves the guest is writable again.
+                    self.thaw_rootfs(mount_point).await.is_ok()
+                }
+            };
+            self.snapshot_frozen.lock().await.failed_hold(released);
+            if !released {
+                // The caller must treat this sandbox as failed; the recovery
+                // task owns the disk from here.
+                return Err(format!(
+                    "{ERR_FREEZE_FAILED}: {error}; disk may still be frozen and thaw failed"
+                )
+                .into());
+            }
+            return Err(error);
+        }
+
+        let mut snapshot_dir = PathBuf::from(spec_dir);
+        snapshot_dir.push("snapshot");
+        let capture_result: CResult<()> = async {
+            stdfs::create_dir_all(&snapshot_dir).map_err(|e| e.to_string())?;
+            let hypervisor = ch.lock().await;
+            hypervisor
+                .snapshot_vm_with_memory(
+                    &format!("file://{}", snapshot_dir.display()),
+                    memory_vol_url,
+                    snapshot_type,
+                    mode.has_memory(),
+                )
+                .await?;
+            // The memory dump can outlast the initial lease. Extend it before
+            // releasing the hypervisor lock for metadata I/O.
+            if let SnapshotFreezeState::Frozen { id, deadline, .. } =
+                &mut *self.snapshot_frozen.lock().await
+            {
+                if id == snapshot_id {
+                    *deadline = Instant::now() + Duration::from_secs(300);
+                }
+            }
+            drop(hypervisor);
+            self.store_pause_snapshot_metadata(spec_dir).await
+        }
+        .await;
+
+        if let Err(capture_error) = capture_result {
+            let resume_result = match &hold {
+                SnapshotHold::VmPaused => ch.lock().await.resume_vm().await,
+                SnapshotHold::Rootfs { mount_point } => self.thaw_rootfs(mount_point).await,
+            };
+            match resume_result {
+                Ok(()) => {
+                    *self.snapshot_frozen.lock().await = SnapshotFreezeState::Idle;
+                    return Err(capture_error);
+                }
+                Err(resume_error) => {
+                    return Err(format!(
+                        "snapshot capture failed: {capture_error}; resume failed: {resume_error}"
+                    )
+                    .into());
+                }
+            }
+        }
+        self.renew_snapshot_frozen(snapshot_id).await?;
+        Ok(())
+    }
+
+    pub async fn renew_snapshot_frozen(&self, snapshot_id: &str) -> CResult<()> {
+        let mut frozen = self.snapshot_frozen.lock().await;
+        match &mut *frozen {
+            SnapshotFreezeState::Frozen { id, deadline, .. } if id == snapshot_id => {
+                *deadline = Instant::now() + Duration::from_secs(30);
+                Ok(())
+            }
+            SnapshotFreezeState::Expired { id } if id == snapshot_id => {
+                Err("snapshot freeze lease expired; the shim released the sandbox itself".into())
+            }
+            _ => Err("snapshot is no longer frozen".into()),
+        }
+    }
+
+    fn arm_snapshot_recovery(&self, snapshot_id: &str, ch: Arc<Mutex<CH::CubeHypervisor>>) {
+        let marker = self.snapshot_frozen.clone();
+        let snapshot_id = snapshot_id.to_string();
+        let log = self.log.clone();
+        let sandbox_id = self.id.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let mut failures: u32 = 0;
+            loop {
+                tokio::time::sleep(SNAPSHOT_RECOVERY_INTERVAL).await;
+                // Release the marker lock before the slow thaw RPC so
+                // `renew_snapshot_frozen` is not blocked by it.
+                let hold = {
+                    let frozen = marker.lock().await;
+                    match &*frozen {
+                        SnapshotFreezeState::Frozen { id, deadline, hold }
+                            if id == &snapshot_id =>
+                        {
+                            if Instant::now() < *deadline {
+                                // Cubelet renewed the lease while we were waiting.
+                                failures = 0;
+                                continue;
+                            }
+                            hold.clone()
+                        }
+                        _ => return,
+                    }
+                };
+                let result = match &hold {
+                    SnapshotHold::VmPaused => match ch.try_lock() {
+                        Ok(hypervisor) => hypervisor.resume_vm().await,
+                        Err(_) => continue,
+                    },
+                    SnapshotHold::Rootfs { mount_point } => {
+                        thaw_rootfs_with_reconnect(&sandbox_id, client.as_ref(), mount_point).await
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        // The guest is writable again; `Expired` makes
+                        // renew/resume fail closed.
+                        *marker.lock().await = SnapshotFreezeState::Expired {
+                            id: snapshot_id.clone(),
+                        };
+                        warnf!(
+                            log,
+                            "snapshot {} auto-released after Cubelet did not resume it",
+                            snapshot_id
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        if failures < SNAPSHOT_RECOVERY_ATTEMPTS {
+                            warnf!(
+                                log,
+                                "snapshot {} auto-release failed ({}/{}): {}",
+                                snapshot_id,
+                                failures,
+                                SNAPSHOT_RECOVERY_ATTEMPTS,
+                                error
+                            );
+                            continue;
+                        }
+                        // The guest cannot be released; destroy the VM (the
+                        // monitor marks the sandbox Exited).
+                        *marker.lock().await = SnapshotFreezeState::Expired {
+                            id: snapshot_id.clone(),
+                        };
+                        errf!(
+                            log,
+                            "snapshot {} could not be released after {} attempts; destroying the VM: {}",
+                            snapshot_id,
+                            SNAPSHOT_RECOVERY_ATTEMPTS,
+                            error
+                        );
+                        let _ = ch.lock().await.delete_vm().await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn resume_snapshot_frozen(&mut self, snapshot_id: &str) -> CResult<()> {
+        let mut frozen = self.snapshot_frozen.lock().await;
+        if !frozen.resume_needed(snapshot_id)? {
+            return Ok(());
+        }
+        let hold = match &*frozen {
+            SnapshotFreezeState::Frozen { hold, .. } => hold.clone(),
+            _ => return Err("snapshot is no longer frozen".into()),
+        };
+        match hold {
+            SnapshotHold::VmPaused => {
+                self.ch
+                    .as_ref()
+                    .ok_or("hypervisor is unavailable")?
+                    .lock()
+                    .await
+                    .resume_vm()
+                    .await?;
+            }
+            SnapshotHold::Rootfs { mount_point } => {
+                self.thaw_rootfs(&mount_point).await?;
+            }
+        }
+        *frozen = SnapshotFreezeState::Idle;
+        Ok(())
+    }
+
+    /// Resolves the guest mount point of the writable rootfs disk. The caller
+    /// passes the host path it created; the shim owns the host->guest index
+    /// mapping and never guesses "the first disk".
+    fn rootfs_guest_mount_point(&self, host_path: Option<&str>) -> CResult<String> {
+        let path =
+            host_path.ok_or("rootfs host path is required for a filesystem-only snapshot")?;
+        let index = self.conf.disk_path_map.get(path).ok_or_else(|| {
+            format!("{ERR_ROOTFS_UNSUPPORTED}: rootfs path {path} is not a blk-cube disk; cannot locate its guest mount")
+        })?;
+        Ok(Disk::guest_mount_point(*index))
+    }
+
+    async fn freeze_rootfs(&self, mount_point: &str) -> CResult<()> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("agent connection is unavailable; cannot freeze the rootfs")?
+            .lock()
+            .await
+            .clone();
+        let req = agent::FreezeRootfsRequest {
+            mount_point: mount_point.to_string(),
+            ..Default::default()
+        };
+        // The context is what bounds the call (ttrpc applies its timeout to the
+        // response wait); this outer timer is only a backstop, so it must sit
+        // above it, never at the same value.
+        match tokio::time::timeout(
+            FREEZE_CALL_BACKSTOP,
+            client.freeze_rootfs(freeze_rpc_context(), &req),
+        )
+        .await
+        {
+            Ok(result) => result.map(|_| ()).map_err(|e| {
+                format!("{ERR_FREEZE_FAILED}: freeze {mount_point} failed: {e}").into()
+            }),
+            Err(_) => Err(format!(
+                "{ERR_FREEZE_FAILED}: freeze {mount_point} timed out after {}s",
+                FREEZE_RPC_TIMEOUT.as_secs()
+            )
+            .into()),
+        }
+    }
+
+    /// Asks the guest whether this agent build can freeze a filesystem. The
+    /// answer is a property of the agent image, which is independent of the
+    /// shim version that passed the Cubelet gate.
+    async fn ensure_filesystem_freeze_supported(&self) -> CResult<()> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| format!("{ERR_FREEZE_UNSUPPORTED}: agent connection is unavailable"))?
+            .lock()
+            .await
+            .clone();
+        let req = agent::GuestDetailsRequest::default();
+        // Same budget as freeze/thaw: this probe gates the whole capture, so a
+        // short timeout here would report "unsupported" for a guest that is
+        // merely slow to answer.
+        let details = client
+            .get_guest_details(freeze_rpc_context(), &req)
+            .await
+            .map_err(|e| format!("{ERR_FREEZE_UNSUPPORTED}: get guest details failed: {e}"))?;
+        if !details.support_filesystem_freeze {
+            return Err(format!(
+                "{ERR_FREEZE_UNSUPPORTED}: guest agent does not support filesystem freeze"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn thaw_rootfs(&self, mount_point: &str) -> CResult<()> {
+        // A frozen disk must be released even when the cached agent channel
+        // died with the connection that froze it; reconnect instead of giving
+        // up and leaving the sandbox wedged.
+        thaw_rootfs_with_reconnect(&self.id, self.client.as_ref(), mount_point).await
+    }
+
+    pub async fn snapshot_is_frozen(&self) -> bool {
+        matches!(
+            &*self.snapshot_frozen.lock().await,
+            SnapshotFreezeState::Frozen { .. }
+        )
+    }
+
     pub async fn paused(&self) -> bool {
         let state = self.state.lock().await;
         *state == SandBoxState::Paused
@@ -1325,6 +1863,8 @@ impl SandBox {
     ///   `metadata.json` is written beside it — same layout as CommitSandbox
     ///   so Resume can use `get_snapshot_dir(base, cpu, mem)`.
     /// * `memory_vol_url` – optional CubeCow (or device) URL for memory ranges.
+    /// * `snapshot_type` – same Full / Incremental / SoftDirty choice as
+    ///   CommitSandbox (`--snapshot-type`).
     ///
     /// On success the MicroVM is deleted (`pause2snapshot`) and state stays
     /// `Paused`. Cubelet then reaps this shim via task Delete. On failure after
@@ -1333,6 +1873,7 @@ impl SandBox {
         &mut self,
         destination_path: &str,
         memory_vol_url: Option<String>,
+        snapshot_type: SnapshotType,
     ) -> CResult<()> {
         {
             let mut state = self.state.lock().await;
@@ -1347,12 +1888,25 @@ impl SandBox {
         }
 
         if let Err(e) = self
-            .pause_vm_to_snapshot_inner(destination_path, memory_vol_url)
+            .pause_vm_to_snapshot_inner(destination_path, memory_vol_url, snapshot_type)
             .await
         {
+            // A failed pause leaves the sandbox unusable (no resume will
+            // follow), so run the full teardown.
+            let _ = self.disconnect_agent().await;
             let mut state = self.state.lock().await;
             *state = SandBoxState::Exited;
             return Err(e);
+        }
+        self.stop_log_forward_detached().await;
+        // The connections only had to survive the freeze; the VM is gone now,
+        // so disarming the dead client restores the fast "not connected" guards.
+        self.client = None;
+        self.conn = None;
+        self.monitor_conn = None;
+        let mut containers = self.containers.lock().await;
+        for (_, c) in containers.iter_mut() {
+            c.clear_client();
         }
         Ok(())
     }
@@ -1361,8 +1915,9 @@ impl SandBox {
         &mut self,
         destination_path: &str,
         memory_vol_url: Option<String>,
+        snapshot_type: SnapshotType,
     ) -> CResult<()> {
-        self.disconnect_agent(false).await?;
+        self.quiesce_agent_for_pause().await;
 
         let ch = self.ch.as_mut().unwrap().lock().await;
 
@@ -1382,7 +1937,7 @@ impl SandBox {
         })?;
 
         let destination_url = format!("file://{}", snapshot_dir.display());
-        ch.pause_vm_cube_with_config(&destination_url, memory_vol_url)
+        ch.pause_vm_cube_with_config(&destination_url, memory_vol_url, snapshot_type)
             .await?;
 
         // vmshutdown event after pause2snapshot deletes the MicroVM
@@ -1455,7 +2010,7 @@ impl SandBox {
 
         // disconnect_agent aborts the OLD monitor_vm / watch_oom tasks
         // before we delete the VM out from under them.
-        self.disconnect_agent(true).await?;
+        self.disconnect_agent().await?;
 
         // Delete the current VM in place of a checkpoint snapshot.
         // VmDelete shuts the VM down and destroys its object; the VMM process
@@ -1466,13 +2021,9 @@ impl SandBox {
             return Err(e);
         }
 
-        // VmDelete pushes a VmShutdown event into the hypervisor's event
-        // queue. The fresh monitor_vm spawned by resume_vm_with_config
-        // would otherwise consume that stale event on its first iteration
-        // and treat the freshly-restored VM as crashed: aborted=true →
-        // SandBoxState::Exited → notify_vm_shutdown to all containers,
-        // poisoning the next pause/resume request with "sandbox not in
-        // normal state". Drain everything left in the queue here.
+        // Drain stale VmShutdown events left by the delete so the fresh
+        // monitor spawned by resume_vm_with_config does not treat the
+        // restored VM as crashed.
         if let Some(ch_arc) = self.ch.as_ref() {
             let ch = ch_arc.lock().await;
             while let Ok(ev) = ch.try_wait_notify() {
@@ -1512,20 +2063,15 @@ impl SandBox {
             }
         }
 
-        self.connect_agent().await?;
+        self.connect_agent_with_retry(true).await?;
 
-        if self.client.is_none() {
-            errf!(self.log, "client is None in resume_vm");
-            return Err(format!("client is None"));
-        }
+        let client = self.client.as_ref().ok_or("client is None")?;
 
-        self.reset_guest().await?;
-
-        let client = self.client.as_ref().unwrap();
-
-        let mut containers = self.containers.lock().await;
-        for (_, c) in containers.iter_mut() {
-            c.set_client(client.clone()).await?;
+        {
+            let mut containers = self.containers.lock().await;
+            for (_, c) in containers.iter_mut() {
+                c.set_client(client.clone()).await?;
+            }
         }
 
         let (sender, handle) = self.watch_oom().await?;
@@ -1544,6 +2090,48 @@ impl SandBox {
 
         Ok(())
     }
+}
+
+/// Thaw with an explicit reconnect, for callers whose cached agent channel
+/// may be stale (background recovery, resume).
+async fn thaw_rootfs_with_reconnect(
+    sandbox_id: &str,
+    client: Option<&Arc<Mutex<agent_ttrpc::AgentServiceClient>>>,
+    mount_point: &str,
+) -> CResult<()> {
+    if let Some(client) = client {
+        let client = client.lock().await.clone();
+        let req = agent::ThawRootfsRequest {
+            mount_point: mount_point.to_string(),
+            ..Default::default()
+        };
+        if tokio::time::timeout(
+            FREEZE_CALL_BACKSTOP,
+            client.thaw_rootfs(freeze_rpc_context(), &req),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    let conn = AsyncUtils::connect_agent(&sandbox_id.to_string()).await?;
+    let client = agent_ttrpc::AgentServiceClient::new(conn);
+    let req = agent::ThawRootfsRequest {
+        mount_point: mount_point.to_string(),
+        ..Default::default()
+    };
+    tokio::time::timeout(
+        FREEZE_CALL_BACKSTOP,
+        client.thaw_rootfs(freeze_rpc_context(), &req),
+    )
+    .await
+    .map_err(|_| format!("{ERR_THAW_FAILED}: thaw {mount_point} timed out after reconnect"))?
+    .map(|_| ())
+    .map_err(|e| {
+        format!("{ERR_THAW_FAILED}: thaw {mount_point} failed after reconnect: {e}").into()
+    })
 }
 
 fn recreate_dir(path: &str, context: &str) -> CResult<()> {
@@ -1604,11 +2192,194 @@ mod tests {
     use crate::container::container_mgr::ContainerInfo;
     use crate::container::{Container, ANNO_APP_SNAPSHOT_CONTAINER_ID};
 
+    use super::agent;
     use super::agent_ttrpc;
     use super::config;
     use super::normalize_dns_for_agent;
     use super::Log;
     use super::SandBox;
+    use super::{
+        freeze_rpc_context, SnapshotFreezeState, SnapshotHold, SnapshotMode,
+        ERR_FREEZE_UNSUPPORTED, ERR_ROOTFS_UNSUPPORTED, FREEZE_CALL_BACKSTOP, FREEZE_RPC_TIMEOUT,
+    };
+    use cube_hypervisor::SnapshotType;
+
+    fn new_ut_sandbox() -> SandBox {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(128);
+        SandBox::new("ut".to_string(), Log::default(), false, tx)
+    }
+
+    /// Drops the peer so every agent RPC on this client fails immediately.
+    fn attach_dead_agent(sb: &mut SandBox) {
+        let (client_fd, peer_fd) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        drop(peer_fd);
+        let client = ttrpc::r#async::Client::new(client_fd.into_raw_fd());
+        sb.client = Some(Arc::new(Mutex::new(agent_ttrpc::AgentServiceClient::new(
+            client,
+        ))));
+    }
+
+    #[tokio::test]
+    async fn filesystem_only_capture_rejects_a_memory_volume() {
+        let mut sb = new_ut_sandbox();
+        let err = sb
+            .capture_snapshot_frozen(
+                "snap-1",
+                "/tmp/spec",
+                Some("dev://memory".to_string()),
+                SnapshotType::Full,
+                SnapshotMode::FsOnly,
+                Some("/data/rootfs.img"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must not carry a memory volume"));
+        assert!(!sb.snapshot_is_frozen().await);
+    }
+
+    #[tokio::test]
+    async fn filesystem_only_capture_requires_a_rootfs_mount() {
+        let mut sb = new_ut_sandbox();
+        let err = sb
+            .capture_snapshot_frozen(
+                "snap-1",
+                "/tmp/spec",
+                None,
+                SnapshotType::Full,
+                SnapshotMode::FsOnly,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rootfs host path is required"));
+        assert!(!sb.snapshot_is_frozen().await);
+
+        // A host path that is not a blk-cube disk cannot be mapped to a guest
+        // mount either; refuse before touching the VM.
+        let err = sb
+            .capture_snapshot_frozen(
+                "snap-1",
+                "/tmp/spec",
+                None,
+                SnapshotType::Full,
+                SnapshotMode::FsOnly,
+                Some("/data/not-a-disk"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(ERR_ROOTFS_UNSUPPORTED));
+        assert!(!sb.snapshot_is_frozen().await);
+    }
+
+    #[tokio::test]
+    async fn filesystem_only_capture_rejects_an_agent_without_freeze_support() {
+        let mut sb = new_ut_sandbox();
+        sb.conf
+            .disk_path_map
+            .insert("/data/rootfs.img".to_string(), 1);
+        attach_dead_agent(&mut sb);
+
+        let err = sb
+            .capture_snapshot_frozen(
+                "snap-1",
+                "/tmp/spec",
+                None,
+                SnapshotType::Full,
+                SnapshotMode::FsOnly,
+                Some("/data/rootfs.img"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(ERR_FREEZE_UNSUPPORTED));
+        assert!(!sb.snapshot_is_frozen().await);
+    }
+
+    #[test]
+    fn the_freeze_calls_use_their_own_timeout_budget() {
+        assert_eq!(
+            freeze_rpc_context().timeout_nano,
+            FREEZE_RPC_TIMEOUT.as_nanos() as i64,
+            "freeze/thaw must not inherit the sandbox-wide short context"
+        );
+        assert!(
+            FREEZE_CALL_BACKSTOP > FREEZE_RPC_TIMEOUT,
+            "the outer timer must never fire before the RPC budget"
+        );
+    }
+
+    #[test]
+    fn a_failed_hold_is_only_dropped_when_the_release_is_proven() {
+        let mut state = SnapshotFreezeState::Frozen {
+            id: "snap-1".to_string(),
+            deadline: std::time::Instant::now(),
+            hold: SnapshotHold::Rootfs {
+                mount_point: "/run/blk-cube/vdb".to_string(),
+            },
+        };
+        state.failed_hold(false);
+        match &state {
+            SnapshotFreezeState::Frozen { deadline, .. } => assert!(
+                *deadline <= std::time::Instant::now(),
+                "a failed capture must hand the disk to the recovery task immediately"
+            ),
+            _ => panic!("an unproven release must stay Frozen"),
+        }
+        state.failed_hold(true);
+        assert!(matches!(state, SnapshotFreezeState::Idle));
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_the_hold_when_the_guest_cannot_be_reached() {
+        let mut sb = new_ut_sandbox();
+        attach_dead_agent(&mut sb);
+        *sb.snapshot_frozen.lock().await = SnapshotFreezeState::Frozen {
+            id: "snap-1".to_string(),
+            deadline: std::time::Instant::now(),
+            hold: SnapshotHold::Rootfs {
+                mount_point: "/run/blk-cube/vdb".to_string(),
+            },
+        };
+
+        assert!(sb.resume_snapshot_frozen("snap-1").await.is_err());
+        assert!(sb.snapshot_is_frozen().await);
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_hold_is_a_noop() {
+        let mut sb = new_ut_sandbox();
+        sb.resume_snapshot_frozen("snap-1").await.unwrap();
+        assert!(!sb.snapshot_is_frozen().await);
+    }
+
+    #[tokio::test]
+    async fn expired_snapshot_freeze_rejects_resume_and_renew() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(128);
+        let mut sb = SandBox::new("ut".to_string(), Log::default(), false, tx);
+        *sb.snapshot_frozen.lock().await = SnapshotFreezeState::Expired {
+            id: "snap-1".to_string(),
+        };
+
+        assert!(!sb.snapshot_is_frozen().await);
+        assert!(sb
+            .renew_snapshot_frozen("snap-1")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("lease expired"));
+        assert!(sb
+            .resume_snapshot_frozen("snap-1")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("lease expired"));
+        assert!(sb.resume_snapshot_frozen("snap-2").await.is_err());
+    }
 
     #[tokio::test]
     async fn test_sandbox_prepare_resource() {
@@ -1631,6 +2402,7 @@ mod tests {
         assert_eq!(vm_config.vcpus, 999);
         assert_eq!(vm_config.memory_size, 999);
         assert_eq!(vm_config.kernel, "ut_kernel".to_string());
+        assert!(vm_config.to_vm_config().balloon.is_some());
         assert!(vm_config.cmdlines.contains(&"custom.param=42".to_string()));
         assert!(vm_config
             .cmdlines
@@ -1727,5 +2499,72 @@ mod tests {
 
         let got = normalize_dns_for_agent(" options  ndots:5  timeout:2 ").unwrap();
         assert_eq!(got, "options ndots:5 timeout:2");
+    }
+
+    fn sandbox_with_restore_annos(annos: HashMap<String, String>) -> SandBox {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let mut sb = SandBox::new("ut".to_string(), Log::default(), false, tx);
+        sb.spec = SpecBuilder::default().annotations(annos).build().unwrap();
+        sb.conf.app_snapshot_restore = true;
+        sb.conf.virtiofs = vec![config::VirtioFs {
+            id: "virtio_rw".to_string(),
+            propagation_mount_name: "virtio_rw".to_string(),
+            ..Default::default()
+        }];
+        sb
+    }
+
+    fn virtiofs_sources(storages: &[agent::Storage]) -> Vec<String> {
+        storages
+            .iter()
+            .filter(|s| s.driver == "virtio-fs")
+            .map(|s| s.source.clone())
+            .collect()
+    }
+
+    #[test]
+    fn guest_mount_restore_matches_pause_and_fromsnap() {
+        let pause = sandbox_with_restore_annos(HashMap::from([(
+            config::ANNO_PAUSE_SNAPSHOT_ID.to_string(),
+            "snap-pause1".to_string(),
+        )]));
+        assert!(pause.pause_resume());
+        assert!(pause.guest_mount_restore());
+
+        let from_snap = sandbox_with_restore_annos(HashMap::from([(
+            config::ANNO_RUNTIME_SNAPSHOT_ID.to_string(),
+            "snap-runtime1".to_string(),
+        )]));
+        assert!(!from_snap.pause_resume());
+        assert!(from_snap.from_snapshot());
+        assert!(from_snap.guest_mount_restore());
+
+        let from_tpl = sandbox_with_restore_annos(HashMap::new());
+        assert!(!from_tpl.pause_resume());
+        assert!(!from_tpl.from_snapshot());
+        assert!(!from_tpl.guest_mount_restore());
+    }
+
+    #[test]
+    fn get_storages_skips_virtiofs_on_memory_restore() {
+        let mut pause = sandbox_with_restore_annos(HashMap::from([(
+            config::ANNO_PAUSE_SNAPSHOT_ID.to_string(),
+            "snap-pause1".to_string(),
+        )]));
+        assert!(
+            !virtiofs_sources(&pause.get_storages().unwrap()).contains(&"virtio_rw".to_string())
+        );
+
+        let mut from_snap = sandbox_with_restore_annos(HashMap::from([(
+            config::ANNO_RUNTIME_SNAPSHOT_ID.to_string(),
+            "snap-runtime1".to_string(),
+        )]));
+        assert!(!virtiofs_sources(&from_snap.get_storages().unwrap())
+            .contains(&"virtio_rw".to_string()));
+
+        let mut from_tpl = sandbox_with_restore_annos(HashMap::new());
+        assert!(
+            virtiofs_sources(&from_tpl.get_storages().unwrap()).contains(&"virtio_rw".to_string())
+        );
     }
 }

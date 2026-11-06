@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // CubeVSAdapter is the controller's boundary to CubeNet/cubevs. Keeping it as
@@ -21,6 +21,7 @@ type CubeVSAdapter interface {
 	AddTAPDevice(ifindex uint32, ip net.IP, sandboxID string, version uint32, opts cubevs.MVMOptions) error
 	UpsertTAPDevice(ifindex uint32, ip net.IP, sandboxID string, version uint32, opts cubevs.MVMOptions) error
 	UpsertTAPDeviceMetadata(ifindex uint32, ip net.IP, sandboxID string, version uint32) error
+	UpdateTAPPolicy(ifindex uint32, opts cubevs.MVMOptions) error
 	GetTAPDevice(ifindex uint32) (*cubevs.TAPDevice, error)
 	CleanupTAPPolicy(ifindex uint32) error
 	DeleteTAPDeviceMetadata(ifindex uint32, ip net.IP) error
@@ -50,6 +51,10 @@ func (realCubeVSAdapter) UpsertTAPDevice(ifindex uint32, ip net.IP, sandboxID st
 
 func (realCubeVSAdapter) UpsertTAPDeviceMetadata(ifindex uint32, ip net.IP, sandboxID string, version uint32) error {
 	return cubevs.UpsertTAPDeviceMetadata(ifindex, ip, sandboxID, version)
+}
+
+func (realCubeVSAdapter) UpdateTAPPolicy(ifindex uint32, opts cubevs.MVMOptions) error {
+	return cubevs.UpdateTAPDevicePolicy(ifindex, opts)
 }
 
 func (realCubeVSAdapter) GetTAPDevice(ifindex uint32) (*cubevs.TAPDevice, error) {
@@ -91,7 +96,7 @@ func (realCubeVSAdapter) DeletePortMappingsByIfindex(ifindex uint32) error {
 // registerCubeVSTap writes the complete TAP metadata and policy options into
 // CubeVS for a newly-created sandbox.
 func (s *NetworkController) registerCubeVSTap(ifindex int, ip net.IP, sandboxID string, cfg *CubeNetworkConfig) (err error) {
-	opts, err := cubeVSTapRegistration(cfg)
+	opts, err := cubeVSTapRegistration(withOperatorAllowOut(cfg, s.cfg.OperatorAllowOut))
 	if err != nil {
 		return err
 	}
@@ -119,11 +124,27 @@ func (s *NetworkController) registerCubeVSTap(ifindex int, ip net.IP, sandboxID 
 	return err
 }
 
+// updateCubeVSTapPolicy converges an active sandbox's CubeVS policy on cfg and
+// bumps its policy generation so established flows are re-evaluated. Unlike
+// register/replace it neither touches TAP metadata nor flushes the policy maps,
+// because the sandbox is live and must not lose its policy mid-update.
+func (s *NetworkController) updateCubeVSTapPolicy(ifindex int, sandboxID string, cfg *CubeNetworkConfig) error {
+	opts, err := cubeVSTapRegistration(withOperatorAllowOut(cfg, s.cfg.OperatorAllowOut))
+	if err != nil {
+		return err
+	}
+	CubeLog.WithContext(context.Background()).Infof(
+		"network runtime update cubevs policy: sandbox_id=%s ifindex=%d cube_network_config=%s",
+		sandboxID, ifindex, formatCubeNetworkConfig(cfg),
+	)
+	return s.cubevsAdapter.UpdateTAPPolicy(uint32(ifindex), opts)
+}
+
 // replaceCubeVSTap rewrites TAP metadata and the complete desired CubeVS policy.
 // Legacy recovery uses this to avoid carrying old allow/deny/DNS residue into
 // the recovered Active sandbox.
 func (s *NetworkController) replaceCubeVSTap(ifindex int, ip net.IP, sandboxID string, cfg *CubeNetworkConfig) error {
-	opts, err := cubeVSTapRegistration(cfg)
+	opts, err := cubeVSTapRegistration(withOperatorAllowOut(cfg, s.cfg.OperatorAllowOut))
 	if err != nil {
 		return err
 	}

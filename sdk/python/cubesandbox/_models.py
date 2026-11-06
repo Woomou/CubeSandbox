@@ -197,17 +197,28 @@ class SnapshotInfo:
 
     snapshot_id: str
     names: list[str] = field(default_factory=list)
+    #: Artifact mode the control plane recorded: ``"full"`` or ``"fs-only"``.
+    #: Servers that predate filesystem-only snapshots omit it; the default
+    #: keeps their responses truthful (everything they can produce is full).
+    mode: str = "full"
 
     @classmethod
     def from_dict(cls, data: dict) -> "SnapshotInfo":
         return cls(
             snapshot_id=data.get("snapshotID", ""),
             names=data.get("names") or [],
+            mode=data.get("mode") or "full",
         )
 
 
 class SandboxState(str, Enum):
     """E2B-compatible sandbox lifecycle state.
+
+    E2B's own SDK declares only ``RUNNING`` and ``PAUSED``. CubeAPI also
+    reports ``pausing`` while a pause is in flight and ``unknown`` for a
+    sandbox that is still being created, whose state could not be read, or
+    that has already exited, so both are declared here: every state CubeAPI
+    documents resolves to a member instead of falling back to a raw string.
 
     Subclasses ``str`` so comparisons against plain strings (e.g.
     ``state == "running"``) keep working for existing callers.
@@ -215,6 +226,8 @@ class SandboxState(str, Enum):
 
     RUNNING = "running"
     PAUSED = "paused"
+    PAUSING = "pausing"
+    UNKNOWN = "unknown"
 
     def __str__(self) -> str:
         return self.value
@@ -312,6 +325,7 @@ class SandboxInfo(dict[str, Any]):
     end_at: datetime | None = None
     state: SandboxState | str | None = None
     cpu_count: int | None = None
+    cpu_milli: int | None = None
     memory_mb: int | None = None
     envd_version: str = ""
     _envd_access_token: str | None = field(default=None, repr=False)
@@ -331,6 +345,7 @@ class SandboxInfo(dict[str, Any]):
             "endAt": self.end_at.isoformat() if self.end_at else None,
             "state": self.state.value if isinstance(self.state, SandboxState) else self.state,
             "cpuCount": self.cpu_count,
+            "cpuMilli": self.cpu_milli,
             "memoryMB": self.memory_mb,
             "envdVersion": self.envd_version,
             "diskSizeMB": self.disk_size_mb,
@@ -351,6 +366,7 @@ class SandboxInfo(dict[str, Any]):
             end_at=_parse_timestamp(data.get("endAt")),
             state=_normalize_state(data.get("state")),
             cpu_count=data.get("cpuCount"),
+            cpu_milli=data.get("cpuMilli"),
             memory_mb=data.get("memoryMB"),
             envd_version=data.get("envdVersion", ""),
             _envd_access_token=data.get("envdAccessToken"),
@@ -421,3 +437,4 @@ def _serialize_results(results: list[Result]) -> list[dict[str, Any]]:
         item["text"] = result.text
         serialized.append(item)
     return serialized
+

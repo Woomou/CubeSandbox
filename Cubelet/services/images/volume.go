@@ -15,7 +15,6 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/multimetadb/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -26,7 +25,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/volumefile"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/multimeta"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -169,6 +169,9 @@ func (l *volumeLocal) Create(ctx context.Context, opts *workflow.CreateContext) 
 func (l *volumeLocal) Destroy(ctx context.Context, opts *workflow.DestroyContext) error {
 	if opts == nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "workflow.DestroyContext nil")
+	}
+	if workflow.RetainFor(opts).Volume {
+		return nil
 	}
 	log.G(ctx).Debugf("Destroy doing")
 	info, err := l.readVolumeInfo(ctx, opts.SandboxID)

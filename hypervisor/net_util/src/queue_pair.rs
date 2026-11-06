@@ -15,12 +15,26 @@ use vm_memory::bitmap::Bitmap;
 use vm_memory::{Bytes, GuestMemory};
 use vm_virtio::{AccessPlatform, Translatable};
 
+/// Whether an EIO-drop log line should be emitted after the cumulative dropped
+/// count moved from `before` to `after`. Log the first drop, then once per
+/// 1000-frame boundary crossed, so a persistently down tap cannot flood the
+/// log at line rate. The `tx_dropped_frames` counter is the source of truth
+/// for monitoring; this log is best-effort.
+fn should_log_dropped(before: u64, after: u64) -> bool {
+    (before == 0 && after > 0) || before / 1000 != after / 1000
+}
+
 #[derive(Clone)]
 pub struct TxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
     pub limit_bytes: Wrapping<u64>,
     pub limit_frames: Wrapping<u64>,
+    /// Frames the tap refused with EIO and we dropped instead of killing the
+    /// VM (see the EIO branch in `process_desc_chain`).
+    pub dropped_frames: Wrapping<u64>,
+    /// Malformed frames shorter than the mandatory virtio-net header.
+    pub malformed_frames: Wrapping<u64>,
 }
 
 impl Default for TxVirtio {
@@ -36,6 +50,8 @@ impl TxVirtio {
             counter_frames: Wrapping(0),
             limit_bytes: Wrapping(0),
             limit_frames: Wrapping(0),
+            dropped_frames: Wrapping(0),
+            malformed_frames: Wrapping(0),
         }
     }
 
@@ -93,7 +109,16 @@ impl TxVirtio {
                 next_desc = desc_chain.next();
             }
 
-            let len = if !iovecs.is_empty() {
+            let frame_len = iovecs.iter().map(|iovec| iovec.iov_len).sum::<usize>();
+            let len = if frame_len < vnet_hdr_len() {
+                // The virtio-net header is mandatory. Letting the short chain
+                // reach a VNET_HDR tap makes Linux return EINVAL, which is
+                // otherwise indistinguishable from a host-side tap failure.
+                // Complete it with zero bytes so a malformed guest frame cannot
+                // terminate the worker.
+                self.malformed_frames += Wrapping(1);
+                0
+            } else {
                 let result = unsafe {
                     libc::writev(
                         tap.as_raw_fd() as libc::c_int,
@@ -111,16 +136,22 @@ impl TxVirtio {
                         retry_write = true;
                         break;
                     }
-                    error!("net: tx: failed writing to tap: {}", e);
-                    return Err(NetQueuePairError::WriteTap(e));
+
+                    if e.raw_os_error() != Some(libc::EIO) {
+                        error!("net: tx: failed writing to tap: {}", e);
+                        return Err(NetQueuePairError::WriteTap(e));
+                    }
+
+                    // EIO: the tap refused the frame (device down / carrier
+                    // not up). Drop it like real hardware would and keep the
+                    // queue alive; see the commit message for the rationale.
+                    self.dropped_frames += Wrapping(1);
+                    0
+                } else {
+                    self.counter_bytes += Wrapping(result as u64 - vnet_hdr_len() as u64);
+                    self.counter_frames += Wrapping(1);
+                    result as u32
                 }
-
-                self.counter_bytes += Wrapping(result as u64 - vnet_hdr_len() as u64);
-                self.counter_frames += Wrapping(1);
-
-                result as u32
-            } else {
-                0
             };
 
             // For the sake of simplicity (similar to the RX rate limiting), we always
@@ -322,6 +353,8 @@ impl RxVirtio {
 pub struct NetCounters {
     pub tx_bytes: Arc<AtomicU64>,
     pub tx_frames: Arc<AtomicU64>,
+    pub tx_dropped_frames: Arc<AtomicU64>,
+    pub tx_malformed_frames: Arc<AtomicU64>,
     pub rx_bytes: Arc<AtomicU64>,
     pub rx_frames: Arc<AtomicU64>,
     pub rx_limit_bytes: Arc<AtomicU64>,
@@ -427,15 +460,33 @@ impl NetQueuePair {
             .tx_frames
             .fetch_add(self.tx.counter_frames.0, Ordering::AcqRel);
         self.counters
+            .tx_malformed_frames
+            .fetch_add(self.tx.malformed_frames.0, Ordering::AcqRel);
+        self.counters
             .tx_limit_bytes
             .fetch_add(self.tx.limit_bytes.0, Ordering::AcqRel);
         self.counters
             .tx_limit_frames
             .fetch_add(self.tx.limit_frames.0, Ordering::AcqRel);
+        if self.tx.dropped_frames.0 != 0 {
+            let before = self
+                .counters
+                .tx_dropped_frames
+                .fetch_add(self.tx.dropped_frames.0, Ordering::AcqRel);
+            let after = before + self.tx.dropped_frames.0;
+            if should_log_dropped(before, after) {
+                debug!(
+                    "net: tx: tap refused frame(s) with EIO; dropping instead of failing the VM (total dropped: {})",
+                    after
+                );
+            }
+        }
         self.tx.counter_bytes = Wrapping(0);
         self.tx.counter_frames = Wrapping(0);
         self.tx.limit_bytes = Wrapping(0);
         self.tx.limit_frames = Wrapping(0);
+        self.tx.dropped_frames = Wrapping(0);
+        self.tx.malformed_frames = Wrapping(0);
 
         queue
             .needs_notification(mem)
@@ -494,5 +545,83 @@ impl NetQueuePair {
         queue
             .needs_notification(mem)
             .map_err(NetQueuePairError::QueueNeedsNotification)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_log_dropped, NetCounters, TxVirtio};
+    use std::num::Wrapping;
+    use std::sync::atomic::Ordering;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_virtio::queue::testing::VirtQueue as GuestQ;
+
+    #[test]
+    fn drops_short_tx_chain_without_writing_to_tap() {
+        const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
+        const FRAME_ADDRESS: GuestAddress = GuestAddress(0x2_0000);
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3_0000)]).unwrap();
+        let guest_queue = GuestQ::new(QUEUE_ADDRESS, &memory, 4);
+        guest_queue.dtable[0].set(FRAME_ADDRESS.0, 9, 0, 0);
+        guest_queue.avail.ring[0].set(0);
+        guest_queue.avail.idx.set(1);
+        let mut queue = guest_queue.create_queue();
+
+        // A regular file is deliberately not a TAP. The short-frame check must
+        // complete the chain before touching the fd, which also makes this a
+        // deterministic fault-injection test without CAP_NET_ADMIN.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut tap = super::Tap::from_file_for_test(file);
+        let mut tx = TxVirtio::new();
+        tx.process_desc_chain(
+            &memory,
+            &mut tap,
+            &mut queue,
+            &mut None,
+            None,
+            &mut std::sync::Once::new(),
+        )
+        .unwrap();
+
+        assert_eq!(guest_queue.used.idx.get(), 1);
+        assert_eq!(tx.malformed_frames, Wrapping(1));
+        assert_eq!(tx.dropped_frames, Wrapping(0));
+    }
+
+    #[test]
+    fn malformed_counter_is_independent_from_eio_drops() {
+        let counters = NetCounters::default();
+        counters.tx_malformed_frames.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(counters.tx_malformed_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.tx_dropped_frames.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn logs_first_drop() {
+        assert!(should_log_dropped(0, 1));
+        assert!(should_log_dropped(0, 5));
+    }
+
+    #[test]
+    fn suppresses_within_the_same_thousand_bucket() {
+        assert!(!should_log_dropped(1, 2));
+        assert!(!should_log_dropped(500, 999));
+        assert!(!should_log_dropped(1000, 1500));
+    }
+
+    #[test]
+    fn logs_on_each_thousand_boundary_crossed() {
+        assert!(should_log_dropped(999, 1000));
+        assert!(should_log_dropped(1999, 2001));
+        // A single batch spanning several boundaries still logs once.
+        assert!(should_log_dropped(1500, 4200));
+    }
+
+    #[test]
+    fn no_log_when_nothing_was_dropped() {
+        assert!(!should_log_dropped(0, 0));
+        assert!(!should_log_dropped(42, 42));
     }
 }

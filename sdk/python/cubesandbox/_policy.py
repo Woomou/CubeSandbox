@@ -25,6 +25,17 @@ Method = Literal[
 
 AuditLevel = Literal["full", "metadata", "none"]
 
+# Align with e2b maxNetworkRuleHeaderValueLen. Well under nginx's default
+# large_client_header_buffers (8k), so injected headers fit common proxies.
+SECRET_MAX_BYTES = 2048
+
+
+def _validate_inject_secret(secret: Any, field: str) -> None:
+    if not isinstance(secret, str):
+        return
+    if len(secret.encode("utf-8")) > SECRET_MAX_BYTES:
+        raise ValueError(f"{field} exceeds {SECRET_MAX_BYTES} bytes")
+
 
 def _validate_scheme(value: Any, field: str) -> Optional[str]:
     """Normalize *value* (strip + lowercase) and validate against http/https.
@@ -118,6 +129,9 @@ class Inject:
     secret: str
     format: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        _validate_inject_secret(self.secret, "Inject.secret")
+
     def render(self) -> str:
         """Render the final injected header value (preview helper)."""
         fmt = self.format or "${SECRET}"
@@ -204,7 +218,9 @@ def _normalize_match_dict(m: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_inject_dict(i: Dict[str, Any]) -> Dict[str, Any]:
     # No snake_case keys to translate today; pass through verbatim.
-    return dict(i)
+    out = dict(i)
+    _validate_inject_secret(out.get("secret"), "inject.secret")
+    return out
 
 
 def _normalize_action_dict(a: Dict[str, Any]) -> Dict[str, Any]:
@@ -424,6 +440,80 @@ def _validate_allow_out_domains_require_deny_all(
     from ._exceptions import ApiError
 
     raise ApiError(ALLOW_OUT_DOMAIN_REQUIRES_DENY_ALL, 400)
+
+
+def _build_network_update_body(network: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate ``Sandbox.update_network``'s single argument into the API body.
+
+    The update endpoint takes the policy at the top level and carries
+    ``allow_internet_access`` alongside it, so this flattens what
+    :func:`_build_network_payload` nests. Only keys the caller actually supplied
+    are emitted: the flag is presence-based, matching E2B, so omitting it is
+    distinct from sending ``true``.
+    """
+    unknown = set(network) - _NETWORK_UPDATE_KEYS
+    if unknown:
+        raise ValueError(
+            f"network has unsupported keys: {sorted(unknown)!r}; "
+            f"supported keys are {sorted(_NETWORK_UPDATE_KEYS)!r}"
+        )
+    allow_internet_access = network.get("allow_internet_access", True)
+    if not isinstance(allow_internet_access, bool):
+        raise ValueError(
+            "network.allow_internet_access must be a bool, got "
+            f"{type(allow_internet_access).__name__}"
+        )
+    body = _build_network_payload(network, allow_internet_access=allow_internet_access)
+    if "allow_internet_access" in network:
+        body["allowInternetAccess"] = allow_internet_access
+    return body
+
+
+_NETWORK_UPDATE_KEYS = frozenset(
+    {
+        "allow_out",
+        "deny_out",
+        "rules",
+        "allow_internet_access",
+        "allow_public_traffic",
+        "mask_request_host",
+    }
+)
+
+
+def _build_network_payload(
+    network: Dict[str, Any],
+    *,
+    allow_internet_access: bool = True,
+) -> Dict[str, Any]:
+    """Translate the SDK's snake_case ``network`` argument into the API body.
+
+    Shared by sandbox creation and :meth:`Sandbox.update_network` so both accept
+    exactly the same argument shape and run the same client-side validation.
+    """
+    _validate_allow_out_domains_require_deny_all(
+        network.get("allow_out"),
+        network.get("deny_out"),
+        default_deny_all=not allow_internet_access,
+    )
+    net: Dict[str, Any] = {}
+    if "allow_out" in network:
+        net["allowOut"] = network["allow_out"]
+    if "deny_out" in network:
+        net["denyOut"] = network["deny_out"]
+    if "allow_public_traffic" in network:
+        net["allowPublicTraffic"] = network["allow_public_traffic"]
+    if "mask_request_host" in network:
+        net["maskRequestHost"] = network["mask_request_host"]
+    if network.get("rules"):
+        # ``rules`` accepts either CubeEgress's list-of-Rule shape or E2B's
+        # per-host transform mapping (``{host: [{transform: {...}}]}``).
+        # ``_normalize_rules_arg`` collapses both into a list of rule dicts
+        # that ``_serialize_rule`` understands.
+        normalized_rules = _normalize_rules_arg(network["rules"])
+        if normalized_rules:
+            net["rules"] = [_serialize_rule(r) for r in normalized_rules]
+    return net
 
 
 def _is_domain_allow_out_target(target: object) -> bool:

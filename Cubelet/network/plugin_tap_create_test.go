@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/internal/tomlext"
 	networkruntime "github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime"
 	networktypes "github.com/tencentcloud/CubeSandbox/Cubelet/network/types"
 	networkstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/network"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 type fakeNetworkRuntime struct {
@@ -29,14 +29,18 @@ type fakeNetworkRuntime struct {
 	lastEnsureRequest  *networkruntime.EnsureNetworkRequest
 	releaseCalled      bool
 	lastReleaseRequest *networkruntime.ReleaseNetworkRequest
-	listTaps           []networkruntime.TapState
-	dumpPolicies       map[string]map[string]any
-	healthErrs         []error
-	healthCalls        int
-	tapFiles           []*os.File
-	getTapFileCalls    int
-	lastTapSandboxID   string
-	lastTapName        string
+
+	lastUpdatePolicyRequest *networkruntime.UpdateNetworkPolicyRequest
+	updatePolicyErr         error
+
+	listTaps         []networkruntime.TapState
+	dumpPolicies     map[string]map[string]any
+	healthErrs       []error
+	healthCalls      int
+	tapFiles         []*os.File
+	getTapFileCalls  int
+	lastTapSandboxID string
+	lastTapName      string
 }
 
 func (c *fakeNetworkRuntime) EnsureNetwork(_ context.Context, req *networkruntime.EnsureNetworkRequest) (*networkruntime.EnsureNetworkResponse, error) {
@@ -50,7 +54,7 @@ func (c *fakeNetworkRuntime) EnsureNetwork(_ context.Context, req *networkruntim
 		NetworkHandle: "sandbox-1",
 		Interfaces: []networkruntime.Interface{
 			{
-				Name:    "z192.168.0.40",
+				Name:    "192.168.0.40",
 				MAC:     "20:90:6f:fc:fc:fc",
 				MTU:     1500,
 				IPs:     []string{"169.254.68.6/30"},
@@ -82,6 +86,11 @@ func (c *fakeNetworkRuntime) ReleaseNetwork(_ context.Context, req *networkrunti
 	c.releaseCalled = true
 	c.lastReleaseRequest = req
 	return &networkruntime.ReleaseNetworkResponse{Released: true, PersistMetadata: req.PersistMetadata}, nil
+}
+
+func (c *fakeNetworkRuntime) UpdateNetworkPolicy(_ context.Context, req *networkruntime.UpdateNetworkPolicyRequest) error {
+	c.lastUpdatePolicyRequest = req
+	return c.updatePolicyErr
 }
 
 func (c *fakeNetworkRuntime) ListTaps(_ context.Context, _ *networkruntime.ListTapsRequest) (*networkruntime.ListTapsResponse, error) {
@@ -161,8 +170,89 @@ func TestTapCreateWithNetworkRuntimeCallsEnsureNetwork(t *testing.T) {
 		t.Fatal("network runtime ReleaseNetwork was called despite successful Create")
 	}
 	shimInfo, ok := opts.NetworkInfo.(*networktypes.ShimNetReq)
-	if !ok || shimInfo == nil || len(shimInfo.Interfaces) != 1 || shimInfo.Interfaces[0].Name != "z192.168.0.40" {
+	if !ok || shimInfo == nil || len(shimInfo.Interfaces) != 1 || shimInfo.Interfaces[0].Name != "192.168.0.40" {
 		t.Fatalf("NetworkInfo not populated from runtime response: %+v", opts.NetworkInfo)
+	}
+}
+
+func TestRestartRebuildsNetworkWhenMetadataMissing(t *testing.T) {
+	fakeClient := &fakeNetworkRuntime{}
+	store := networkstore.NewStore(nil)
+	store.Add(networkstore.NetworkAllocation{
+		SandboxID:          "sandbox-1",
+		NetworkType:        cubebox.NetworkType_tap.String(),
+		PersistentMetadata: []byte(`{"sandbox_ip":"192.168.0.40"}`),
+	})
+	manager := &delegateNetworkManager{
+		tapPlugin: &local{
+			Config: &Config{
+				MVMMacAddr:  "20:90:6f:fc:fc:fc",
+				MvmMtu:      1500,
+				MvmGwDestIP: "169.254.68.5",
+				MVMInnerIP:  "169.254.68.6",
+				MvmMask:     30,
+			},
+			networkRuntime: fakeClient,
+		},
+		allocationStore: store,
+	}
+	opts := &workflow.CreateContext{
+		IsRestart:        true,
+		BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: "sandbox-1"},
+		ReqInfo: &cubebox.RunCubeSandboxRequest{
+			RequestID:    "restart-1",
+			InstanceType: cubebox.InstanceType_cubebox.String(),
+			NetworkType:  cubebox.NetworkType_tap.String(),
+		},
+	}
+
+	if err := manager.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	if !fakeClient.ensureCalled {
+		t.Fatal("EnsureNetwork was not called to rebuild shim metadata")
+	}
+	shimInfo, ok := opts.NetworkInfo.(*networktypes.ShimNetReq)
+	if !ok || shimInfo == nil || len(shimInfo.Interfaces) != 1 {
+		t.Fatalf("NetworkInfo not rebuilt: %+v", opts.NetworkInfo)
+	}
+	stored, err := store.Get("sandbox-1")
+	if err != nil || stored.Metadata == nil {
+		t.Fatalf("allocation metadata not restored: %+v %v", stored, err)
+	}
+}
+
+func TestRestartKeepsStoredNetworkMetadata(t *testing.T) {
+	fakeClient := &fakeNetworkRuntime{}
+	store := networkstore.NewStore(nil)
+	storedReq := &networktypes.ShimNetReq{
+		Interfaces: []*networktypes.Interface{{Name: "kept"}},
+	}
+	store.Add(networkstore.NetworkAllocation{
+		SandboxID:   "sandbox-1",
+		NetworkType: cubebox.NetworkType_tap.String(),
+		Metadata:    storedReq,
+	})
+	manager := &delegateNetworkManager{
+		tapPlugin: &local{
+			Config:         &Config{},
+			networkRuntime: fakeClient,
+		},
+		allocationStore: store,
+	}
+	opts := &workflow.CreateContext{
+		IsRestart:        true,
+		BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: "sandbox-1"},
+		ReqInfo:          &cubebox.RunCubeSandboxRequest{NetworkType: cubebox.NetworkType_tap.String()},
+	}
+	if err := manager.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	if fakeClient.ensureCalled {
+		t.Fatal("EnsureNetwork ran even though allocation metadata was present")
+	}
+	if opts.NetworkInfo != storedReq {
+		t.Fatalf("NetworkInfo = %+v, want stored request", opts.NetworkInfo)
 	}
 }
 
@@ -323,6 +413,34 @@ func TestTapCreateWithNetworkRuntimeAddsDNSAllowOutCIDRsForDomainAllow(t *testin
 	wantAllowOut := []string{"172.67.0.0/16", "api.example.com", "1.1.1.1/32", "8.8.8.8/32"}
 	if strings.Join(fakeClient.lastEnsureRequest.CubeNetworkConfig.AllowOut, ",") != strings.Join(wantAllowOut, ",") {
 		t.Fatalf("AllowOut=%v, want %v", fakeClient.lastEnsureRequest.CubeNetworkConfig.AllowOut, wantAllowOut)
+	}
+}
+
+func TestTapCreateWithNetworkRuntimeForwardsQosToShim(t *testing.T) {
+	fakeClient := &fakeNetworkRuntime{}
+	l := &local{
+		Config:         &Config{MvmGwDestIP: "169.254.68.5", MVMInnerIP: "169.254.68.6", MvmMask: 30},
+		networkRuntime: fakeClient,
+	}
+	opts := &workflow.CreateContext{
+		BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: "sandbox-qos"},
+		ReqInfo: &cubebox.RunCubeSandboxRequest{
+			RequestID: "qos-request",
+			Annotations: map[string]string{
+				"cube.master.net": `{"Version":1,"Qos":{"BandWidth":{"Size":1250000,"RefillTime":100},"OPS":{"Size":5000,"RefillTime":1000}}}`,
+			},
+		},
+	}
+	if err := l.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	shimReq, ok := opts.NetworkInfo.(*networktypes.ShimNetReq)
+	if !ok || shimReq == nil || len(shimReq.Interfaces) != 1 || shimReq.Interfaces[0].Qos == nil {
+		t.Fatalf("shim request missing qos: %#v", opts.NetworkInfo)
+	}
+	got := shimReq.Interfaces[0].Qos
+	if got.BwSize != 1250000 || got.BwRefillTime != 100 || got.OpsSize != 5000 || got.OpsRefillTime != 1000 {
+		t.Fatalf("shim qos=%+v, want bandwidth and packet buckets", got)
 	}
 }
 
@@ -600,6 +718,7 @@ func TestShouldAppendDNSAllowOut(t *testing.T) {
 	allow := true
 	host := "api.example.com:443"
 	sni := "*.example.com"
+	catchAll := "*"
 
 	tests := []struct {
 		name string
@@ -658,6 +777,16 @@ func TestShouldAppendDNSAllowOut(t *testing.T) {
 			cfg: &networkruntime.CubeNetworkConfig{
 				Rules: []*networkruntime.EgressRule{
 					{Match: &networkruntime.EgressRuleMatch{Host: &host}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "l7 catch-all host",
+			cfg: &networkruntime.CubeNetworkConfig{
+				AllowInternetAccess: &block,
+				Rules: []*networkruntime.EgressRule{
+					{Match: &networkruntime.EgressRuleMatch{Host: &catchAll}},
 				},
 			},
 			want: true,

@@ -11,8 +11,6 @@ lang: en-US
 
 # LangChain Integration Guide
 
-[中文](../../zh/guide/integrations/langchain.md)
-
 Run a LangChain agent that calls a Python tool inside a
 [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) MicroVM. Because Cube exposes an
 **E2B-compatible API**, migrating a LangChain app from E2B to Cube usually means changing a few
@@ -505,7 +503,7 @@ finally:
 ## References
 
 - Runnable samples — `0.x` (LangChain 0.3.x): [`examples/langchain-integration/0.x`](https://github.com/TencentCloud/CubeSandbox/tree/master/examples/langchain-integration/0.x) · `1.x` (LangChain 1.x): [`examples/langchain-integration/1.x`](https://github.com/TencentCloud/CubeSandbox/tree/master/examples/langchain-integration/1.x)
-- Bring your own image: [`docs/guide/tutorials/bring-your-own-image.md`](../tutorials/bring-your-own-image.md)
+- Custom template images: [`docs/guide/tutorials/bring-your-own-image.md`](../tutorials/bring-your-own-image.md)
 - Create a template from an image: [`docs/guide/tutorials/template-from-image.md`](../tutorials/template-from-image.md)
 - Snapshot / clone / rollback: [`docs/guide/snapshot-rollback-clone.md`](../snapshot-rollback-clone.md)
 - Credential safekeeping + egress control: [`docs/guide/security-proxy.md`](../security-proxy.md)

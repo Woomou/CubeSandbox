@@ -1,16 +1,20 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.7.3";
 
 export {
   Sandbox,
   JUPYTER_PORT,
+  MCP_PORT,
+  type McpServer,
+  type GitHubMcpServerConfig,
   type CreateOptions,
   type RunCodeOptions,
   type PauseOptions,
   type ListSnapshotsOptions,
   type NetworkOptions,
+  type UpdateNetworkOptions,
   type LifecycleOptions,
 } from "./sandbox.js";
 

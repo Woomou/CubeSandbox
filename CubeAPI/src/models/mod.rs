@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
+pub mod snapshot_mode;
+pub use snapshot_mode::{normalize_request, SnapshotMode};
+
 // ─── Common ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -30,13 +33,21 @@ impl ApiError {
 pub type SandboxMetadata = HashMap<String, String>;
 pub type EnvVars = HashMap<String, String>;
 
-/// State of the sandbox (running | paused)
+/// State of the sandbox (running | paused | pausing | unknown)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxState {
     Running,
     Paused,
     Pausing,
+    /// The backend reported a state CubeAPI cannot map to a live lifecycle
+    /// phase. An exited container (`Stopped`) lands here, but so does a
+    /// sandbox that is still being created and one whose state could not be
+    /// read from its node, so `unknown` is not by itself a terminal signal:
+    /// `POST /sandboxes/{id}/connect` returns 409 only for the states that are
+    /// terminal. Exposed instead of silently reporting `Running` so clients
+    /// stop treating a dead sandbox as usable.
+    Unknown,
 }
 
 /// Network configuration for sandbox egress/ingress control.
@@ -60,9 +71,121 @@ pub struct SandboxNetworkConfig {
     /// expanded to the requested sandbox port; envd traffic is exempt.
     #[serde(rename = "maskRequestHost", skip_serializing_if = "Option::is_none")]
     pub mask_request_host: Option<String>,
-    /// L7 egress rules, evaluated first-match-wins in list order.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// L7 egress rules. Accepts CubeSandbox's ordered rule array and E2B's
+    /// host-keyed transform map for compatibility. Both are normalized to the
+    /// ordered internal rule model.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_egress_rules",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<SandboxNetworkRulesInput>)]
     pub rules: Option<Vec<EgressRule>>,
+}
+
+impl SandboxNetworkConfig {
+    /// True when the caller supplied no policy field at all. Distinguishes
+    /// "policy omitted" from "policy explicitly emptied".
+    pub fn is_empty(&self) -> bool {
+        self.allow_public_traffic.is_none()
+            && self.allow_out.is_none()
+            && self.deny_out.is_none()
+            && self.mask_request_host.is_none()
+            && self.rules.is_none()
+    }
+}
+
+/// Deserialize CubeSandbox's ordered rule list and E2B's host-keyed rule map
+/// into the same internal representation. E2B uses the map form for
+/// per-host request transforms, while CubeEgress evaluates an ordered list.
+fn deserialize_egress_rules<'de, D>(deserializer: D) -> Result<Option<Vec<EgressRule>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(input) = Option::<SandboxNetworkRulesInput>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    let hosts = match input {
+        SandboxNetworkRulesInput::CubeSandbox(rules) => return Ok(Some(rules)),
+        SandboxNetworkRulesInput::E2B(hosts) => hosts,
+    };
+    let mut rules = Vec::new();
+
+    for (host, entries) in hosts {
+        if host.is_empty() {
+            return Err(serde::de::Error::custom(
+                "network.rules host keys must be non-empty strings",
+            ));
+        }
+
+        let injects: Vec<Vec<EgressRuleInject>> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                entry.transform.and_then(|transform| {
+                    let injects: Vec<EgressRuleInject> = transform
+                        .headers
+                        .into_iter()
+                        .map(|(header, secret)| EgressRuleInject {
+                            header,
+                            secret,
+                            format: None,
+                        })
+                        .collect();
+                    (!injects.is_empty()).then_some(injects)
+                })
+            })
+            .collect();
+
+        let suffix_needed = injects.len() > 1;
+        for (index, inject) in injects.into_iter().enumerate() {
+            let name = if suffix_needed {
+                format!("e2b-transform-{host}-{index}")
+            } else {
+                format!("e2b-transform-{host}")
+            };
+            rules.push(EgressRule {
+                name,
+                r#match: EgressRuleMatch {
+                    host: Some(host.clone()),
+                    ..Default::default()
+                },
+                action: EgressRuleAction {
+                    allow: true,
+                    audit: None,
+                    inject: Some(inject),
+                },
+            });
+        }
+    }
+
+    Ok(Some(rules))
+}
+
+/// Accepted wire shapes for `SandboxNetworkConfig.rules`.
+///
+/// CubeSandbox clients use the ordered rule array. E2B clients use a
+/// host-keyed map whose values are request transforms. CubeAPI normalizes both
+/// shapes into the internal ordered egress-rule model.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(untagged)]
+enum SandboxNetworkRulesInput {
+    CubeSandbox(Vec<EgressRule>),
+    E2B(std::collections::BTreeMap<String, Vec<E2BNetworkRule>>),
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct E2BNetworkRule {
+    #[serde(default)]
+    transform: Option<E2BNetworkTransform>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct E2BNetworkTransform {
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
 }
 
 /// L7 egress rule: match conditions + action (allow/deny, audit, credential injection).
@@ -123,6 +246,113 @@ pub struct EgressRuleInject {
     /// Template containing `${SECRET}`; defaults to `"${SECRET}"` when omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+}
+
+/// Header rewrite in E2B's per-host `rules` shape.
+///
+/// Unknown keys are rejected rather than ignored: `headers` is the only
+/// transform CubeEgress can express, and silently dropping another kind would
+/// leave the caller believing a rewrite is in place that never runs.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct E2bNetworkTransform {
+    /// Headers to inject or override on matching requests.
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// One entry of E2B's per-host `rules` mapping.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct E2bNetworkRule {
+    pub transform: Option<E2bNetworkTransform>,
+}
+
+/// The two accepted shapes of `rules`.
+///
+/// CubeSandbox rules are a list carrying the full L7 semantics: a match on
+/// sni/host/method/path/scheme/port, an allow-or-deny verdict, an audit level
+/// and credential injection. E2B's are a map from host to header rewrites, with
+/// no verdict, no audit and no match beyond the host -- a strict subset, and one
+/// that its own docs note "does not allow egress on its own".
+///
+/// Both are accepted so an E2B client works unchanged, but the list stays the
+/// canonical form: converting our rules into E2B's map would silently drop
+/// `allow: false`, `audit`, and every match field except the host.
+///
+/// A JSON array and a JSON object cannot be confused, so the shape alone
+/// discriminates.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum EgressRulesInput {
+    List(Vec<EgressRule>),
+    PerHost(std::collections::BTreeMap<String, Vec<E2bNetworkRule>>),
+}
+
+impl EgressRulesInput {
+    /// Collapse either shape into the canonical rule list.
+    ///
+    /// Mirrors the conversion the Python SDK already performs client-side, down
+    /// to the `e2b-transform-<host>[-<index>]` rule names, so the same request
+    /// produces the same audit records whichever side did the translation.
+    /// Anything the subset cannot express is rejected rather than dropped.
+    pub fn into_rules(self) -> Result<Vec<EgressRule>, String> {
+        let per_host = match self {
+            Self::List(rules) => return Ok(rules),
+            Self::PerHost(per_host) => per_host,
+        };
+
+        let mut out = Vec::new();
+        for (host, entries) in per_host {
+            if host.is_empty() {
+                return Err("network rules host keys must be non-empty".to_string());
+            }
+            if entries.is_empty() {
+                return Err(format!(
+                    "network rules[{host}] is empty; every host must declare at least one transform"
+                ));
+            }
+            let single = entries.len() == 1;
+            for (index, entry) in entries.into_iter().enumerate() {
+                let transform = entry.transform.ok_or_else(|| {
+                    format!("network rules[{host}][{index}] is missing 'transform'")
+                })?;
+                let headers = transform.headers.ok_or_else(|| {
+                    format!("network rules[{host}][{index}].transform requires 'headers'")
+                })?;
+                if headers.is_empty() {
+                    return Err(format!(
+                        "network rules[{host}][{index}].transform.headers is empty"
+                    ));
+                }
+                let inject = headers
+                    .into_iter()
+                    .map(|(header, secret)| EgressRuleInject {
+                        header,
+                        secret,
+                        format: None,
+                    })
+                    .collect();
+                let suffix = if single {
+                    String::new()
+                } else {
+                    format!("-{index}")
+                };
+                out.push(EgressRule {
+                    name: format!("e2b-transform-{host}{suffix}"),
+                    r#match: EgressRuleMatch {
+                        host: Some(host.clone()),
+                        ..Default::default()
+                    },
+                    action: EgressRuleAction {
+                        allow: true,
+                        audit: None,
+                        inject: Some(inject),
+                    },
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Sandbox lifecycle configuration. Mirrors the e2b SDK's `lifecycle` object —
@@ -255,11 +485,183 @@ pub struct NewSandbox {
     )]
     pub env_vars: Option<EnvVars>,
 
+    /// E2B-compatible MCP servers keyed by server name, e.g.
+    /// `{"duckduckgo": {}, "arxiv": {"storagePath": "/"}}`. Keys starting with
+    /// `github/<owner>/<repo>` require `runCmd` and may set `installCmd` and
+    /// `envs`. CubeAPI validates the shape only; the SDK starts `mcp-gateway`
+    /// inside the sandbox, and the value is never forwarded or returned.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<HashMap<String, Object>>)]
     pub mcp: Option<serde_json::Value>,
 
     #[serde(rename = "volumeMounts", skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+
+    /// CoW backend (xfs | s3). Omitted = inherit from the template, else xfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+
+    /// Never, OnFailure or Always. Omitted means Never.
+    #[serde(
+        rename = "restartPolicy",
+        alias = "restart_policy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub restart_policy: Option<String>,
+
+    /// Optional override of the node restart backoff.
+    #[serde(
+        rename = "restartBackoff",
+        alias = "restart_backoff",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub restart_backoff: Option<RestartBackoff>,
+
+    /// Runtime health check applied to the sandbox. Times are seconds.
+    #[serde(
+        rename = "livenessProbe",
+        alias = "liveness_probe",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub liveness_probe: Option<LivenessProbe>,
+}
+
+/// Backoff between sandbox restarts. Zero fields use the node default.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct RestartBackoff {
+    #[serde(
+        rename = "initialIntervalSecond",
+        alias = "initial_interval_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_interval_second: Option<i32>,
+    #[serde(
+        rename = "maxIntervalSecond",
+        alias = "max_interval_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_interval_second: Option<i32>,
+    /// 0 or omitted uses the node default (2). It does not select a constant interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
+    /// 0 means unlimited.
+    #[serde(
+        rename = "maxRestarts",
+        alias = "max_restarts",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_restarts: Option<i32>,
+    /// 0 or omitted uses the node default (0.1). It does not turn jitter off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<f64>,
+    #[serde(
+        rename = "stableDurationSecond",
+        alias = "stable_duration_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stable_duration_second: Option<i32>,
+}
+
+/// One health check. Exactly one of tcp or http.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct LivenessProbe {
+    #[serde(
+        rename = "initialDelaySecond",
+        alias = "initial_delay_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_delay_second: Option<i32>,
+    #[serde(
+        rename = "periodSecond",
+        alias = "period_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub period_second: Option<i32>,
+    #[serde(
+        rename = "failureThreshold",
+        alias = "failure_threshold",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub failure_threshold: Option<i32>,
+    #[serde(
+        rename = "probeTimeoutSecond",
+        alias = "probe_timeout_second",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub probe_timeout_second: Option<i32>,
+    #[serde(
+        rename = "httpGet",
+        alias = "http_get",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub http_get: Option<LivenessHTTPGet>,
+    #[serde(
+        rename = "tcpSocket",
+        alias = "tcp_socket",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_socket: Option<LivenessTCP>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct LivenessHTTPGet {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub port: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct LivenessTCP {
+    pub port: i32,
+}
+
+// ─── Sandbox — create / connect v2 request ────────────────────────────────
+
+/// Request body for POST /v2/sandboxes (E2B SDK >= 2.51.0).
+///
+/// Reuses the v1 [`NewSandbox`] shape and adds the v2-only
+/// `autoPauseMemory` flag. CubeSandbox always keeps the full memory snapshot
+/// on pause, so `autoPauseMemory=false` (filesystem-only snapshot) is rejected
+/// by the handler rather than silently ignored.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct NewSandboxV2 {
+    #[serde(flatten)]
+    pub base: NewSandbox,
+
+    /// Keep the full memory snapshot when auto-pausing. Defaults to true.
+    /// `false` (filesystem-only, cold-boot on resume) is not supported and is
+    /// rejected by the handler.
+    #[serde(rename = "autoPauseMemory", alias = "auto_pause_memory", default)]
+    pub auto_pause_memory: Option<bool>,
+}
+
+/// Request body for POST /v2/sandboxes/{id}/connect (E2B SDK >= 2.51.0).
+///
+/// Reuses the v1 [`ConnectSandbox`] shape and adds the v2-only `memory` flag.
+/// CubeSandbox always resumes from the memory snapshot, so `memory=false`
+/// (cold-boot from disk) is rejected by the handler.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ConnectSandboxV2 {
+    #[serde(flatten)]
+    pub base: ConnectSandbox,
+
+    /// Resume from the memory snapshot. Defaults to true. `false` (cold-boot
+    /// from disk) is not supported and is rejected by the handler.
+    #[serde(default)]
+    pub memory: Option<bool>,
 }
 
 // ─── Sandbox — create / connect response ──────────────────────────────────
@@ -293,7 +695,112 @@ pub struct Sandbox {
     pub domain: Option<String>,
 }
 
+// ─── Sandbox — fork request / response ─────────────────────────────────────
+
+/// Request body for POST /sandboxes/{sandboxID}/fork.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ForkRequest {
+    /// Number of fork sandboxes to derive (1..=100). Defaults to 1 when absent.
+    #[serde(default = "default_fork_count")]
+    pub count: i32,
+    /// Optional idle TTL (seconds) applied to each forked sandbox.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<i32>,
+    /// Snapshot artifact mode for the one shared fork snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+fn default_fork_count() -> i32 {
+    1
+}
+
+/// Per-fork error entry inside a fork response element. CubeMaster's business
+/// ret_code is carried in `code`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ForkError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl ForkError {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// One element of a fork response: exactly one of `sandbox` or `error` is
+/// present, encoding that fork's independent success/failure.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ForkResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ForkError>,
+}
+
+/// Response body for POST /sandboxes/{sandboxID}/fork — an array of length
+/// `count`, each element either a fully-connectable `Sandbox` or an `error`.
+pub type ForkResponse = Vec<ForkResult>;
+
 // ─── Sandbox — list / detail responses ────────────────────────────────────
+
+/// Node-local restart bookkeeping. Separate from `state`, which stays the
+/// lifecycle value (`running`, `paused`, …).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RestartStatus {
+    #[serde(rename = "restartPolicy", alias = "restart_policy", default)]
+    pub restart_policy: String,
+    #[serde(rename = "restartState", alias = "restart_state", default)]
+    pub restart_state: String,
+    #[serde(rename = "restartCount", alias = "restart_count", default)]
+    pub restart_count: i32,
+    #[serde(
+        rename = "lastExitCode",
+        alias = "last_exit_code",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_exit_code: Option<i32>,
+    #[serde(
+        rename = "lastExitReason",
+        alias = "last_exit_reason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_exit_reason: Option<String>,
+    #[serde(
+        rename = "lastRestartAt",
+        alias = "last_restart_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_restart_at: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "lastSuccessfulRestartAt",
+        alias = "last_successful_restart_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_successful_restart_at: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "lastFailedRestartAt",
+        alias = "last_failed_restart_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_failed_restart_at: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "nextRestartAt",
+        alias = "next_restart_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_restart_at: Option<DateTime<Utc>>,
+}
 
 /// One entry in GET /sandboxes (RunningSandbox in OpenAPI spec).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -314,7 +821,11 @@ pub struct ListedSandbox {
     pub end_at: Option<DateTime<Utc>>,
     #[serde(rename = "cpuCount")]
     pub cpu_count: i32,
+    /// Exact CPU allocation in millicores. Optional for compatibility with older responses.
+    #[serde(rename = "cpuMilli", skip_serializing_if = "Option::is_none")]
+    pub cpu_milli: Option<i32>,
     #[serde(rename = "memoryMB")]
+    /// Historical field name; the value is memory in MiB.
     pub memory_mb: i32,
     #[serde(rename = "diskSizeMB", skip_serializing_if = "Option::is_none")]
     pub disk_size_mb: Option<i32>,
@@ -325,6 +836,8 @@ pub struct ListedSandbox {
     pub envd_version: String,
     #[serde(rename = "volumeMounts", skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+    #[serde(rename = "restartStatus", skip_serializing_if = "Option::is_none")]
+    pub restart_status: Option<RestartStatus>,
 }
 
 /// Detailed sandbox info returned by GET /sandboxes/{sandboxID}.
@@ -352,7 +865,11 @@ pub struct SandboxDetail {
     pub domain: Option<String>,
     #[serde(rename = "cpuCount")]
     pub cpu_count: i32,
+    /// Exact CPU allocation in millicores. Optional for compatibility with older responses.
+    #[serde(rename = "cpuMilli", skip_serializing_if = "Option::is_none")]
+    pub cpu_milli: Option<i32>,
     #[serde(rename = "memoryMB")]
+    /// Historical field name; the value is memory in MiB.
     pub memory_mb: i32,
     #[serde(rename = "diskSizeMB", skip_serializing_if = "Option::is_none")]
     pub disk_size_mb: Option<i32>,
@@ -361,16 +878,23 @@ pub struct SandboxDetail {
     pub state: SandboxState,
     #[serde(rename = "volumeMounts", skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+    #[serde(rename = "restartStatus", skip_serializing_if = "Option::is_none")]
+    pub restart_status: Option<RestartStatus>,
+    #[serde(rename = "configuredQos", skip_serializing_if = "Option::is_none")]
+    pub configured_qos: Option<QosConfig>,
 }
 
 // ─── Sandbox — pause/resume/connect/snapshot ──────────────────────────────
 
 /// Request body for POST /sandboxes/{id}/resume (deprecated).
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 #[allow(dead_code)]
 pub struct ResumedSandbox {
-    /// Idle timeout in seconds; None when the client did not send one.
+    /// Idle timeout in seconds; None keeps the current value, 0 keeps the
+    /// current value for this deprecated endpoint, -1 disables expiry, and a
+    /// positive value starts a new window after resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_timeout_value"))]
     pub timeout: Option<i32>,
     #[serde(rename = "autoPause", default)]
     pub auto_pause: bool,
@@ -379,8 +903,10 @@ pub struct ResumedSandbox {
 /// Request body for POST /sandboxes/{id}/connect.
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct ConnectSandbox {
-    /// Idle timeout in seconds; None when the client did not send one.
+    /// Idle timeout in seconds; omitted to keep the current value, -1 for no expiry.
+    /// Zero and values below -1 are invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_connect_timeout_value"))]
     pub timeout: Option<i32>,
 }
 
@@ -388,6 +914,22 @@ pub struct ConnectSandbox {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSnapshotRequest {
     pub name: Option<String>,
+    /// CoW backend (xfs | s3). Empty means xfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Snapshot artifact mode: full | fs-only | filesystem (E2B alias).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// E2B compatibility alias: false means fs-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<bool>,
+    /// Deprecated E2B alias for `memory`.
+    #[serde(
+        default,
+        rename = "keepMemory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keep_memory: Option<bool>,
 }
 
 /// Response for POST /sandboxes/{id}/snapshots.
@@ -396,6 +938,14 @@ pub struct SnapshotInfo {
     #[serde(rename = "snapshotID")]
     pub snapshot_id: String,
     pub names: Vec<String>,
+    /// CoW backend that produced this snapshot (xfs | s3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// S3 sync status (pending|running|ready|failed). Empty for xfs.
+    #[serde(rename = "remoteStatus", skip_serializing_if = "Option::is_none")]
+    pub remote_status: Option<String>,
+    /// Snapshot artifact mode. Always one of full | fs-only.
+    pub mode: SnapshotMode,
 }
 
 /// Query parameters for GET /snapshots.
@@ -410,6 +960,10 @@ pub struct ListSnapshotsQuery {
     /// Pagination cursor from previous response header x-next-token.
     #[serde(rename = "nextToken")]
     pub next_token: Option<String>,
+    /// Filter by snapshot name or ID. (E2B SDK `list_snapshots` gained `name` in v2.33.0)
+    pub name: Option<String>,
+    /// Filter by CoW backend (xfs | s3).
+    pub backend: Option<String>,
 }
 
 /// One entry in the GET /snapshots list.
@@ -425,6 +979,14 @@ pub struct SnapshotListItem {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// CoW backend that produced this snapshot (xfs | s3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// S3 sync status (pending|running|ready|failed). Empty for xfs.
+    #[serde(rename = "remoteStatus", skip_serializing_if = "Option::is_none")]
+    pub remote_status: Option<String>,
+    /// Snapshot artifact mode. Always one of full | fs-only.
+    pub mode: SnapshotMode,
 }
 
 /// Request body for POST /sandboxes/{id}/rollback.
@@ -432,6 +994,9 @@ pub struct SnapshotListItem {
 pub struct RollbackRequest {
     #[serde(rename = "snapshotID")]
     pub snapshot_id: String,
+    /// CoW backend (xfs | s3). Empty means Cubelet uses the snapshot catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 /// Response for POST /sandboxes/{id}/rollback after synchronous completion.
@@ -521,6 +1086,74 @@ fn default_log_limit() -> i32 {
     1000
 }
 
+// ─── Sandbox — network policy ─────────────────────────────────────────────
+
+/// Request body for PUT /sandboxes/{id}/network.
+///
+/// The body is the complete desired egress policy, not a patch: any field left
+/// out clears what the sandbox currently has.
+///
+/// The policy fields sit at the top level rather than under `network`, matching
+/// E2B's update endpoint so a client written against either SDK reaches the same
+/// wire format. Note this is deliberately *not* the shape of our own create body
+/// (which nests them, as E2B's create also does) -- the inconsistency is
+/// upstream's, and following it costs less than making E2B clients silently
+/// apply an empty policy.
+///
+/// `allowPublicTraffic` and `maskRequestHost` are CubeSandbox extensions; E2B's
+/// update schema carries neither.
+///
+/// Unknown fields are rejected. Under full-replacement semantics a key that fails
+/// to match is indistinguishable from one deliberately left out, so a typo like
+/// `allowOu` would clear that policy dimension and answer 204 -- and combined with
+/// an omitted `allowInternetAccess` it reopens egress the caller was restricting.
+/// Failing the request is the only outcome that cannot be mistaken for success.
+/// E2B's own update body carries only `allowOut`, `denyOut`, `rules` and
+/// `allowInternetAccess`, all accepted here, so strictness costs no compatibility.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSandboxNetworkRequest {
+    #[serde(rename = "allowInternetAccess", alias = "allow_internet_access")]
+    pub allow_internet_access: Option<bool>,
+    #[serde(rename = "allowOut", alias = "allow_out", default)]
+    pub allow_out: Option<Vec<String>>,
+    #[serde(rename = "denyOut", alias = "deny_out", default)]
+    pub deny_out: Option<Vec<String>>,
+    #[serde(rename = "allowPublicTraffic", alias = "allow_public_traffic", default)]
+    pub allow_public_traffic: Option<bool>,
+    #[serde(rename = "maskRequestHost", alias = "mask_request_host", default)]
+    pub mask_request_host: Option<String>,
+    #[serde(default)]
+    pub rules: Option<EgressRulesInput>,
+}
+
+impl UpdateSandboxNetworkRequest {
+    /// Split the body into the internet-access flag and the policy.
+    ///
+    /// The policy is `None` when the caller sent no policy field at all, which
+    /// has to stay distinct from an explicitly emptied one so the service keeps
+    /// applying its documented default.
+    pub fn into_parts(self) -> Result<(Option<bool>, Option<SandboxNetworkConfig>), String> {
+        let rules = match self.rules {
+            Some(input) => Some(input.into_rules()?),
+            None => None,
+        };
+        let network = SandboxNetworkConfig {
+            allow_public_traffic: self.allow_public_traffic,
+            allow_out: self.allow_out,
+            deny_out: self.deny_out,
+            mask_request_host: self.mask_request_host,
+            rules,
+        };
+        let network = if network.is_empty() {
+            None
+        } else {
+            Some(network)
+        };
+        Ok((self.allow_internet_access, network))
+    }
+}
+
 // ─── Sandbox — timeout / refresh ──────────────────────────────────────────
 
 /// Request body for POST /sandboxes/{id}/timeout
@@ -547,6 +1180,19 @@ fn validate_timeout_value(timeout: i32) -> Result<(), validator::ValidationError
     }
 }
 
+/// Connect accepts the never-timeout sentinel or a positive timeout. An
+/// omitted value keeps the current timeout; zero is intentionally rejected so
+/// it cannot trigger an immediate lifecycle action while connecting.
+fn validate_connect_timeout_value(timeout: i32) -> Result<(), validator::ValidationError> {
+    if timeout == -1 || timeout > 0 {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new(
+            "connect_timeout_must_be_positive_or_never",
+        ))
+    }
+}
+
 /// Request body for POST /sandboxes/{id}/refreshes
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct RefreshRequest {
@@ -560,19 +1206,36 @@ pub struct RefreshRequest {
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListSandboxesQuery {
+    /// `key=value` pairs joined by `&`, written as is, percent-encoded, or double-encoded as E2B's SDKs send it.
+    /// A `&` or `=` inside a value must stay `%`-encoded after URL decoding (`+` is a space when form-encoded).
+    /// An empty value is the same as omitting `metadata`: no filter.
     pub metadata: Option<String>,
 }
 
 /// Query params for GET /v2/sandboxes.
-#[derive(Debug, Deserialize, IntoParams)]
+///
+/// `limit` is validated rather than silently clamped: `limit=0`/`-1` used to
+/// fall through `.max(1)` to a one-item page, and because every page costs a
+/// full node-window walk (see `SandboxService::list_v2`), a client paging one
+/// item at a time forced one cluster sweep *per sandbox*. Rejecting it with a
+/// 400 also tells the caller its own request was wrong instead of quietly
+/// returning less than it asked for.
+#[derive(Debug, Deserialize, Validate, IntoParams)]
 #[into_params(parameter_in = Query)]
-#[allow(dead_code)]
 pub struct ListSandboxesV2Query {
+    /// `key=value` pairs joined by `&`, written as is, percent-encoded, or double-encoded as E2B's SDKs send it.
+    /// A `&` or `=` inside a value must stay `%`-encoded after URL decoding (`+` is a space when form-encoded).
+    /// An empty value is the same as omitting `metadata`: no filter.
     pub metadata: Option<String>,
+    /// Comma-separated states: `running`, `paused` (includes pausing), `pausing`, `unknown` (aliases `stopped`, `error`).
+    /// `pausing` is a Cube-native state: asking for it returns `pausing`; otherwise a pausing sandbox reads `paused`.
+    /// Defaults to running and paused sandboxes; any unrecognised or empty value is a 400.
     pub state: Option<String>,
+    /// Continuation cursor from the previous response's `x-next-token` header.
     #[serde(rename = "nextToken")]
     pub next_token: Option<String>,
     #[serde(default = "default_page_limit")]
+    #[validate(range(min = 1, max = 1000, message = "limit must be between 1 and 1000"))]
     pub limit: i32,
 }
 
@@ -583,10 +1246,139 @@ fn default_page_limit() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateTemplateRequest, NewSandbox, SandboxNetworkConfig, SetTimeoutRequest,
-        TemplateAliasLookupResponse,
+        ConnectSandbox, ConnectSandboxV2, CreateTemplateRequest, NewSandbox, NewSandboxV2,
+        ResumedSandbox, SandboxNetworkConfig, SetTimeoutRequest, TemplateAliasLookupResponse,
+        UpdateSandboxNetworkRequest,
     };
     use validator::Validate;
+
+    fn update_parts(body: &str) -> Result<(Option<bool>, Option<SandboxNetworkConfig>), String> {
+        serde_json::from_str::<UpdateSandboxNetworkRequest>(body)
+            .expect("body should deserialize")
+            .into_parts()
+    }
+
+    #[test]
+    fn update_network_reads_the_flat_body() {
+        let (internet, net) = update_parts(
+            r#"{"allowInternetAccess": false, "allowOut": ["8.8.8.8"], "denyOut": ["1.1.1.1"]}"#,
+        )
+        .expect("valid body");
+        assert_eq!(internet, Some(false));
+        let net = net.expect("policy");
+        assert_eq!(net.allow_out.as_deref(), Some(&["8.8.8.8".to_string()][..]));
+        assert_eq!(net.deny_out.as_deref(), Some(&["1.1.1.1".to_string()][..]));
+    }
+
+    #[test]
+    fn update_network_reads_the_e2b_snake_case_flag() {
+        // E2B's schema spells this one field snake_case while the rest are camel.
+        let (internet, _) =
+            update_parts(r#"{"allowOut": ["8.8.8.8"], "allow_internet_access": false}"#)
+                .expect("valid body");
+        assert_eq!(internet, Some(false));
+    }
+
+    #[test]
+    fn update_network_treats_an_empty_body_as_no_policy() {
+        // Must stay None rather than an emptied policy, or `{}` would stop
+        // meaning "apply the documented default".
+        let (internet, net) = update_parts("{}").expect("valid body");
+        assert!(internet.is_none());
+        assert!(net.is_none());
+    }
+
+    #[test]
+    fn update_network_rejects_bodies_that_would_silently_clear_the_policy() {
+        // openapi.yml used to document the nested create shape for this endpoint.
+        // A client following it sent the whole policy under `network`, which
+        // deserialized into an all-None body and replaced the sandbox's egress
+        // policy with the platform default -- public egress reopened, answered
+        // with 204. A misspelled key clears one dimension the same silent way.
+        // Both have to fail, because under full replacement a key that does not
+        // match is indistinguishable from one deliberately omitted.
+        for body in [
+            r#"{"network": {"allowOut": ["8.8.8.8"]}}"#,
+            r#"{"allowOu": ["8.8.8.8"]}"#,
+        ] {
+            serde_json::from_str::<UpdateSandboxNetworkRequest>(body)
+                .expect_err(&format!("body must be rejected: {body}"));
+        }
+    }
+
+    #[test]
+    fn update_network_keeps_our_rule_list_verbatim() {
+        let (_, net) = update_parts(
+            r#"{"rules": [{"name": "n", "match": {"host": "h", "port": 443, "scheme": "https"},
+                           "action": {"allow": false}}]}"#,
+        )
+        .expect("valid body");
+        let rules = net.expect("policy").rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "n");
+        // The deny verdict is exactly what E2B's shape cannot carry.
+        assert!(!rules[0].action.allow);
+    }
+
+    #[test]
+    fn update_network_converts_e2b_catch_all_host() {
+        let (_, net) = update_parts(
+            r#"{"rules": {"*": [{"transform": {"headers": {"Authorization": "sek"}}}]}}"#,
+        )
+        .expect("catch-all host should convert");
+        let rules = net.expect("policy").rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "e2b-transform-*");
+        assert_eq!(rules[0].r#match.host.as_deref(), Some("*"));
+        let inject = rules[0].action.inject.as_ref().expect("inject");
+        assert_eq!(inject[0].header, "Authorization");
+        assert_eq!(inject[0].secret, "sek");
+    }
+
+    #[test]
+    fn update_network_converts_e2b_per_host_rules() {
+        let (_, net) = update_parts(
+            r#"{"rules": {"api.example.com": [{"transform": {"headers": {"X-Token": "abc"}}}]}}"#,
+        )
+        .expect("valid body");
+        let rules = net.expect("policy").rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        // Same naming the Python SDK produces, so audit records match whichever
+        // side did the translation.
+        assert_eq!(rules[0].name, "e2b-transform-api.example.com");
+        assert_eq!(rules[0].r#match.host.as_deref(), Some("api.example.com"));
+        assert!(rules[0].action.allow);
+        let inject = rules[0].action.inject.as_ref().expect("inject");
+        assert_eq!(inject[0].header, "X-Token");
+        assert_eq!(inject[0].secret, "abc");
+    }
+
+    #[test]
+    fn update_network_indexes_multiple_transforms_per_host() {
+        let (_, net) = update_parts(
+            r#"{"rules": {"h": [{"transform": {"headers": {"A": "1"}}},
+                                {"transform": {"headers": {"B": "2"}}}]}}"#,
+        )
+        .expect("valid body");
+        let rules = net.expect("policy").rules.expect("rules");
+        assert_eq!(rules[0].name, "e2b-transform-h-0");
+        assert_eq!(rules[1].name, "e2b-transform-h-1");
+    }
+
+    #[test]
+    fn update_network_rejects_e2b_rules_it_cannot_express() {
+        // An unsupported transform kind, and a host keyed to nothing, are the
+        // two ways this subset silently loses intent.
+        assert!(
+            serde_json::from_str::<UpdateSandboxNetworkRequest>(
+                r#"{"rules": {"h": [{"transform": {"rewrite": {}}}]}}"#
+            )
+            .is_err(),
+            "unknown transform kind must not deserialize"
+        );
+        assert!(update_parts(r#"{"rules": {"h": []}}"#).is_err());
+        assert!(update_parts(r#"{"rules": {"h": [{}]}}"#).is_err());
+    }
 
     #[test]
     fn set_timeout_request_rejects_invalid_negative_values() {
@@ -617,6 +1409,42 @@ mod tests {
     }
 
     #[test]
+    fn resume_and_connect_accept_omitted_never_and_positive_timeouts() {
+        for timeout in [None, Some(-1), Some(60)] {
+            ConnectSandbox { timeout }
+                .validate()
+                .unwrap_or_else(|e| panic!("connect timeout={timeout:?} should be valid: {e}"));
+            ResumedSandbox {
+                timeout,
+                auto_pause: false,
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("resume timeout={timeout:?} should be valid: {e}"));
+        }
+
+        ResumedSandbox {
+            timeout: Some(0),
+            auto_pause: false,
+        }
+        .validate()
+        .expect("deprecated resume keeps the current timeout for zero");
+
+        for timeout in [0, -2] {
+            assert!(ConnectSandbox {
+                timeout: Some(timeout)
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(ResumedSandbox {
+            timeout: Some(-2),
+            auto_pause: false,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn sandbox_network_config_accepts_snake_case_policy_fields() {
         let cfg: SandboxNetworkConfig = serde_json::from_value(serde_json::json!({
             "allow_out": ["api.example.com", "8.8.8.8"],
@@ -631,6 +1459,204 @@ mod tests {
         );
         assert_eq!(cfg.deny_out, Some(vec!["0.0.0.0/0".to_string()]));
         assert_eq!(cfg.mask_request_host.as_deref(), Some("localhost:${PORT}"));
+    }
+
+    #[test]
+    fn sandbox_network_config_accepts_e2b_host_keyed_rules() {
+        let cfg: SandboxNetworkConfig = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "api.example.com": [{
+                    "transform": {
+                        "headers": {"X-Header": "Content"}
+                    }
+                }]
+            }
+        }))
+        .expect("E2B network rules should deserialize");
+
+        let rules = cfg.rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "e2b-transform-api.example.com");
+        assert_eq!(rules[0].r#match.host.as_deref(), Some("api.example.com"));
+        assert!(rules[0].action.allow);
+        assert_eq!(
+            rules[0].action.inject.as_ref().unwrap()[0].header,
+            "X-Header"
+        );
+        assert_eq!(
+            rules[0].action.inject.as_ref().unwrap()[0].secret,
+            "Content"
+        );
+    }
+
+    #[test]
+    fn sandbox_network_config_ignores_e2b_noop_rules() {
+        let cfg: SandboxNetworkConfig = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "api.example.com": [
+                    {},
+                    {"transform": {}},
+                    {"transform": {"headers": {}}},
+                    {"transform": {"headers": {"X-Header": "Content"}}}
+                ]
+            }
+        }))
+        .expect("E2B no-op network rules should deserialize");
+
+        let rules = cfg.rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "e2b-transform-api.example.com");
+        assert_eq!(rules[0].r#match.host.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            rules[0].action.inject.as_ref().unwrap()[0].header,
+            "X-Header"
+        );
+    }
+
+    #[test]
+    fn sandbox_network_config_rejects_unknown_e2b_transforms() {
+        let result = serde_json::from_value::<SandboxNetworkConfig>(serde_json::json!({
+            "rules": {
+                "api.example.com": [{
+                    "transform": {
+                        "rewrite": "https://other.example.com"
+                    }
+                }]
+            }
+        }));
+
+        assert!(
+            result.is_err(),
+            "unsupported transforms must not be ignored"
+        );
+    }
+
+    #[test]
+    fn sandbox_network_config_preserves_array_rules() {
+        let cfg: SandboxNetworkConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "existing",
+                "match": {"host": "api.example.com"},
+                "action": {"allow": false}
+            }]
+        }))
+        .expect("array network rules should deserialize");
+
+        let rule = &cfg.rules.expect("rules")[0];
+        assert_eq!(rule.name, "existing");
+        assert!(!rule.action.allow);
+    }
+
+    #[test]
+    fn new_sandbox_accepts_e2b_network_rules_map() {
+        let req: NewSandbox = serde_json::from_value(serde_json::json!({
+            "templateID": "tpl-1",
+            "network": {
+                "allowOut": ["api.example.com"],
+                "denyOut": ["0.0.0.0/0"],
+                "rules": {
+                    "api.example.com": [{
+                        "transform": {
+                            "headers": {"X-Header": "Content"}
+                        }
+                    }]
+                }
+            }
+        }))
+        .expect("E2B create request should deserialize");
+
+        let rule = &req.network.expect("network").rules.expect("rules")[0];
+        assert_eq!(rule.r#match.host.as_deref(), Some("api.example.com"));
+        assert_eq!(rule.action.inject.as_ref().unwrap()[0].header, "X-Header");
+    }
+
+    #[test]
+    fn new_sandbox_v2_flatten_preserves_network_rules_and_aliases() {
+        // flatten must preserve v1's custom network.rules deserialization and envs alias.
+        let req: NewSandboxV2 = serde_json::from_value(serde_json::json!({
+            "templateID": "tpl-1",
+            "autoPauseMemory": true,
+            "envs": {"CUBE_TEST_ENV": "value"},
+            "metadata": {"owner": "alice"},
+            "volumeMounts": [{"name": "dataset", "path": "/data", "readOnly": true}],
+            "network": {
+                "allowOut": ["api.example.com"],
+                "rules": {
+                    "api.example.com": [{
+                        "transform": {"headers": {"X-Header": "Content"}}
+                    }]
+                }
+            }
+        }))
+        .expect("v2 sandbox request should deserialize through flatten");
+
+        assert_eq!(req.auto_pause_memory, Some(true));
+        let base = req.base;
+        assert_eq!(
+            base.env_vars
+                .as_ref()
+                .and_then(|e| e.get("CUBE_TEST_ENV"))
+                .map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            base.metadata
+                .as_ref()
+                .and_then(|m| m.get("owner"))
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert!(base.volume_mounts.as_ref().unwrap()[0].read_only);
+
+        let rule = &base.network.as_ref().unwrap().rules.as_ref().unwrap()[0];
+        assert_eq!(rule.name, "e2b-transform-api.example.com");
+        assert_eq!(rule.r#match.host.as_deref(), Some("api.example.com"));
+        assert_eq!(rule.action.inject.as_ref().unwrap()[0].header, "X-Header");
+    }
+
+    #[test]
+    fn new_sandbox_v2_accepts_snake_case_auto_pause_memory() {
+        // snake_case alias must resolve too, so a hand-rolled client cannot
+        // silently bypass the false rejection.
+        let req: NewSandboxV2 = serde_json::from_value(serde_json::json!({
+            "templateID": "tpl-1",
+            "auto_pause_memory": false
+        }))
+        .expect("snake_case auto_pause_memory should deserialize");
+
+        assert_eq!(req.auto_pause_memory, Some(false));
+    }
+
+    #[test]
+    fn new_sandbox_v2_flatten_preserves_cubesandbox_rule_array() {
+        // CubeSandbox's ordered-array rules shape must also survive flatten.
+        let req: NewSandboxV2 = serde_json::from_value(serde_json::json!({
+            "templateID": "tpl-1",
+            "network": {
+                "rules": [{
+                    "name": "n",
+                    "match": {"host": "h", "port": 443, "scheme": "https"},
+                    "action": {"allow": false}
+                }]
+            }
+        }))
+        .expect("v2 sandbox request with array rules should deserialize");
+
+        let rule = &req.base.network.as_ref().unwrap().rules.as_ref().unwrap()[0];
+        assert_eq!(rule.name, "n");
+        assert!(!rule.action.allow);
+    }
+
+    #[test]
+    fn connect_sandbox_v2_flatten_preserves_timeout_and_memory() {
+        let req: ConnectSandboxV2 = serde_json::from_value(serde_json::json!({
+            "timeout": 300,
+            "memory": true
+        }))
+        .expect("v2 connect request should deserialize through flatten");
+
+        assert_eq!(req.memory, Some(true));
+        assert_eq!(req.base.timeout, Some(300));
     }
 
     #[test]
@@ -706,6 +1732,85 @@ mod tests {
         assert_eq!(json["templateID"], "tpl-abc");
         assert_eq!(json["public"], true);
     }
+
+    #[test]
+    fn create_template_accepts_canonical_qos_shape() {
+        let req: CreateTemplateRequest = serde_json::from_value(serde_json::json!({
+            "image": "example.invalid/sandbox:latest",
+            "qos": {
+                "network": {
+                    "bandwidthMbps": 100,
+                    "packetsPerSecond": 5000
+                }
+            }
+        }))
+        .expect("template qos should deserialize");
+
+        let qos = req.qos.expect("qos");
+        let network = qos.network.expect("network qos");
+        assert_eq!(network.bandwidth_mbps, Some(100));
+        assert_eq!(network.packets_per_second, Some(5000));
+    }
+
+    #[test]
+    fn create_template_accepts_packets_only_qos_shape() {
+        let req: CreateTemplateRequest = serde_json::from_value(serde_json::json!({
+            "image": "example.invalid/sandbox:latest",
+            "qos": {
+                "network": {
+                    "packetsPerSecond": 5000
+                }
+            }
+        }))
+        .expect("packets-only template qos should deserialize");
+
+        let qos = req.qos.expect("qos");
+        let network = qos.network.as_ref().expect("network qos");
+        assert_eq!(network.bandwidth_mbps, None);
+        assert_eq!(network.packets_per_second, Some(5000));
+        let serialized = serde_json::to_value(qos).expect("qos should serialize");
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "network": {"packetsPerSecond": 5000}
+            })
+        );
+    }
+
+    #[test]
+    fn create_template_accepts_block_io_only_qos_shape() {
+        let req: CreateTemplateRequest = serde_json::from_value(serde_json::json!({
+            "image": "example.invalid/sandbox:latest",
+            "qos": {
+                "blockIo": {
+                    "throughputMiBps": 64,
+                    "iops": 1000
+                }
+            }
+        }))
+        .expect("block-io-only template qos should deserialize");
+
+        let qos = req.qos.expect("qos");
+        assert!(qos.network.is_none());
+        let block_io = qos.block_io.expect("block io qos");
+        assert_eq!(block_io.throughput_mibps, Some(64));
+        assert_eq!(block_io.iops, Some(1000));
+    }
+
+    #[test]
+    fn create_template_rejects_unknown_qos_fields() {
+        let err = serde_json::from_value::<CreateTemplateRequest>(serde_json::json!({
+            "image": "example.invalid/sandbox:latest",
+            "qos": {
+                "network": {
+                    "bandwidth_mbps": 100
+                }
+            }
+        }))
+        .expect_err("unknown qos fields must be rejected");
+
+        assert!(err.to_string().contains("bandwidth_mbps"));
+    }
 }
 
 // ─── Templates ─────────────────────────────────────────────────────────────
@@ -772,6 +1877,8 @@ pub struct TemplateDetail {
         skip_serializing_if = "Option::is_none"
     )]
     pub allow_internet_access: Option<bool>,
+    #[serde(rename = "configuredQos", skip_serializing_if = "Option::is_none")]
+    pub configured_qos: Option<QosConfig>,
     /// Latest create/rebuild job id for the template.
     #[serde(rename = "jobID", skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
@@ -854,10 +1961,66 @@ pub struct CreateTemplateRequest {
     /// Enable ivshmem when building the template snapshot.
     #[serde(rename = "enableIvshmem", default)]
     pub enable_ivshmem: Option<bool>,
+    /// Optional template-level QoS. Every sandbox created from this template
+    /// receives the same independent ingress and egress network ceilings.
+    #[serde(default)]
+    pub qos: Option<QosConfig>,
     /// Whether CubeMaster bakes the CubeEgress root CA into the template rootfs.
     /// Omitted or null defaults to true on CubeMaster.
     #[serde(rename = "with_cube_ca", default)]
     pub with_cube_ca: Option<bool>,
+    /// CoW backend for this template and its sandboxes/snapshots ("xfs" | "s3").
+    /// Omitted keeps the historical xfs path; normalized/validated by CubeMaster.
+    #[serde(rename = "backend", default)]
+    pub backend: Option<String>,
+    /// Container user for the template build and later sandboxes.
+    /// `uid`, `uid:gid`, `username`, or `username:gid`. The group must be numeric.
+    /// Omitted keeps the default root user.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QosConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkQosConfig>,
+    #[serde(rename = "blockIo", default, skip_serializing_if = "Option::is_none")]
+    pub block_io: Option<BlockIoQosConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkQosConfig {
+    #[schema(minimum = 1)]
+    #[serde(
+        rename = "bandwidthMbps",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bandwidth_mbps: Option<u32>,
+    #[schema(minimum = 1)]
+    #[serde(
+        rename = "packetsPerSecond",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub packets_per_second: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BlockIoQosConfig {
+    #[schema(minimum = 1)]
+    #[serde(
+        rename = "throughputMiBps",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub throughput_mibps: Option<u32>,
+    #[schema(minimum = 1)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iops: Option<u32>,
 }
 
 /// Body for POST /templates/:id (rebuild).
@@ -1011,6 +2174,7 @@ pub struct NodeResourcesView {
     #[serde(rename = "cpuMilli")]
     pub cpu_milli: i64,
     #[serde(rename = "memoryMB")]
+    /// Memory in MiB. The MB suffix is retained for API compatibility.
     pub memory_mb: i64,
 }
 
@@ -1188,4 +2352,26 @@ pub struct VolumeAndToken {
     /// Auth token returned by the volume plugin. Empty string when not applicable.
     #[serde(default)]
     pub token: String,
+}
+
+/// Exposed-port endpoint returned by GET /sandboxes/{sandboxID}/exposed-ports/{containerPort}.
+///
+/// `mode` selects the address family of `endpoint`: "host_port" (endpoint is
+/// hostIP:hostPort, usable from any caller) or "tap_ip" (endpoint is
+/// sandboxIP:containerPort, only meaningful for callers on the sandbox's own
+/// node).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExposedPortEndpoint {
+    #[serde(rename = "sandboxID")]
+    pub sandbox_id: String,
+    #[serde(rename = "containerPort")]
+    pub container_port: i32,
+    pub mode: String,
+    pub endpoint: String,
+    #[serde(rename = "hostIP", skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
+    #[serde(rename = "hostPort", skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<i32>,
+    #[serde(rename = "sandboxIP", skip_serializing_if = "Option::is_none")]
+    pub sandbox_ip: Option<String>,
 }

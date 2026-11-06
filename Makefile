@@ -24,6 +24,7 @@ AGENT_EXT4_CONTAINER_DIR := /workspace/$(patsubst $(ROOT_DIR)/%,%,$(abspath $(AG
 MANUAL_DEPLOY_SCRIPT ?= $(ROOT_DIR)/deploy/one-click/deploy-manual.sh
 WEB_DIR ?= $(ROOT_DIR)/web
 CUBECOW_DIR ?= $(ROOT_DIR)/cubecow
+CUBES3LVOL_DIR ?= $(ROOT_DIR)/CubeS3lvol
 CUBELET_COW_THIRD_PARTY_DIR ?= $(ROOT_DIR)/Cubelet/third_party/cubecow
 COW_STATICLIB ?= $(CUBELET_COW_THIRD_PARTY_DIR)/lib/libcubecow.a
 COW_HEADER ?= $(CUBELET_COW_THIRD_PARTY_DIR)/include/cubecow.h
@@ -45,9 +46,7 @@ KERNEL_IMAGE_TARGET ?= vmlinux
 KERNEL_BUILD_JOBS ?=
 KERNEL_CROSS_COMPILE ?=
 
-# Top-level Rust project directories. Each owns its own Cargo workspace and
-# `target/`; sub-crates share their workspace's target dir, so cleaning these
-# five removes all Rust build artifacts in the repo.
+# Top-level Rust project directories. Each owns its own Cargo workspace.
 RUST_PROJECT_DIRS := \
 	$(ROOT_DIR)/CubeAPI \
 	$(ROOT_DIR)/CubeShim \
@@ -56,9 +55,35 @@ RUST_PROJECT_DIRS := \
 	$(ROOT_DIR)/cubecow \
 	$(ROOT_DIR)/hypervisor
 
+# Cargo workspaces visited by `make clean`.
+RUST_CARGO_CLEAN_DIRS := \
+	$(RUST_PROJECT_DIRS) \
+	$(ROOT_DIR)/agent/libs
+
+# Local Go build outputs and installed binaries. Intentionally excludes
+# `_output/kernel` and `_output/release`, which are expensive to rebuild.
+GO_BUILD_ARTIFACT_DIRS := \
+	$(ROOT_DIR)/CubeMaster/build \
+	$(ROOT_DIR)/CubeMaster/coverage \
+	$(ROOT_DIR)/CubeMaster/docker/cubemaster \
+	$(ROOT_DIR)/Cubelet/build \
+	$(ROOT_DIR)/Cubelet/coverage \
+	$(ROOT_DIR)/CubeOps/bin \
+	$(ROOT_DIR)/CubeProxy/bin \
+	$(ROOT_DIR)/cube-lifecycle-manager/bin \
+	$(ROOT_DIR)/examples/cube-bench/bin \
+	$(ROOT_DIR)/examples/volume/s3/bin \
+	$(CUBELET_COW_THIRD_PARTY_DIR) \
+	$(OUTPUT_DIR) \
+	$(AGENT_EXT4_OUTPUT_DIR)
+
+GO_BUILD_ARTIFACT_FILES := \
+	$(ROOT_DIR)/cubecow/examples/go-test/cubecow-test
+
 BINARIES := \
 	agent \
 	cube-init \
+	cube-volume-s3 \
 	cubeapi \
 	cubelet \
 	cubemaster \
@@ -84,19 +109,22 @@ endif
 
 # Builder image build-args. Set MIRROR=cn to source packages from China-reachable
 # mirrors: the ubuntu apt archive (amd64 -> $(APT_MIRROR_BASE)/ubuntu, arm64 ->
-# $(APT_MIRROR_BASE)/ubuntu-ports) plus the llvm.sh installer script and clang-14
-# apt packages (override the LLVM mirror host with LLVM_MIRROR_BASE=...). Unset
-# builds against upstream archive.ubuntu.com/ports.ubuntu.com and apt.llvm.org. The
-# LLVM GPG signing key is always fetched from apt.llvm.org -- llvm.sh hardcodes that
-# URL and the mirror does not serve the key -- but that is a small request that
-# usually succeeds even when bulk package downloads from apt.llvm.org are slow. This
-# build-time MIRROR is unrelated to the runtime MIRROR=cn used by deploy/one-click.
+# $(APT_MIRROR_BASE)/ubuntu-ports) plus the clang-14 apt packages (override the
+# LLVM mirror host with LLVM_MIRROR_BASE=...). Unset builds against upstream
+# archive.ubuntu.com/ports.ubuntu.com and apt.llvm.org. The LLVM GPG signing key
+# is vendored at docker/llvm-snapshot.gpg.key so the image build does not wget
+# it from apt.llvm.org. This build-time MIRROR is unrelated to the runtime
+# MIRROR=cn used by deploy/one-click.
 APT_MIRROR_BASE ?= http://mirrors.tencent.com
 LLVM_MIRROR_BASE ?= https://mirrors.zju.edu.cn/llvm-apt
+RUSTUP_DIST_SERVER ?= https://rsproxy.cn
+RUSTUP_UPDATE_ROOT ?= https://rsproxy.cn/rustup
 BUILDER_BUILD_ARGS ?=
 ifeq ($(MIRROR),cn)
 BUILDER_BUILD_ARGS += --build-arg 'APT_MIRROR_BASE=$(APT_MIRROR_BASE)'
 BUILDER_BUILD_ARGS += --build-arg 'LLVM_MIRROR_BASE=$(LLVM_MIRROR_BASE)'
+BUILDER_BUILD_ARGS += --build-arg 'RUSTUP_DIST_SERVER=$(RUSTUP_DIST_SERVER)'
+BUILDER_BUILD_ARGS += --build-arg 'RUSTUP_UPDATE_ROOT=$(RUSTUP_UPDATE_ROOT)'
 else ifneq ($(MIRROR),)
 $(warning MIRROR='$(MIRROR)' is not recognized by builder-image; expected 'cn' or empty -- building against upstream ubuntu and apt.llvm.org sources)
 endif
@@ -111,12 +139,18 @@ help:
 	@printf "  builder-shell  Start interactive shell with persisted HOME (%s)\n" "$(BUILDER_HOME)"
 	@printf "  builder-run    Run command inside builder image (BUILDER_CMD=...)\n"
 	@printf "  cubemaster    Build cubemaster and cubemastercli in Docker\n"
+	@printf "  cubetemplatecenter Build templatecenter in Docker\n"
 	@printf "  cubelet       Build cubelet and cubecli in Docker\n"
 	@printf "  cubevsmapdump Build CubeVS eBPF business map dump tool in Docker\n"
 	@printf "  cubecow-sdk   Build cubecow static library for Cubelet\n"
+	@printf "  cube-s3lvol   Build CubeS3lvol (s3lvol) release in Docker\n"
+	@printf "  cube-s3lvol-test Run CubeS3lvol offline integration tests in Docker\n"
 	@printf "  cubecow-smoke Build cubecow smoke test CLI in Docker\n"
 	@printf "  cubecow-test-native Build SDK artifacts and run native tests in Docker\n"
 	@printf "  cube-proxy-sidecar Build cube-proxy-sidecar (developer-only; not in 'all')\n"
+	@printf "  cube-volume-s3 Build the S3-compatible Volume plugin in Docker\n"
+	@printf "  cube-volume-s3-test Run S3 Volume plugin unit tests in Docker\n"
+	@printf "  cube-volume-cos-rpc-test Run COS RPC Volume plugin unit tests in Docker\n"
 	@printf "  agent         Build cube-agent in Docker\n"
 	@printf "  cube-init     Build cube-init (guest PID1) in Docker (alias: guest-init)\n"
 	@printf "  guest-init    Alias for cube-init (source dir guest-init/)\n"
@@ -127,23 +161,31 @@ help:
 	@printf "  cube-api      Alias of cubeapi\n"
 	@printf "  cubeops       Build CubeOps in Docker\n"
 	@printf "  cubeops-test  Run CubeOps unit tests in Docker\n"
+	@printf "  ops-agent     Build ops-agent in Docker\n"
+	@printf "  ops-agent-test Run ops-agent unit tests in Docker\n"
 	@printf "  shim          Build containerd-shim-cube-rs and cube-runtime in Docker\n"
 	@printf "  cubemaster-test Run CubeMaster unit tests in Docker\n"
+	@printf "  cubetemplatecenter-test Run CubeTemplateCenter unit tests in Docker\n"
 	@printf "  cubelet-test  Run Cubelet unit tests in Docker\n"
+	@printf "  cubelet-mount-test Run Cubelet mount tests in privileged Docker\n"
 	@printf "  cube-proxy-test Run CubeProxy unit tests locally\n"
 	@printf "  cube-api-test Run CubeAPI unit tests in Docker\n"
 	@printf "  cubeops-test  Run CubeOps unit tests in Docker\n"
 	@printf "  shim-test     Run CubeShim unit tests in Docker\n"
 	@printf "  cubelog-test  Run cubelog unit tests on the host\n"
 	@printf "  cubedb-test   Run CubeDB unit tests on the host\n"
+	@printf "  blobstore-test Run pkgs/blobstore unit tests on the host\n"
+	@printf "  sandboxrestart-test Run pkgs/sandboxrestart unit tests on the host\n"
+	@printf "  proto-test    Run pkgs/proto unit tests on the host\n"
 	@printf "  cube-lifecycle-manager-test Run cube-lifecycle-manager unit tests in Docker\n"
-	@printf "  cubelet-pkg-test Run Cubelet ./pkg/... unit tests in Docker (no coverage)\n"
 	@printf "  agent-test    Run cube-agent unit tests in Docker\n"
 	@printf "  hypervisor-test Run hypervisor --lib --bins unit tests in Docker\n"
 	@printf "  guest-kernel  Build guest kernel vmlinux/Image (KERNEL_SRC=...; native or cross x86_64<->aarch64)\n"
 	@printf "  all           Build all default binaries in Docker\n"
 	@printf "  manual-release Build binaries and package manual update tarball\n"
-	@printf "  clean-rust-target-dirs Remove target/ in every top-level Rust project\n"
+	@printf "  clean         Remove local Go/Rust build artifacts (not global caches)\n"
+	@printf "  clean-go-build-dirs Remove Go component build/bin dirs and _output/{bin,cube-agent}\n"
+	@printf "  clean-rust-target-dirs cargo clean every Rust workspace in Docker\n"
 	@printf "  web-install   Install WebUI npm dependencies\n"
 	@printf "  web-dev       Start WebUI Vite dev server\n"
 	@printf "  web-build     Build WebUI static assets\n"
@@ -152,7 +194,6 @@ help:
 	@printf "  web-fmt       Format WebUI sources\n"
 	@printf "  fmt           Format all component directories\n"
 	@printf "  web-api-sync  Export OpenAPI and regenerate WebUI schema types\n"
-	@printf "  web-sync-dev-env Build and deploy WebUI into dev-env VM\n"
 	@printf "\nNotes:\n"
 	@printf "  - builder-shell forwards ~/.git-credentials when present\n"
 	@printf "  - builder-run reuses the same mounted workspace and persisted HOME\n"
@@ -162,14 +203,33 @@ help:
 	@printf "  - Run 'make builder-image' first if image %s is missing\n" "$(BUILDER_IMAGE)"
 
 .PHONY: builder-image
-# BUILDER_FORCE_REBUILD rebuilds even when the image is present, and adds
-# --no-cache so a stale image is refreshed from scratch rather than reproduced
-# from the Docker layer cache. A plain first build (image missing) stays cached.
+# Context is the repo root (Dockerfile COPYs CubeS3lvol/setup_dep.sh + patches/).
+# Rebuilds when the image's s3lvol SPDK/AWS stamps no longer match the current
+# pin + patches (toolchain layers stay cached). BUILDER_FORCE_REBUILD=1 forces it.
 builder-image:
-	@if [ -z "$(BUILDER_FORCE_REBUILD)" ] && docker image inspect $(BUILDER_IMAGE) >/dev/null 2>&1; then \
-		printf 'Builder image %s already present, skipping build (set BUILDER_FORCE_REBUILD=1 to rebuild)\n' "$(BUILDER_IMAGE)"; \
+	@expected_spdk="$$($(CUBES3LVOL_DIR)/setup_dep.sh --print-stamp spdk)"; \
+	expected_aws="$$($(CUBES3LVOL_DIR)/setup_dep.sh --print-stamp aws)"; \
+	need_build=0; \
+	if [ -n "$(BUILDER_FORCE_REBUILD)" ]; then \
+		need_build=1; \
+	elif ! docker image inspect $(BUILDER_IMAGE) >/dev/null 2>&1; then \
+		need_build=1; \
 	else \
-		docker build $(if $(filter-out 0,$(BUILDER_FORCE_REBUILD)),--no-cache) $(BUILDER_BUILD_ARGS) -t $(BUILDER_IMAGE) -f $(BUILDER_DOCKERFILE) ./docker; \
+		actual_spdk="$$(docker image inspect -f '{{index .Config.Labels "org.cubesandbox.s3lvol.spdk-stamp"}}' $(BUILDER_IMAGE) 2>/dev/null || true)"; \
+		actual_aws="$$(docker image inspect -f '{{index .Config.Labels "org.cubesandbox.s3lvol.aws-stamp"}}' $(BUILDER_IMAGE) 2>/dev/null || true)"; \
+		if [ "$$actual_spdk" != "$$expected_spdk" ] || [ "$$actual_aws" != "$$expected_aws" ]; then \
+			printf 'Builder image %s s3lvol stamps stale (spdk %s -> %s, aws %s -> %s), rebuilding\n' \
+				"$(BUILDER_IMAGE)" "$${actual_spdk:-none}" "$$expected_spdk" "$${actual_aws:-none}" "$$expected_aws"; \
+			need_build=1; \
+		fi; \
+	fi; \
+	if [ "$$need_build" -eq 0 ]; then \
+		printf 'Builder image %s already present and s3lvol stamps match, skipping build (set BUILDER_FORCE_REBUILD=1 to rebuild)\n' "$(BUILDER_IMAGE)"; \
+	else \
+		docker build $(if $(filter-out 0,$(BUILDER_FORCE_REBUILD)),--no-cache) $(BUILDER_BUILD_ARGS) \
+			--build-arg S3LVOL_SPDK_STAMP="$$expected_spdk" \
+			--build-arg S3LVOL_AWS_STAMP="$$expected_aws" \
+			-t $(BUILDER_IMAGE) -f $(BUILDER_DOCKERFILE) .; \
 	fi
 
 .PHONY: prepare-builder-home
@@ -239,33 +299,106 @@ else
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk'
 endif
 
+# cube-s3lvol: build the CubeS3lvol release in Docker, mirroring track_s3lvol.
+# setup_dep.sh reuses /opt/s3lvol-* from the builder when stamps match.
+.PHONY: cube-s3lvol
+cube-s3lvol:
+ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
+	@mkdir -p "$(OUTPUT_DIR)/CubeS3lvol"
+	cd "$(CUBES3LVOL_DIR)" && AWS_BUILD_TYPE=RelWithDebInfo ./setup_dep.sh --jobs "$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && AWS_BUILD_TYPE=RelWithDebInfo make S3LVOL_BUILD_TYPE=release -j"$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && AWS_BUILD_TYPE=RelWithDebInfo ./make_release.sh --no-tar --skip-smoke --version "$(CUBE_VERSION)" --outdir "$(OUTPUT_DIR)/CubeS3lvol"
+	@printf 'CubeS3lvol release: %s/CubeS3lvol/s3lvol-*/ (bin/s3lvol_tgt + scripts/ + VERSION)\n' "$(OUTPUT_DIR)"
+else
+	$(MAKE) builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cube-s3lvol'
+endif
+
+# cube-s3lvol-test: the CI gate (check-rules + debug make + check-offline).
+# Journal/wal/cache/local_dev tests write aio files under /data; tmpfs keeps
+# that off the host. The DPDK EAL tests (--no-huge) still need locked memory,
+# /sys cgroup/cpu topology, and a writable runtime dir; a non-root docker
+# process cannot initialise the EAL (spdk_env_init -> exit 77). Same privileged
+# root pattern as cubevs-test. Incremental setup_dep.sh / make do not rewrite
+# existing 1000-owned deps. setup_dep.sh is incremental.
+.PHONY: cube-s3lvol-test
+cube-s3lvol-test:
+ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
+	cd "$(CUBES3LVOL_DIR)" && ./setup_dep.sh --jobs "$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && make check-rules
+	cd "$(CUBES3LVOL_DIR)" && make -j"$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && mkdir -p /tmp/s3lvol-dpdk && \
+		RTE_RUNTIME_DIR=/tmp/s3lvol-dpdk make check-offline
+	cd "$(CUBES3LVOL_DIR)" && rm -f test/integration/s3_dynamic_json_test && \
+		$(MAKE) -C test/integration S3LVOL_ASAN=1 s3_dynamic_json_test && \
+		ASAN_OPTIONS=detect_leaks=1 ./test/integration/s3_dynamic_json_test
+else
+	$(MAKE) builder-image
+	$(MAKE) builder-run \
+		BUILDER_USER=0:0 \
+		BUILDER_RUN_EXTRA_MOUNTS='--privileged --tmpfs /data:rw,mode=1777 --ulimit memlock=-1' \
+		BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cube-s3lvol-test'
+endif
+
 .PHONY: cubecow-clean
 cubecow-clean:
 	rm -rf "$(CUBELET_COW_THIRD_PARTY_DIR)"
 	cd "$(CUBECOW_DIR)" && cargo clean
 
-.PHONY: clean-rust-target-dirs
-clean-rust-target-dirs:
-	@for dir in $(RUST_PROJECT_DIRS); do \
-		if [ -d "$$dir/target" ]; then \
-			printf '  %-8s %s\n' "RM" "$$dir/target"; \
-			rm -rf "$$dir/target"; \
+.PHONY: clean-go-build-dirs
+clean-go-build-dirs:
+	@for dir in $(GO_BUILD_ARTIFACT_DIRS); do \
+		if [ -d "$$dir" ]; then \
+			printf '  %-8s %s\n' "RM" "$$dir"; \
+			rm -rf "$$dir"; \
 		fi; \
 	done
+	@for f in $(GO_BUILD_ARTIFACT_FILES); do \
+		if [ -e "$$f" ]; then \
+			printf '  %-8s %s\n' "RM" "$$f"; \
+			rm -f "$$f"; \
+		fi; \
+	done
+
+.PHONY: clean-rust-target-dirs
+clean-rust-target-dirs:
+ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
+	@for dir in $(RUST_CARGO_CLEAN_DIRS); do \
+		printf '  %-8s %s\n' "CARGO" "clean $$dir"; \
+		cargo clean --manifest-path "$$dir/Cargo.toml"; \
+	done
+else
+	$(MAKE) builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make clean-rust-target-dirs'
+endif
+
+.PHONY: clean
+clean: clean-go-build-dirs clean-rust-target-dirs
 
 .PHONY: cubecow-smoke
 cubecow-smoke: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && go build -a -o /workspace/_output/bin/cubecow-smoke ./pkg/cubecow/cmd/cubecow-smoke'
 
+# Both halves of the cubecow test set: the crate's own #[test]s via cargo, and
+# the Go bindings that link it. Nothing else in the tree runs the first half --
+# cubecow-sdk only builds the crate.
 .PHONY: cubecow-test-native
 cubecow-test-native: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && go test -a ./pkg/cubecow -run Test -count=1'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/cubecow && cargo test -p cubecow --lib && cd /workspace/Cubelet && go mod download && go test -a ./pkg/cubecow -run Test -count=1'
 
 .PHONY: cubemaster
 cubemaster: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeMaster && make proto && CGO_ENABLED=0 make build && mkdir -p /workspace/_output/bin && cp build/cubemaster build/cubemastercli /workspace/_output/bin/'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeMaster && CGO_ENABLED=0 make build && mkdir -p /workspace/_output/bin && cp build/cubemaster build/cubemastercli /workspace/_output/bin/'
+
+# CubeTemplateCenter is a separate module whose go.mod replaces CubeMaster,
+# CubeDB, Cubelet and cubelog with local paths, so it builds inside the same
+# builder image as every other Go component.
+.PHONY: cubetemplatecenter
+cubetemplatecenter: builder-image
+	@mkdir -p "$(OUTPUT_DIR)"
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeTemplateCenter && go mod download && make build && mkdir -p /workspace/_output/bin && cp build/templatecenter /workspace/_output/bin/'
 
 .PHONY: cubelet
 cubelet: builder-image
@@ -278,6 +411,13 @@ cubelet: builder-image
 cubevsmapdump: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) builder-run BUILDER_CMD='mkdir -p /workspace/_output/bin && cd /workspace/CubeNet/cubevs && make gen && go build -o /workspace/_output/bin/cubevsmapdump ./cmd/cubevsmapdump'
+
+# S3-compatible Volume plugin. CubeMaster/Cubelet fork it once per hook, so it
+# ships as a standalone static binary next to the component binaries.
+.PHONY: cube-volume-s3
+cube-volume-s3: builder-image
+	@mkdir -p "$(OUTPUT_DIR)"
+	$(MAKE) builder-run BUILDER_CMD="mkdir -p /workspace/_output/bin && cd /workspace/examples/volume/s3 && go mod download && CGO_ENABLED=0 GOOS=linux GOARCH=$$(go env GOARCH) go build -trimpath -ldflags '-s -w' -o /workspace/_output/bin/cube-volume-s3 ./cmd/cube-volume-s3"
 
 .PHONY: cube-proxy-sidecar
 cube-proxy-sidecar: builder-image
@@ -326,19 +466,62 @@ cube-api: cubeapi
 .PHONY: cubeops
 cubeops: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
-	$(MAKE) builder-run BUILDER_CMD="mkdir -p /workspace/_output/bin && cd /workspace/CubeOps && go mod download && CGO_ENABLED=0 GOOS=linux GOARCH=$$(go env GOARCH) go build -ldflags '-s -w -X github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Version=$(CUBE_VERSION) -X github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Commit=$(CUBE_COMMIT) -X github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.BuildTime=$(CUBE_BUILD_TIME)' -o /workspace/_output/bin/cubeops ./cmd/cubeops"
+	$(MAKE) builder-run BUILDER_CMD='mkdir -p /workspace/_output/bin && cd /workspace/CubeOps && CGO_ENABLED=0 make build && cp bin/cubeops bin/cubeopscli /workspace/_output/bin/'
 
 .PHONY: cubeops-test
 cubeops-test: builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeOps && go mod download && go test ./...'
 
+# ops-agent: standalone Go module (own go.mod, replace => ../pkgs/CubeLog).
+.PHONY: ops-agent
+ops-agent: builder-image
+	@mkdir -p "$(OUTPUT_DIR)"
+	$(MAKE) builder-run BUILDER_CMD="mkdir -p /workspace/_output/bin && cd /workspace/OpsAgent && go mod download && CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o /workspace/_output/bin/ops-agent ./cmd/ops-agent"
+
+.PHONY: ops-agent-test
+ops-agent-test: builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/OpsAgent && go mod download && go test ./...'
+
+# The plugin's tests need no cloud access; the s3fs helpers skip themselves when
+# mountpoint(1) is unavailable.
+.PHONY: cube-volume-s3-test
+cube-volume-s3-test: builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/examples/volume/s3 && go mod download && go vet ./... && go test ./...'
+
+# COS RPC Volume plugin (examples/volume/cos/rpc): the reference gRPC volume
+# plugin and the only example consuming pkgs/proto. Standalone Go module (its
+# own go.mod), so it is not covered by any component test target above.
+.PHONY: cube-volume-cos-rpc-test
+cube-volume-cos-rpc-test: builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/examples/volume/cos/rpc && go mod download && go vet ./... && go test ./...'
+
 .PHONY: cubemaster-test
 cubemaster-test: builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeMaster && go mod download && make test'
 
+# CubeTemplateCenter shares CubeMaster's pkg/templatecenter/image, which uses
+# Linux-only syscall constants, so its tests cannot run on a macOS host and go
+# through the builder like every other Go component.
+.PHONY: cubetemplatecenter-test
+cubetemplatecenter-test: builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeTemplateCenter && go mod download && CUBEMASTER_REQUIRE_EXT4_TESTS=1 go test ./... -count=1'
+
+# cubecow-sdk (CGO) and cubevs's generated BPF code are build prerequisites
+# for several Cubelet packages.
 .PHONY: cubelet-test
 cubelet-test: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/CubeNet/cubevs && make gen && cd /workspace/Cubelet && go mod download && make test'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/CubeNet/cubevs && make gen && cd /workspace/Cubelet && go mod download && make proto && make test'
+
+# Keep the ordinary Cubelet gate unprivileged while still exercising tests that
+# call mount(2) in CI. Run every storage test protected by requireRoot; the full
+# package also contains unrelated timing-sensitive tests. Patchoverlay's other
+# privileged tests need host overlayfs support, so only its affected removal test
+# runs here. Running the builder as root can leave both ignored workspace
+# artifacts and shared builder-home caches root-owned; harmless in CI, but local
+# cleanup or a later unprivileged builder may require ownership repair.
+.PHONY: cubelet-mount-test
+cubelet-mount-test: builder-image
+	$(MAKE) builder-run BUILDER_USER=0:0 BUILDER_RUN_EXTRA_MOUNTS='--privileged' BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && CI=true go test -count=1 ./plugins/snapshots/overlay/patchoverlay -run TestRemoveDirectory && CI=true go test -count=1 ./storage -run TestNewExt4\|TestParam\|TestCreateDestroy\|TestCleanupTemplateLocalData\|TestCreateWithTimeoutCtx\|TestCreateWithInvalidParam\|TestCreateCubeboxBySnap\|TestInit\|TestSnapCreateCubebox && CUBELET_REQUIRE_MOUNT_TESTS=1 CI=true go test -count=1 cmd/cubelet/state_tmpfs.go cmd/cubelet/root_shared_mount.go cmd/cubelet/state_tmpfs_test.go cmd/cubelet/root_shared_mount_test.go'
 
 .PHONY: cube-proxy-test
 cube-proxy-test:
@@ -357,23 +540,42 @@ shim-test: builder-image
 # container is faster.
 .PHONY: cubelog-test
 cubelog-test:
-	cd cubelog && go test -short ./...
+	cd pkgs/CubeLog && go test -short ./...
 
 .PHONY: cubedb-test
 cubedb-test:
-	cd CubeDB && go mod download && go test ./...
+	cd pkgs/cubedb && go mod download && go test ./...
+
+# pkgs/blobstore is pure Go (no CGO). Consumers compile it via replace;
+# the module's own tests must run here.
+.PHONY: blobstore-test
+blobstore-test:
+	cd pkgs/blobstore && go mod download && go test ./...
+
+# pkgs/sandboxrestart is stdlib-only, so no module download is needed.
+.PHONY: sandboxrestart-test
+sandboxrestart-test:
+	cd pkgs/sandboxrestart && go test ./...
+.PHONY: redisx-test
+redisx-test:
+	cd pkgs/redisx && go test ./...
+
+# pkgs/proto runs on the host: pure Go (generated .pb.go + grpc/protobuf
+# deps, no CGO/builder-only deps), like cubelog/cubedb. Consumers only
+# compile its non-test code via replace, so the module's own _test.go files
+# must be run here -- `go test ./...` in an importer never runs a
+# dependency's tests.
+.PHONY: proto-test
+proto-test:
+	cd pkgs/proto && go mod download && go vet ./... && go test ./...
+
+.PHONY: cubebench-test
+cubebench-test:
+	bash tests/perf/cubebench_test.sh
 
 .PHONY: cube-lifecycle-manager-test
 cube-lifecycle-manager-test: builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/cube-lifecycle-manager && go mod download && go test ./...'
-
-# cubelet-pkg-test bypasses cubelet-test: that target runs `go test
-# -coverprofile`, and the builder's Go toolchain lacks the `covdata` tool, so
-# any coverage build fails. Run only ./pkg/... with -short (skips the
-# Redis/KVM-dependent cases), which is self-contained in the builder.
-.PHONY: cubelet-pkg-test
-cubelet-pkg-test: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && make proto && go test -short ./pkg/...'
 
 # cubevs-test runs the CubeNet/cubevs module's own unit tests (dataplane policy,
 # DNS learning, migration, dump, classify), which the cubelet targets never
@@ -393,12 +595,12 @@ agent-test: builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/agent && make test'
 
 # Only unit tests (--lib --bins) run here; the tests/integration.rs target
-# needs a full VM. This does not pass /dev/kvm into the builder, so the
-# runtime-KVM vmm tests are not reached (see tests/unittest/run.sh
-# hypervisor-kvm for those).
+# needs a full VM. The root package command does not execute workspace member
+# tests, so block_util runs explicitly. This does not pass /dev/kvm into the
+# builder; see tests/unittest/run.sh hypervisor-kvm for runtime-KVM tests.
 .PHONY: hypervisor-test
 hypervisor-test: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/hypervisor && cargo test --features kvm --lib --bins'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/hypervisor && cargo test --features kvm --lib --bins && cargo test -p block_util --lib'
 
 .PHONY: shim
 shim: builder-image
@@ -465,10 +667,6 @@ web-fmt:
 web-api-sync:
 	cd "$(WEB_DIR)" && npm run api:sync
 
-.PHONY: web-sync-dev-env
-web-sync-dev-env:
-	"$(ROOT_DIR)/dev-env/internal/sync_web_to_vm.sh"
-
 # Run make fmt in each component directory that has a fmt target.
 # Components without formattable code (e.g. CubeProxy) are skipped.
 # Outside the builder, Go/Rust fmt routes through builder-run so
@@ -489,13 +687,23 @@ ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
 	@printf '  %-8s %s\n' "FMT" "Cubelet"
 	@$(MAKE) -C Cubelet fmt
 	@printf '  %-8s %s\n' "FMT" "cubelog"
-	@$(MAKE) -C cubelog fmt
+	@$(MAKE) -C pkgs/CubeLog fmt
+	@printf '  %-8s %s\n' "FMT" "proto"
+	@$(MAKE) -C pkgs/proto fmt
+	@printf '  %-8s %s\n' "FMT" "blobstore"
+	@$(MAKE) -C pkgs/blobstore fmt
+	@printf '  %-8s %s\n' "FMT" "sandboxrestart"
+	@$(MAKE) -C pkgs/sandboxrestart fmt
 	@printf '  %-8s %s\n' "FMT" "CubeMaster"
 	@$(MAKE) -C CubeMaster fmt
+	@printf '  %-8s %s\n' "FMT" "CubeTemplateCenter"
+	@$(MAKE) -C CubeTemplateCenter fmt
 	@printf '  %-8s %s\n' "FMT" "CubeNet"
 	@$(MAKE) -C CubeNet fmt
 	@printf '  %-8s %s\n' "FMT" "CubeOps"
 	@$(MAKE) -C CubeOps fmt
+	@printf '  %-8s %s\n' "FMT" "OpsAgent"
+	@$(MAKE) -C OpsAgent fmt
 	@printf '  %-8s %s\n' "FMT" "CubeShim"
 	@$(MAKE) -C CubeShim fmt
 	@printf '  %-8s %s\n' "FMT" "cube-lifecycle-manager"
@@ -506,6 +714,8 @@ ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
 	@$(MAKE) -C sdk/go fmt
 	@printf '  %-8s %s\n' "FMT" "examples/cube-bench"
 	@$(MAKE) -C examples/cube-bench fmt
+	@printf '  %-8s %s\n' "FMT" "examples/volume/s3"
+	@$(MAKE) -C examples/volume/s3 fmt
 else
 	@$(MAKE) builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make fmt'
@@ -516,3 +726,28 @@ else
 		printf '  %-8s %s\n' "SKIP" "web (npm not available on host)"; \
 	fi
 endif
+
+# Live snapshot E2E (filesystem-only + regression). Requires a running cluster
+# that supports fs-only snapshots:
+#   make e2e-fs-only CUBE_API_URL=http://HOST:3000 CUBE_TEMPLATE_ID=tpl-...
+# This target always passes --run-e2e so the suite never silently skips, and
+# fails loudly when the cluster is unreachable or does not advertise fs-only.
+.PHONY: e2e-fs-only
+e2e-fs-only:
+	@test -n "$(CUBE_API_URL)" || (echo "CUBE_API_URL is required" >&2; exit 1)
+	@test -n "$(CUBE_TEMPLATE_ID)" || (echo "CUBE_TEMPLATE_ID is required" >&2; exit 1)
+	cd tests/e2e/sdk_compat && \
+		CUBE_API_URL="$(CUBE_API_URL)" \
+		CUBE_TEMPLATE_ID="$(CUBE_TEMPLATE_ID)" \
+		CUBE_PROXY_NODE_IP="$(CUBE_PROXY_NODE_IP)" \
+		PYTHONPATH="$(ROOT_DIR)/sdk/python" \
+		SDK_E2E_BACKENDS="$${SDK_E2E_BACKENDS:-cubesandbox}" \
+		python3 -m pytest \
+			cases/lifecycle/test_cold_start_mounts.py \
+			cases/lifecycle/test_filesystem_only_snapshot.py \
+			cases/lifecycle/test_rollback_clone.py \
+			cases/lifecycle/test_fork.py \
+			cases/lifecycle/test_pause_resume.py \
+			cases/volume/test_snapshot_reference.py \
+			cases/volume/test_snapshot_volume_mounts.py \
+			--run-e2e -q

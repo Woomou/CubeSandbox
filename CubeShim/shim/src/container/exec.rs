@@ -4,9 +4,10 @@
 
 use super::ContainerState;
 use crate::log::Log;
-use crate::{debugf, errf, infof};
-use oci_spec::runtime::Process;
+use crate::{debugf, errf, infof, warnf};
+use oci_spec::runtime::{Box as ConsoleBox, Process};
 use protoc::{agent, agent_ttrpc};
+use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ttrpc::context;
@@ -30,6 +31,22 @@ pub struct Tty {
     pub height: u32,
     pub width: u32,
     pub terminal: bool,
+}
+
+/// Prefer a cached containerd ResizePty size over OCI console_size.
+/// HandleConsoleResize typically fires before Start, so the cache must win.
+pub fn resolve_pty_size(tty: &Tty, spec_size: Option<ConsoleBox>) -> Option<(u32, u32)> {
+    if tty.height > 0 && tty.width > 0 {
+        return Some((tty.height, tty.width));
+    }
+    let size = spec_size?;
+    let height = size.height() as u32;
+    let width = size.width() as u32;
+    if height == 0 || width == 0 {
+        None
+    } else {
+        Some((height, width))
+    }
 }
 
 impl Exec {
@@ -373,12 +390,20 @@ impl Exec {
                 res = client.read_stdout(ctx.clone(), &req) => {
                     match res {
                         Err(e) => {
-                            debugf!(log, "init log: read stdout failed:{}", e);
-                            return;
+                            warnf!(log, "init log: read stdout failed:{}, retry", e);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
                         }
                         Ok(rsp) => {
+                            if rsp.data.is_empty() {
+                                continue;
+                            }
                             if let Err(e) = file.write_all(&rsp.data).await {
                                 infof!(log, "init log: write stdout failed:{}", e);
+                                return;
+                            }
+                            if let Err(e) = file.flush().await {
+                                infof!(log, "init log: flush stdout failed:{}", e);
                                 return;
                             }
                         }
@@ -439,12 +464,20 @@ impl Exec {
                 res = client.read_stderr(ctx.clone(), &req) => {
                     match res {
                         Err(e) => {
-                            debugf!(log, "init log: read stderr failed:{}", e);
-                            return;
+                            warnf!(log, "init log: read stderr failed:{}, retry", e);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
                         }
                         Ok(rsp) => {
+                            if rsp.data.is_empty() {
+                                continue;
+                            }
                             if let Err(e) = file.write_all(&rsp.data).await {
                                 infof!(log, "init log: write stderr failed:{}", e);
+                                return;
+                            }
+                            if let Err(e) = file.flush().await {
+                                infof!(log, "init log: flush stderr failed:{}", e);
                                 return;
                             }
                         }
@@ -452,5 +485,46 @@ impl Exec {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_pty_size, Tty};
+    use oci_spec::runtime::Process;
+
+    #[test]
+    fn resolve_pty_size_prefers_cached_resize() {
+        let tty = Tty {
+            height: 40,
+            width: 160,
+            ..Default::default()
+        };
+        let proc: Process = serde_json::from_str(
+            r#"{"cwd":"/","user":{"uid":0,"gid":0},"terminal":true,"consoleSize":{"height":24,"width":80}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_pty_size(&tty, proc.console_size()), Some((40, 160)));
+    }
+
+    #[test]
+    fn resolve_pty_size_falls_back_to_oci_console_size() {
+        let tty = Tty::default();
+        let proc: Process = serde_json::from_str(
+            r#"{"cwd":"/","user":{"uid":0,"gid":0},"terminal":true,"consoleSize":{"height":24,"width":80}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_pty_size(&tty, proc.console_size()), Some((24, 80)));
+    }
+
+    #[test]
+    fn resolve_pty_size_ignores_zero() {
+        let tty = Tty::default();
+        let proc: Process = serde_json::from_str(
+            r#"{"cwd":"/","user":{"uid":0,"gid":0},"terminal":true,"consoleSize":{"height":0,"width":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_pty_size(&tty, proc.console_size()), None);
+        assert_eq!(resolve_pty_size(&tty, None), None);
     }
 }

@@ -125,10 +125,15 @@ func refreshTimeoutMeta(ctx context.Context, sandboxID string, timeoutSeconds in
 	if p := getTimeoutProvider(); p != nil {
 		endAt, err := p.RefreshTimeout(ctx, sandboxID, timeoutSeconds)
 		if err != nil {
-			log.G(ctx).Warnf("lifecycle: RefreshTimeout sandbox=%s failed: %v", sandboxID, err)
+			log.G(ctx).Errorf("lifecycle: RefreshTimeout sandbox=%s failed: %v", sandboxID, err)
+		} else if timeoutSeconds < 0 {
+			return 0
 		} else if endAt > 0 {
 			return endAt
 		}
+	}
+	if timeoutSeconds < 0 {
+		return 0
 	}
 	return time.Now().UnixMilli() + int64(timeoutSeconds)*1000
 }

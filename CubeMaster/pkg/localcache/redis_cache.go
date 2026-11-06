@@ -23,7 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type RedisNodeInfo struct {
@@ -164,25 +164,6 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 	}
 	if log.IsDebug() {
 		log.G(ctx).Debugf("WriteNodeMetric: %+v", m)
-	}
-	return nil
-}
-
-// DeleteNodeMetric removes both current and legacy metric keys for a retired
-// node. Cache eviction remains correct if Redis is temporarily unavailable,
-// so callers may log this error after the database transaction has committed.
-func DeleteNodeMetric(ctx context.Context, nodeID string) error {
-	if nodeID == "" {
-		return errors.New("DeleteNodeMetric: node id required")
-	}
-	keys := rediskey.DeleteKeys(rediskey.NodeMetric(nodeID), rediskey.LegacyNodeMetric(nodeID))
-	args := redis.Args{}
-	for _, key := range keys {
-		args = args.Add(key)
-	}
-	if _, err := wrapredis.GetRedis().Do("DEL", args...); err != nil {
-		log.G(ctx).Errorf("DeleteNodeMetric DEL failed node_id=%s: %v", nodeID, err)
-		return err
 	}
 	return nil
 }

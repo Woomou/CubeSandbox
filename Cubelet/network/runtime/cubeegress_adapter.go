@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime/cubeegress"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // CubeEgressAdapter is the runtime boundary for L7 egress policy delivery.
@@ -19,7 +19,7 @@ import (
 // deterministic failures in unit tests without spinning up an httptest server.
 type CubeEgressAdapter interface {
 	Configured() bool
-	PutPolicy(ctx context.Context, sandboxIP string, in *cubeegress.PolicyInput) error
+	PutPolicy(ctx context.Context, sandboxIP string, sandboxID cubeegress.SandboxID, in *cubeegress.PolicyInput) error
 	DeletePolicy(ctx context.Context, sandboxIP string) error
 	VerifyPolicyAbsent(ctx context.Context, sandboxIP string) error
 }
@@ -127,6 +127,42 @@ func (s *NetworkController) pushEgressForState(ctx context.Context, state *manag
 	return s.putEgressPolicyForCreate(ctx, state, in)
 }
 
+// syncEgressPolicy converges CubeEgress on cfg's rule set for a live sandbox.
+//
+// Whether CubeEgress is involved at all is decided by the rule sets alone:
+//
+//	want != nil                 -> install the new rules
+//	want == nil, installed != nil -> clear the rules the sandbox still has
+//	want == nil, installed == nil -> L7 is not in play; do not touch CubeEgress
+//
+// The third row is why this exists. pushEgressForState can stop at "no rules, no
+// call" because on create nothing is installed yet, but an update must also be
+// able to clear. Deriving that from the rule sets keeps an L3-only sandbox — one
+// that never had L7 rules and still doesn't — independent of CubeEgress instead
+// of failing its policy updates whenever the proxy is unreachable.
+//
+// `installed` comes from the state's own config, which can under-report if an
+// earlier update pushed rules and then failed before persisting. Those leftovers
+// are inert (the datapath was never told to steer at them) and CubeEgress
+// re-seeds from DumpEgressPolicies on its next reload.
+func (s *NetworkController) syncEgressPolicy(ctx context.Context, state *managedState, cfg *CubeNetworkConfig) error {
+	want := toEgressInput(cfg)
+	installed := toEgressInput(state.CubeNetworkConfig)
+	if want == nil && installed == nil {
+		return nil
+	}
+	// L7 is in play, so CubeEgress has to be part of this deployment. An unset
+	// admin URL means it is not (dev mode), which the create and release paths
+	// also treat as a silent no-op.
+	if s.cubeEgressAdapter == nil || !s.cubeEgressAdapter.Configured() {
+		return nil
+	}
+	if want == nil {
+		return s.deleteEgressForState(ctx, state.SandboxID, state.SandboxIP)
+	}
+	return s.putEgressPolicyForCreate(ctx, state, want)
+}
+
 // putEgressPolicyForCreate keeps sandbox creation from failing on a single
 // transient CubeEgress admin blip. Three total attempts are deliberately small:
 // with the default 2s per-call timeout the worst case is bounded around six
@@ -134,7 +170,7 @@ func (s *NetworkController) pushEgressForState(ctx context.Context, state *manag
 func (s *NetworkController) putEgressPolicyForCreate(ctx context.Context, state *managedState, in *cubeegress.PolicyInput) error {
 	attempts := len(egressCreatePushRetryDelays) + 1
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err := s.cubeEgressAdapter.PutPolicy(ctx, state.SandboxIP, in)
+		err := s.cubeEgressAdapter.PutPolicy(ctx, state.SandboxIP, cubeegress.SandboxID(state.SandboxID), in)
 		if err == nil || cubeegress.IsPermanent(err) || attempt == attempts {
 			return err
 		}
@@ -189,7 +225,7 @@ func (s *NetworkController) deleteEgressForState(ctx context.Context, sandboxID,
 // CubeEgress's bootstrap.lua reads on worker init. The wire shape
 // matches what bootstrap.lua's `_apply` already accepts:
 //
-//	{ "policies": { "<sandbox_ip>": { "policy_id": ..., "rules": [...] } } }
+//	{ "policies": { "<sandbox_ip>": { "policy_id": "<sandbox_id>", "rules": [...] } } }
 //
 // (the outer `policies` wrapper is added by the HTTP layer; this
 // method returns the inner map only).
@@ -211,7 +247,7 @@ func (s *NetworkController) DumpEgressPolicies(_ context.Context) (map[string]ma
 	out := make(map[string]map[string]any, len(s.states))
 	for _, st := range s.states {
 		input := toEgressInput(st.CubeNetworkConfig)
-		body := cubeegress.BuildPolicyBody(st.SandboxIP, input)
+		body := cubeegress.BuildPolicyBody(st.SandboxID, input)
 		if body == nil {
 			continue
 		}

@@ -18,11 +18,11 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func init() {
@@ -88,6 +88,11 @@ func (p *cubeSandboxStorePlugin) Init(ctx context.Context, opts *workflow.InitIn
 }
 
 func (p *cubeSandboxStorePlugin) Create(ctx context.Context, opts *workflow.CreateContext) error {
+	// Restart keeps the sandbox ID. The bucket is still there when destroy
+	// stopped at the deadline, and it is intentionally not removed below.
+	if opts != nil && workflow.ReuseFor(opts).CubeboxMeta {
+		return nil
+	}
 	_, err := p.client.SandboxStore().Create(ctx,
 		sandbox.Sandbox{
 			ID:        opts.SandboxID,
@@ -108,6 +113,9 @@ func (p *cubeSandboxStorePlugin) Create(ctx context.Context, opts *workflow.Crea
 }
 
 func (p *cubeSandboxStorePlugin) Destroy(ctx context.Context, opts *workflow.DestroyContext) error {
+	if workflow.RetainFor(opts).CubeboxMeta {
+		return nil
+	}
 	err := p.client.SandboxStore().Delete(ctx, opts.SandboxID)
 	if err != nil && !errdefs.IsNotFound(err) {
 		return err

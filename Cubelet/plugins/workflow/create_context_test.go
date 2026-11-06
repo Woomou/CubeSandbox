@@ -9,9 +9,25 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	cubebox "github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	cubebox "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
+
+func TestRestartDestroyKeepsResources(t *testing.T) {
+	t.Parallel()
+	require.False(t, restartDestroyKeepsResources(nil))
+	require.False(t, restartDestroyKeepsResources(&DestroyContext{}))
+	require.False(t, restartDestroyKeepsResources(&CreateContext{IsRestart: true}))
+	require.True(t, restartDestroyKeepsResources(&DestroyContext{IsRestartDestroy: true}))
+}
+
+func TestReuseForMirrorsRestart(t *testing.T) {
+	t.Parallel()
+	require.False(t, ReuseFor(nil).Storage)
+	require.False(t, ReuseFor(&CreateContext{}).Network)
+	got := ReuseFor(&CreateContext{IsRestart: true})
+	require.True(t, got.Storage && got.Network && got.Volume && got.CubeboxMeta)
+}
 
 func TestCreateContextIsPauseResume(t *testing.T) {
 	t.Parallel()
@@ -38,4 +54,18 @@ func TestCreateContextIsPauseResume(t *testing.T) {
 		},
 	}
 	require.True(t, pauseResume.IsPauseResume())
+	require.True(t, pauseResume.IsGuestMountRestore())
+	require.False(t, fromTpl.IsGuestMountRestore())
+
+	fromSnap := &CreateContext{
+		ReqInfo: &cubebox.RunCubeSandboxRequest{
+			Annotations: map[string]string{
+				constants.MasterAnnotationRuntimeSnapshotID: "snap-runtime1",
+			},
+		},
+	}
+	require.False(t, fromSnap.IsPauseResume())
+	require.True(t, fromSnap.IsGuestMountRestore())
+	require.False(t, (*CreateContext)(nil).IsGuestMountRestore())
+	require.False(t, (&CreateContext{}).IsGuestMountRestore())
 }

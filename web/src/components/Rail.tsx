@@ -14,6 +14,7 @@ import {
   Settings,
   Store,
   Layers,
+  Archive,
   Github,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -25,6 +26,7 @@ const NAV_ITEMS = [
   { to: '/templates', icon: Package, key: 'templates' },
   { to: '/nodes', icon: Server, key: 'nodes' },
   { to: '/versions', icon: Layers, key: 'versions' },
+  { to: '/warehouse', icon: Archive, key: 'warehouse' },
   { to: '/network', icon: Network, key: 'network' },
   { to: '/observability', icon: Activity, key: 'observability' },
   { to: '/store', icon: Store, key: 'store' },
@@ -45,7 +47,11 @@ export function Rail() {
         </div>
         {NAV_ITEMS.map(({ to, icon: Icon, key }) => {
           const label = t(key);
-          const active = to === '/' ? loc.pathname === '/' : loc.pathname.startsWith(to);
+          const active =
+            to === '/'
+              ? loc.pathname === '/'
+              : loc.pathname.startsWith(to) ||
+                (to === '/templates' && loc.pathname.startsWith('/snapshots'));
           return (
             <NavLink
               key={to}

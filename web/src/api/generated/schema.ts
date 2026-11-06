@@ -314,21 +314,22 @@ export interface components {
             [key: string]: string;
         };
         HealthResponse: {
-            sandboxes: number;
             status: string;
         };
         /** @description One entry in GET /sandboxes (RunningSandbox in OpenAPI spec). */
         ListedSandbox: {
             alias?: string | null;
             clientID: string;
-            /** K8s-style millicores string, e.g. "2000m" (= 2 vCPU), "128m" (= 0.128 vCPU). */
-            cpuCount: string;
+            /** Legacy whole-vCPU count; use cpuMilli for fractional CPU values. */
+            cpuCount: number;
+            /** Exact CPU allocation in millicores, e.g. 100 or 500. */
+            cpuMilli?: number;
             /** Format: int32 */
             diskSizeMB?: number | null;
             /** Format: date-time */
             endAt: string;
             envdVersion: string;
-            /** Format: int32 */
+            /** Memory in MiB; the MB suffix is retained for API compatibility. Format: int32 */
             memoryMB: number;
             metadata?: null | components["schemas"]["HashMap"];
             sandboxID: string;
@@ -360,7 +361,7 @@ export interface components {
              * @description CPU capacity or availability expressed in millicpu.
              */
             cpuMilli: number;
-            /** Format: int64 */
+            /** Memory in MiB; the MB suffix is retained for API compatibility. Format: int64 */
             memoryMB: number;
         };
         /** @description Per-node view of the version matrix. */
@@ -433,8 +434,10 @@ export interface components {
         SandboxDetail: {
             alias?: string | null;
             clientID: string;
-            /** K8s-style millicores string, e.g. "2000m" (= 2 vCPU), "128m" (= 0.128 vCPU). */
-            cpuCount: string;
+            /** Legacy whole-vCPU count; use cpuMilli for fractional CPU values. */
+            cpuCount: number;
+            /** Exact CPU allocation in millicores, e.g. 100 or 500. */
+            cpuMilli?: number;
             /** Format: int32 */
             diskSizeMB?: number | null;
             domain?: string | null;
@@ -442,7 +445,7 @@ export interface components {
             endAt: string;
             envdAccessToken?: string | null;
             envdVersion: string;
-            /** Format: int32 */
+            /** Memory in MiB; the MB suffix is retained for API compatibility. Format: int32 */
             memoryMB: number;
             metadata?: null | components["schemas"]["HashMap"];
             sandboxID: string;
@@ -467,10 +470,10 @@ export interface components {
             logs: components["schemas"]["SandboxLogEntry"][];
         };
         /**
-         * @description State of the sandbox (running | paused)
+         * @description State of the sandbox (running | paused | pausing | unknown)
          * @enum {string}
          */
-        SandboxState: "running" | "paused" | "pausing";
+        SandboxState: "running" | "paused" | "pausing" | "unknown";
         /** @description Volume mount inside the sandbox. */
         SandboxVolumeMount: {
             name: string;

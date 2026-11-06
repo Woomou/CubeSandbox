@@ -43,7 +43,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/version"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/services/server"
 	srvconfig "github.com/tencentcloud/CubeSandbox/Cubelet/services/server/config"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/urfave/cli/v2"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/net/context"
@@ -607,46 +607,6 @@ func setLogLevel(context *cli.Context, config *srvconfig.Config) error {
 		}
 		logrus.SetLevel(lvl)
 	}
-	return nil
-}
-
-func ensureRootSharedMount(rootDir string) error {
-
-	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
-		return nil
-	}
-
-	mountInfo, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(rootDir))
-	if err != nil {
-		return fmt.Errorf("failed to get mount info for %s: %w", rootDir, err)
-	}
-
-	if len(mountInfo) == 0 {
-
-		if err := unix.Mount(rootDir, rootDir, "", unix.MS_BIND, ""); err != nil {
-			return fmt.Errorf("failed to bind mount %s: %w", rootDir, err)
-		}
-
-		if err := unix.Mount("", rootDir, "", unix.MS_SHARED, ""); err != nil {
-			return fmt.Errorf("failed to make %s shared: %w", rootDir, err)
-		}
-		stdlog.Printf("set %s as shared mount", rootDir)
-		return nil
-	}
-
-	for _, info := range mountInfo {
-		optsSplit := strings.Split(info.Optional, " ")
-		for _, opt := range optsSplit {
-			if strings.HasPrefix(opt, "shared:") {
-				return nil
-			}
-		}
-	}
-
-	if err := unix.Mount("", rootDir, "", unix.MS_SHARED, ""); err != nil {
-		return fmt.Errorf("failed to make %s shared: %w", rootDir, err)
-	}
-	stdlog.Printf("set %s as shared mount", rootDir)
 	return nil
 }
 

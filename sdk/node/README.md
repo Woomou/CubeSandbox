@@ -6,7 +6,7 @@
   <a href="https://github.com/TencentCloud/CubeSandbox"><img src="https://img.shields.io/badge/CubeSandbox-GitHub-blue" alt="CubeSandbox" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green" alt="Apache 2.0" /></a>
   <img src="https://img.shields.io/badge/Node.js-18%2B-blue" alt="Node.js 18+" />
-  <img src="https://img.shields.io/badge/version-0.3.0-orange" alt="v0.3.0" />
+  <img src="https://img.shields.io/badge/version-0.7.3-orange" alt="v0.7.3" />
 </p>
 
 ---
@@ -146,6 +146,16 @@ await sb.pause({ timeoutMs: 60000, intervalMs: 500 }); // custom poll params
 const sb2 = await Sandbox.connect(sb.sandboxId);
 ```
 
+### MCP gateway (preview)
+
+Pass the E2B-compatible `mcp` option to start an MCP gateway inside the sandbox. It needs a template that ships `mcp-gateway`; when `template` is omitted, the alias `mcp-gateway` is tried first (override with `CUBE_MCP_TEMPLATE_ID` or `mcpTemplateId`), then `CUBE_TEMPLATE_ID` if that template does not exist. `TemplateNotFoundError` is thrown when neither exists. See [MCP Gateway](../../docs/guide/mcp-gateway.md).
+
+```ts
+const sb = await Sandbox.create({ mcp: { duckduckgo: {}, time: {} } });
+const url = sb.getMcpUrl();            // streamable HTTP endpoint
+const token = await sb.getMcpToken();  // send as "Authorization: Bearer <token>"
+```
+
 ### Network policy
 
 Two layers can be combined inside `network`:
@@ -224,6 +234,7 @@ on a single `create` call — not both.
 // Read & write
 await sb.files.write("/tmp/hello.txt", "Hello, world!");
 console.log(await sb.files.read("/tmp/hello.txt")); // "Hello, world!"
+const png = await sb.files.read("/tmp/chart.png", { format: "bytes" }); // Uint8Array
 
 // Batch write
 await sb.files.writeFiles([
@@ -292,16 +303,35 @@ const { snapshots, nextToken } = await Sandbox.listSnapshots({
   limit: 100,
 });
 
-await Sandbox.deleteSnapshot(snap.snapshotId); // DELETE /templates/:id
+const deleted = await Sandbox.deleteSnapshot(snap.snapshotId); // DELETE /templates/:id?snapshot_only=true
+// `deleted` is false when the snapshot no longer exists; a name may be passed
+// instead of an ID. Only snapshots are matched, never templates; several
+// same-named snapshots throw (HTTP 409), so use the `snap-` ID.
 
 await sb.rollback(snap.snapshotId); // POST /sandboxes/:id/rollback
 
 const clones = await sb.clone(3, { concurrency: 3 });
 ```
 
-`clone` snapshots the sandbox, creates `n` sandboxes from it (capped by
-`concurrency`), then deletes the ephemeral snapshot. If any create fails, all
-successful siblings are killed and the first error is re-thrown.
+`deleteSnapshot` accepts a snapshot ID or name and resolves to `true`/`false`
+depending on whether the snapshot existed. `clone` snapshots the sandbox,
+creates `n` sandboxes from it (capped by `concurrency`), then deletes the
+ephemeral snapshot. If any create fails, all successful siblings are killed
+and the first error is re-thrown.
+
+```ts
+// One server-side call: the backend snapshots sb once and derives N copies.
+const forks = await sb.fork({ count: 3, timeoutMs: 60_000 });
+for (const f of forks) {
+  if (f instanceof Sandbox) await f.runCode("print('alive')");
+  else console.error(f); // that fork's Error
+}
+```
+
+`fork` returns exactly `count` entries (`Sandbox | Error`), so partial success
+keeps copies without throwing. `count` is 1..100 (default 1); `timeoutMs` is the
+per-fork idle TTL in milliseconds. Only whole-request failures throw (e.g. 404
+unknown sandbox, 409 source not forkable yet).
 
 ### Volumes
 
@@ -354,9 +384,9 @@ credential) — read the field directly when the actual value is needed.
 ### List & health check
 
 ```ts
-console.log(await Sandbox.health()); // { status: "ok", sandboxes: 4 }
+console.log(await Sandbox.health()); // { status: "ok" }
 console.log(await Sandbox.list()); // list of running sandboxes
-console.log(await Sandbox.listV2()); // v2 API (supports filtering)
+console.log(await Sandbox.listV2()); // v2 E2B view: running and paused only
 ```
 
 ### Templates
@@ -381,6 +411,7 @@ await Template.delete("tpl-xxx");
 | `CUBE_PROXY_PORT_HTTP` | | `80` | CubeProxy HTTP port |
 | `CUBE_PROXY_SCHEME` | | `http` | Data-plane scheme; normalized to `http` / `https` (unknown values → `https` when port is 443, else `http`) |
 | `CUBE_SANDBOX_DOMAIN` | | `cube.app` | Sandbox domain suffix |
+| `CUBE_MCP_TEMPLATE_ID` | | `mcp-gateway` | Template tried first when `mcp` is set and no template is given; falls back to `CUBE_TEMPLATE_ID` if it does not exist |
 
 You can also pass a `Config` (or plain options object) directly:
 
@@ -421,10 +452,10 @@ var**. Inline fields accepted by `create`: `apiUrl`, `proxyNodeIp`,
 | `Sandbox.create(options?)` | `POST /sandboxes` — create a new sandbox |
 | `Sandbox.connect(sandboxId, options?)` | `POST /sandboxes/:id/connect` — connect (auto-resumes if paused) |
 | `Sandbox.list(config?)` | `GET /sandboxes` — list running sandboxes (v1) |
-| `Sandbox.listV2(config?)` | `GET /v2/sandboxes` — list sandboxes (v2) |
+| `Sandbox.listV2(config?)` | `GET /v2/sandboxes` — list running and paused sandboxes (v2 E2B view) |
 | `Sandbox.health(config?)` | `GET /health` — service health check |
 | `Sandbox.listSnapshots(options?)` | `GET /snapshots` — list snapshots (paginated) |
-| `Sandbox.deleteSnapshot(snapshotId, options?)` | `DELETE /templates/:id` — delete a snapshot |
+| `Sandbox.deleteSnapshot(idOrName, options?)` | `DELETE /templates/:id?snapshot_only=true` — delete a snapshot by ID or name, returns `boolean` |
 
 ### `Volume` — static methods
 
@@ -442,6 +473,7 @@ var**. Inline fields accepted by `create`: `apiUrl`, `proxyNodeIp`,
 |---|---|
 | `sb.runCode(code, options?)` | `POST /execute` — execute code, returns `Execution` |
 | `sb.getInfo()` | `GET /sandboxes/:id` — get sandbox state and metadata |
+| `sb.isRunning(options?)` | Report if the sandbox is running — checks control-plane state first, probes envd `/health` only when running/unknown; returns `boolean` (`false` on unreachable/transport errors) |
 | `sb.pause(options?)` | `POST /sandboxes/:id/pause` — pause sandbox |
 | `sb.resume(timeout?)` | `POST /sandboxes/:id/resume` — resume (deprecated, use `connect`) |
 | `sb.setTimeout(timeout)` | `POST /sandboxes/:id/timeout` — set sandbox idle timeout |
@@ -449,6 +481,7 @@ var**. Inline fields accepted by `create`: `apiUrl`, `proxyNodeIp`,
 | `sb.createSnapshot(name?)` | `POST /sandboxes/:id/snapshots` — create a snapshot |
 | `sb.rollback(snapshotId)` | `POST /sandboxes/:id/rollback` — roll back to a snapshot |
 | `sb.clone(n?, options?)` | Snapshot + create ×n + cleanup |
+| `sb.fork(options?)` | `POST /sandboxes/:id/fork` — server-side fork, per-fork `Sandbox \| Error` |
 | `sb.getHost(port)` | Return virtual hostname `{port}-{id}.{domain}` |
 | `sb.commands` / `sb.files` / `sb.pty` | Shell / filesystem / PTY namespaces (see below) |
 
@@ -456,7 +489,7 @@ var**. Inline fields accepted by `create`: `apiUrl`, `proxyNodeIp`,
 
 | Method | Description |
 |---|---|
-| `read(path, options?)` | Download file content via `GET /files` |
+| `read(path, options?)` | Download file content via `GET /files`; `options.format` is `text` (default) / `bytes` / `blob` / `stream` (e2b-compatible) |
 | `write(path, data, options?)` | Upload via `POST /files` (octet-stream, multipart fallback) |
 | `writeFiles(files, options?)` | Batch write, stops on first error, returns count |
 | `list(path)` | List directory entries |

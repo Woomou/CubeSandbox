@@ -15,48 +15,12 @@ import { ApiError } from '@/lib/api';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import {
-  ArrowLeft,
-  RefreshCw,
-  Trash2,
-  ChevronDown,
-  ChevronUp,
-  Copy,
-  Check,
-  AlertTriangle,
-} from 'lucide-react';
+import { ArrowLeft, RefreshCw, Trash2, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react';
 import { cn, formatDeleteError, copyToClipboard } from '@/lib/utils';
 import { extractTemplateRuntimeConfig, extractTemplateNetworkPolicy } from '@/lib/templateConfig';
 import { BoolBadge } from '@/components/ui/typography';
-
-// ── status helpers ────────────────────────────────────────────────────────────
-
-function statusDotClass(status: string) {
-  switch (status.toUpperCase()) {
-    case 'READY':
-      return 'bg-cube-ok';
-    case 'BUILDING':
-    case 'RUNNING':
-      return 'bg-cube-warn animate-pulse';
-    case 'FAILED':
-      return 'bg-cube-err';
-    default:
-      return 'bg-muted-foreground';
-  }
-}
-function statusTextClass(status: string) {
-  switch (status.toUpperCase()) {
-    case 'READY':
-      return 'text-cube-ok';
-    case 'BUILDING':
-    case 'RUNNING':
-      return 'text-cube-warn';
-    case 'FAILED':
-      return 'text-cube-err';
-    default:
-      return 'text-muted-foreground';
-  }
-}
+import { CopyButton, CopyableText } from '@/components/ui/copy';
+import { statusDotClass, statusTextClass } from '@/lib/status';
 function StatusBadge({ status }: { status: string }) {
   const { t } = useTranslation('templateDetail');
   const tone = (() => {
@@ -88,17 +52,31 @@ function compatTone(status: string) {
   switch (status.toUpperCase()) {
     case 'OK':
       return 'bg-cube-ok/15 text-cube-ok border-cube-ok/30';
-    case 'STALE':
-      return 'bg-destructive/10 text-destructive border-destructive/30';
     case 'UNKNOWN':
-      return 'bg-cube-warn/15 text-cube-warn border-cube-warn/30';
+      return 'bg-cube-err/15 text-cube-err border-cube-err/30';
+    case 'STALE':
+      return 'bg-muted text-muted-foreground border-border';
     default:
       return 'bg-muted text-muted-foreground border-border';
   }
 }
 
-function isStaleCompat(status: string) {
-  return status.toUpperCase() === 'STALE';
+function isUnknownCompat(status: string) {
+  return status.toUpperCase() === 'UNKNOWN';
+}
+
+function replicaLiveDiffers(node: TemplateNodeCompat): boolean {
+  const guestBound = (node.boundGuestImageVersion ?? '').trim();
+  const guestCurrent = (node.currentGuestImageVersion ?? '').trim();
+  const agentBound = (node.boundAgentVersion ?? '').trim();
+  const agentCurrent = (node.currentAgentVersion ?? '').trim();
+  const kernelBound = (node.boundKernelVersion ?? '').trim();
+  const kernelCurrent = (node.currentKernelVersion ?? '').trim();
+  return (
+    (guestBound !== '' && guestCurrent !== '' && guestBound !== guestCurrent) ||
+    (agentBound !== '' && agentCurrent !== '' && agentBound !== agentCurrent) ||
+    (kernelBound !== '' && kernelCurrent !== '' && kernelBound !== kernelCurrent)
+  );
 }
 
 function CompatBadge({ status }: { status: string }) {
@@ -113,29 +91,6 @@ function CompatBadge({ status }: { status: string }) {
     >
       {t(`compat.status.${normalizedStatus}` as 'compat.status.OK', { defaultValue: status })}
     </span>
-  );
-}
-
-// ── copy button ───────────────────────────────────────────────────────────────
-
-function CopyButton({ text, className }: { text: string; className?: string }) {
-  const { t } = useTranslation('templateDetail');
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      onClick={() => {
-        copyToClipboard(text, t('copied'));
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-      className={cn(
-        'text-muted-foreground/50 hover:text-muted-foreground transition-colors',
-        className,
-      )}
-      title={t('copy')}
-    >
-      {copied ? <Check className="h-3 w-3 text-cube-ok" /> : <Copy className="h-3 w-3" />}
-    </button>
   );
 }
 
@@ -154,6 +109,7 @@ function Field({
   copyable?: boolean;
   dim?: boolean;
 }) {
+  const { t } = useTranslation('templateDetail');
   return (
     <div className="flex flex-col gap-1.5">
       <span className="text-xs uppercase tracking-wider text-muted-foreground/70 font-medium">
@@ -167,45 +123,11 @@ function Field({
         )}
       >
         <span>{value ?? '—'}</span>
-        {copyable && value && <CopyButton text={value} />}
-      </span>
-    </div>
-  );
-}
-
-// ── copy tooltip wrapper ─────────────────────────────────────────────────────
-
-function CopyableText({
-  text,
-  display,
-  className,
-}: {
-  text: string;
-  display?: string;
-  className?: string;
-}) {
-  const { t } = useTranslation('templateDetail');
-  const [copied, setCopied] = useState(false);
-  const handleCopy = () => {
-    copyToClipboard(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-  return (
-    <span
-      className={cn('inline-flex items-center gap-1.5 cursor-pointer group', className)}
-      onClick={handleCopy}
-      title={copied ? t('copied') : t('clickToCopy', { text })}
-    >
-      <span>{display ?? text}</span>
-      <span className="opacity-0 group-hover:opacity-100 transition-opacity">
-        {copied ? (
-          <Check className="h-3 w-3 text-cube-ok" />
-        ) : (
-          <Copy className="h-3 w-3 text-muted-foreground/50" />
+        {copyable && value && (
+          <CopyButton text={value} copiedLabel={t('copied')} copyLabel={t('copy')} />
         )}
       </span>
-    </span>
+    </div>
   );
 }
 
@@ -248,6 +170,7 @@ function Section({
 // reserves a clear column for the icon).
 
 function Monoblock({ label, value }: { label: string; value?: string | null }) {
+  const { t } = useTranslation('templateDetail');
   if (!value) return null;
   return (
     <div className="flex flex-col gap-1.5">
@@ -258,7 +181,12 @@ function Monoblock({ label, value }: { label: string; value?: string | null }) {
         <pre className="rounded-md border border-border/50 bg-muted/30 pl-3 pr-10 py-2 font-mono text-xs whitespace-pre-wrap break-all leading-relaxed text-foreground/90">
           {value}
         </pre>
-        <CopyButton text={value} className="absolute top-1/2 -translate-y-1/2 right-2 p-1.5" />
+        <CopyButton
+          text={value}
+          copiedLabel={t('copied')}
+          copyLabel={t('copy')}
+          className="absolute top-1/2 -translate-y-1/2 right-2 p-1.5"
+        />
       </div>
     </div>
   );
@@ -491,6 +419,8 @@ function ReplicaTable({
                       text={r.artifact_id}
                       display={r.artifact_id.slice(0, 28) + '…'}
                       className="font-mono text-sm text-muted-foreground"
+                      copiedLabel={t('copied')}
+                      clickToCopyLabel={t('clickToCopy', { text: r.artifact_id })}
                     />
                   ) : (
                     '—'
@@ -502,6 +432,8 @@ function ReplicaTable({
                       text={r.last_job_id}
                       display={r.last_job_id.slice(0, 28) + '…'}
                       className="font-mono text-sm text-muted-foreground"
+                      copiedLabel={t('copied')}
+                      clickToCopyLabel={t('clickToCopy', { text: r.last_job_id })}
                     />
                   ) : (
                     '—'
@@ -526,36 +458,43 @@ function CompatWarning({
   disabled: boolean;
 }) {
   const { t } = useTranslation('templateDetail');
-  const staleNodes = row.nodes.filter((node) => isStaleCompat(node.compatStatus));
-  if (staleNodes.length === 0) return null;
+  const unknownNodes = row.nodes.filter((node) => isUnknownCompat(node.compatStatus));
+  if (unknownNodes.length === 0) return null;
   return (
-    <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+    <div className="mt-4 rounded-lg border border-cube-err/30 bg-cube-err/5 p-4">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="flex items-center gap-2 text-destructive">
+          <div className="flex items-center gap-2 text-cube-err">
             <AlertTriangle className="h-4 w-4 shrink-0" />
             <p className="text-sm font-semibold">{t('compat.staleTitle')}</p>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {t('compat.staleDesc', { count: staleNodes.length })}
+            {t('compat.staleDesc', { count: unknownNodes.length })}
           </p>
         </div>
-        <Button
-          variant="destructive"
-          size="sm"
-          disabled={disabled}
-          onClick={onRebuild}
-          className="shrink-0"
-        >
+        <Button size="sm" disabled={disabled} onClick={onRebuild} className="shrink-0">
           <RefreshCw className={cn('h-4 w-4 mr-1.5', disabled && 'animate-spin')} />
           {t('rebuild.button')}
         </Button>
       </div>
       <div className="mt-4 space-y-3">
-        {staleNodes.map((node) => (
+        {unknownNodes.map((node) => (
           <CompatNodeCard key={compatNodeKey(node)} node={node} variant="warning" />
         ))}
       </div>
+    </div>
+  );
+}
+
+function CompatDriftNote({ row }: { row: TemplateCompatRow }) {
+  const { t } = useTranslation('templateDetail');
+  const drifted = row.nodes.filter((node) => replicaLiveDiffers(node));
+  if (drifted.length === 0) return null;
+  if (row.nodes.some((node) => isUnknownCompat(node.compatStatus))) return null;
+  return (
+    <div className="mt-4 rounded-lg border border-border/60 bg-muted/30 p-4">
+      <p className="text-sm font-medium">{t('compat.driftTitle')}</p>
+      <p className="mt-1 text-xs text-muted-foreground">{t('compat.driftDesc')}</p>
     </div>
   );
 }
@@ -719,11 +658,7 @@ export default function TemplateDetailPage() {
         ) : isFailed404 ? (
           <div className="space-y-3">
             <p className="text-sm text-destructive">{t('buildFailed')}</p>
-            <p className="text-xs text-muted-foreground">
-              {t('buildFailedDeleteHint', {
-                defaultValue: '该模板构建失败，无法查看详情，但你可以将其删除。',
-              })}
-            </p>
+            <p className="text-xs text-muted-foreground">{t('buildFailedDeleteHint')}</p>
             {showDeleteConfirm ? (
               <div className="space-y-3">
                 <p className="text-sm text-muted-foreground">{t('delete.confirmDesc')}</p>
@@ -742,7 +677,7 @@ export default function TemplateDetailPage() {
                 </div>
                 {deleteMutation.isError && (
                   <p className="text-xs text-destructive">
-                    {formatDeleteError(deleteMutation.error)}
+                    {formatDeleteError(deleteMutation.error, t)}
                   </p>
                 )}
               </div>
@@ -772,8 +707,8 @@ export default function TemplateDetailPage() {
   const compatRow = compat?.templates.find((row) => row.templateID === templateID);
   const compatStatus = compatRow?.overall ?? 'UNKNOWN';
   const compatNodes = compatRow?.nodes ?? [];
-  const isStale = isStaleCompat(compatStatus);
-  const headerAccentClass = isStale ? 'border-destructive' : 'border-cube-ok';
+  const isUnknown = isUnknownCompat(compatStatus);
+  const headerAccentClass = isUnknown ? 'border-cube-err' : 'border-cube-ok';
 
   return (
     <div className="px-6 py-8">
@@ -798,7 +733,7 @@ export default function TemplateDetailPage() {
             <h1 className="text-lg font-semibold font-mono tracking-tight truncate">
               {data.templateID}
             </h1>
-            <CopyButton text={data.templateID} />
+            <CopyButton text={data.templateID} copiedLabel={t('copied')} copyLabel={t('copy')} />
           </div>
           {imgShort && (
             <div className="flex items-center gap-1.5 group">
@@ -809,7 +744,12 @@ export default function TemplateDetailPage() {
               >
                 {imgShort}
               </p>
-              <CopyButton text={imgShort} className="opacity-0 group-hover:opacity-100" />
+              <CopyButton
+                text={imgShort}
+                copiedLabel={t('copied')}
+                copyLabel={t('copy')}
+                className="opacity-0 group-hover:opacity-100"
+              />
             </div>
           )}
           {createdAt && (
@@ -830,7 +770,7 @@ export default function TemplateDetailPage() {
         <div
           className={cn(
             'flex items-stretch shrink-0 divide-x',
-            isStale ? 'divide-destructive/20' : 'divide-cube-ok/20',
+            isUnknown ? 'divide-cube-err/20' : 'divide-cube-ok/20',
           )}
         >
           {[
@@ -870,11 +810,14 @@ export default function TemplateDetailPage() {
       </div>
 
       {compatRow && (
-        <CompatWarning
-          row={compatRow}
-          disabled={isBuilding || rebuildMutation.isPending}
-          onRebuild={() => setShowRebuildConfirm(true)}
-        />
+        <>
+          <CompatWarning
+            row={compatRow}
+            disabled={isBuilding || rebuildMutation.isPending}
+            onRebuild={() => setShowRebuildConfirm(true)}
+          />
+          <CompatDriftNote row={compatRow} />
+        </>
       )}
 
       {/* ── build progress ── */}
@@ -930,6 +873,7 @@ export default function TemplateDetailPage() {
           <Field label={t('fields.templateID')} value={data.templateID} mono copyable />
           <Field label={t('fields.alias')} value={data.displayName || null} />
           <Field label={t('fields.instanceType')} value={data.instanceType ?? '—'} />
+          <Field label={t('fields.backend')} value={data.backend || 'xfs'} />
           {cfg?.exposedPorts && <Field label={t('exposedPorts')} value={cfg.exposedPorts} mono />}
           {cfg?.probePath && (
             <Field label={t('probePath')} value={`${cfg.probePath} :${cfg.probePort}`} mono dim />
@@ -1061,7 +1005,9 @@ export default function TemplateDetailPage() {
               </Button>
             </div>
             {deleteMutation.isError && (
-              <p className="text-xs text-destructive">{formatDeleteError(deleteMutation.error)}</p>
+              <p className="text-xs text-destructive">
+                {formatDeleteError(deleteMutation.error, t)}
+              </p>
             )}
           </div>
         ) : (

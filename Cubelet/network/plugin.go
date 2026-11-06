@@ -18,8 +18,6 @@ import (
 	"github.com/containerd/plugin/registry"
 	"github.com/google/uuid"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/multimetadb/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -28,7 +26,9 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/multimeta"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 type delegateNetworkManager struct {
@@ -143,6 +143,31 @@ func (m *delegateNetworkManager) Create(ctx context.Context, opts *workflow.Crea
 		}
 	}()
 
+	if opts != nil && workflow.ReuseFor(opts).Network {
+		alloc, getErr := m.allocationStore.Get(opts.SandboxID)
+		if getErr == nil && alloc.Metadata != nil {
+			opts.NetworkInfo = alloc.Metadata
+			return nil
+		}
+		// Metadata is not persisted (json:"-"). After a cubelet process
+		// restart the allocation row remains but Metadata is nil. The network
+		// runtime still owns the tap; EnsureNetwork returns that live config.
+		if err := m.tapPlugin.Create(ctx, opts); err != nil {
+			return ret.Errorf(errorcode.ErrorCode_CreateNetworkFailed, "restart network %s: %v", opts.SandboxID, err)
+		}
+		if opts.NetworkInfo == nil {
+			return ret.Errorf(errorcode.ErrorCode_CreateNetworkFailed, "restart network %s: metadata missing", opts.SandboxID)
+		}
+		alloc.SandboxID = opts.SandboxID
+		alloc.Metadata = opts.NetworkInfo
+		if alloc.NetworkType == "" && opts.ReqInfo != nil {
+			alloc.NetworkType = opts.ReqInfo.NetworkType
+		}
+		alloc.Timestamp = time.Now().Unix()
+		m.allocationStore.Add(alloc)
+		return nil
+	}
+
 	if opts.IsCreateSnapshot() {
 		alloc, err := m.allocationStore.Get(opts.GetSandboxID())
 		if err == nil && alloc.SandboxID == opts.GetSandboxID() {
@@ -179,6 +204,9 @@ func (m *delegateNetworkManager) Create(ctx context.Context, opts *workflow.Crea
 }
 
 func (m *delegateNetworkManager) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err error) {
+	if workflow.RetainFor(opts).Network {
+		return nil
+	}
 	defer func() {
 		if err != nil {
 			log.G(ctx).Errorf("Destroy,fail:%v", err.Error())

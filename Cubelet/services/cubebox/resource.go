@@ -9,10 +9,10 @@ import (
 	"math"
 	"sync/atomic"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/numa"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -41,7 +41,7 @@ func (s *service) setRequestResource(createInfo *workflow.CreateContext, reqInfo
 		if numaStr, ok := reqInfo.GetAnnotations()[constants.MasterAnnotationsNumaNode]; ok {
 			var numaNode int32
 			if _, err := fmt.Sscanf(numaStr, "%d", &numaNode); err == nil {
-				if numaNode < 0 || numaNode >= int32(numa.GetMaxNumaNodeId()) {
+				if numaNode < 0 || numaNode >= int32(numaMaxNodeID()) {
 					return fmt.Errorf("invalid numa node: %d", numaNode)
 				}
 
@@ -62,5 +62,12 @@ func (s *service) setRequestResource(createInfo *workflow.CreateContext, reqInfo
 }
 
 func (s *service) getNextNumaNode() int32 {
-	return int32(atomic.AddUint32(&s.numaNodeIndex, 1) % uint32(numa.GetNumaNodeCount()))
+	return int32(atomic.AddUint32(&s.numaNodeIndex, 1) % uint32(numaNodeCount()))
 }
+
+// numaMaxNodeID and numaNodeCount are the host queries. Tests replace them
+// so a one-node machine can still check a pinned node and a later slot.
+var (
+	numaMaxNodeID = numa.GetMaxNumaNodeId
+	numaNodeCount = numa.GetNumaNodeCount
+)

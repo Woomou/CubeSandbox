@@ -13,8 +13,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	imagev1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -22,6 +21,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	imagev1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
 )
 
 func buildReplicaForDistribution(target *node.Node, req *types.CreateCubeSandboxReq, artifactID, jobID string) ReplicaStatus {
@@ -107,7 +108,7 @@ func destroyArtifactOnNode(ctx context.Context, artifactID, instanceType string,
 	return false, nil
 }
 
-func cleanupTemplateReplicasOnNodes(ctx context.Context, templateID string, replicas []models.TemplateReplica, targets []*node.Node) error {
+func cleanupTemplateReplicasOnNodes(ctx context.Context, templateID string, replicas []models.TemplateReplica, targets []*node.Node, backend string) error {
 	if len(replicas) == 0 || len(targets) == 0 {
 		return nil
 	}
@@ -136,38 +137,113 @@ func cleanupTemplateReplicasOnNodes(ctx context.Context, templateID string, repl
 	if len(locators) == 0 {
 		return nil
 	}
-	return cleanupTemplateReplicasWithLocators(ctx, templateID, locators)
+	return cleanupTemplateReplicasWithLocators(ctx, templateID, locators, backend)
 }
 
 func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFromImageReq, generatedReq *types.CreateCubeSandboxReq, artifact *models.RootfsArtifact, templateID, jobID string) ([]*node.Node, int32, int32, int32, error) {
-	// Defense-in-depth: refuse to push a CreateImage to cubelets when the
-	// artifact record is obviously incomplete. Without this guard the call
-	// proceeds with ext4_size_bytes=0 / download_token=""; cubelet then
-	// tries to pull with an empty token against a URL that falls back to
-	// os.Hostname() (buildDownloadURL) and reports "invalid size:0", which
-	// marks the template FAILED and masks the real cause (concurrent build
-	// race; see artifactBuildLocks). Fail here with a clear diagnostic
-	// instead.
-	if artifact == nil {
-		return nil, 0, 0, 0, fmt.Errorf("distributeRootfsArtifact: artifact is nil")
-	}
-	if artifact.Status != ArtifactStatusReady || artifact.Ext4SizeBytes == 0 || strings.TrimSpace(artifact.Ext4SHA256) == "" || strings.TrimSpace(artifact.DownloadToken) == "" || strings.TrimSpace(artifact.MasterNodeIP) == "" {
-		return nil, 0, 0, 0, fmt.Errorf(
-			"artifact %s is not ready for distribution (status=%s size_bytes=%d sha256_set=%t token_set=%t master_node_ip=%q); template build likely did not complete — check cubemaster logs for buildRootfsArtifact errors",
-			artifact.ArtifactID, artifact.Status, artifact.Ext4SizeBytes,
-			strings.TrimSpace(artifact.Ext4SHA256) != "", strings.TrimSpace(artifact.DownloadToken) != "", artifact.MasterNodeIP,
-		)
+	if err := ensureArtifactDistributable(ctx, artifact); err != nil {
+		return nil, 0, 0, 0, err
 	}
 	targets, err := resolveTemplateNodes(req.InstanceType, req.DistributionScope)
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
+	// The ext4 artifact is pre-cached on EVERY in-scope node, jfs included.
+	// templateBuildTargets narrows only the BUILD set — a jfs template is
+	// built once on one node (createTemplateReplicasOnNodes applies it) and
+	// shared over the JuiceFS volume — but every node still maps the
+	// read-only ext4 as its own pmem lower layer, so a node that was never
+	// handed the artifact pays a full ext4 download inside its first
+	// sandbox-create request.
+	backend := req.Backend
+	if strings.TrimSpace(backend) == "" {
+		backend = storageBackendFromCreate(generatedReq)
+	}
+	// jfs replica rows mean "built the shared package". Non-builder nodes
+	// never build, so distribution must not leave them replica rows: redo
+	// scope, the locality caches, and the UI all read those rows. Artifact
+	// placement rows are still recorded for every node so cleanup reaches
+	// all ext4 copies and the backfill sweep can tell coverage from gaps.
+	trackReplicas := distributionTracksReplicas(backend)
+	return distributeRootfsArtifactToNodes(ctx, req, generatedReq, artifact, templateID, jobID, targets, trackReplicas)
+}
+
+// distributionTracksReplicas reports whether a distribution should write
+// per-node replica rows. On jfs a replica row means "built the shared
+// package", which only the build step does; every other backend equates
+// "holds the ext4 artifact" with "has the replica" and keeps both rows.
+func distributionTracksReplicas(backend string) bool {
+	return !constants.IsJFSBackend(backend)
+}
+
+// ensureArtifactDistributable refuses to push a CreateImage to cubelets when
+// the artifact record is obviously incomplete. Without this guard the call
+// proceeds with ext4_size_bytes=0 / download_token=""; cubelet then tries to
+// pull with an empty token against a URL that falls back to os.Hostname()
+// (buildDownloadURL) and reports "invalid size:0", which marks the template
+// FAILED and masks the real cause (concurrent build race; see
+// artifactBuildLocks). Fail here with a clear diagnostic instead.
+func ensureArtifactDistributable(ctx context.Context, artifact *models.RootfsArtifact) error {
+	if artifact == nil {
+		return fmt.Errorf("distributeRootfsArtifact: artifact is nil")
+	}
+	downloadBaseURL := effectiveArtifactDownloadBaseURL("", artifact)
+	if artifact.Status != ArtifactStatusReady || artifact.Ext4SizeBytes == 0 || strings.TrimSpace(artifact.Ext4SHA256) == "" || strings.TrimSpace(artifact.DownloadToken) == "" || downloadBaseURL == "" {
+		return fmt.Errorf(
+			"artifact %s is not ready for distribution (status=%s size_bytes=%d sha256_set=%t token_set=%t download_base_url=%q master_node_ip=%q); template build likely did not complete — check cubemaster logs for buildRootfsArtifact errors",
+			artifact.ArtifactID, artifact.Status, artifact.Ext4SizeBytes,
+			strings.TrimSpace(artifact.Ext4SHA256) != "", strings.TrimSpace(artifact.DownloadToken) != "", downloadBaseURL, artifact.MasterNodeIP,
+		)
+	}
+	// The five checks above only read the artifact row. A row can be perfectly
+	// READY while the ext4 it points at is not servable — either because the
+	// artifact store did not survive a restart (issue #852) or because the
+	// store is node-local and the pull would land on a node that never had
+	// the file (issue #1005). Distributing either way hands every cubelet a
+	// download URL that can only 404 or serve a stale file, so fail here with
+	// the drift spelled out instead of collecting N identical per-node sha256
+	// mismatches.
+	//
+	// Where the file lives depends on the topology: in the standalone-TC
+	// architecture it is ALWAYS in the CubeTemplateCenter tier (CubeMaster's
+	// disk holds nothing), so verifyArtifactServability probes the download
+	// URL a cubelet would use rather than this process's disk.
+	return verifyArtifactServability(ctx, artifact)
+}
+
+// Injectable getter keeps config wiring testable without initializing global config.
+var distributionConfig = config.GetConfig
+
+// distributionWorkerCount returns the configured concurrency for one rootfs
+// artifact distribution call, falling back to the built-in default when no
+// config is loaded (e.g. unit tests).
+func distributionWorkerCount() int {
+	if cfg := distributionConfig(); cfg != nil && cfg.Common != nil && cfg.Common.DistributionWorkers > 0 {
+		return cfg.Common.DistributionWorkers
+	}
+	return defaultDistributionWorkers
+}
+
+// distributeRootfsArtifactToNodes is distributeRootfsArtifact with an
+// explicit target set, so the replica-backfill sweep can push an artifact to
+// exactly the nodes that lack a READY replica instead of re-resolving the
+// full healthy-node set. Callers must run ensureArtifactDistributable first.
+//
+// trackReplicas=false (jfs) skips the per-node replica bookkeeping: on jfs a
+// replica row means "built the shared package", which only the build step
+// writes. Artifact placement rows are still recorded for every node either
+// way, so cleanup and the backfill sweep see the true ext4 coverage.
+func distributeRootfsArtifactToNodes(ctx context.Context, req *types.CreateTemplateFromImageReq, generatedReq *types.CreateCubeSandboxReq, artifact *models.RootfsArtifact, templateID, jobID string, targets []*node.Node, trackReplicas bool) ([]*node.Node, int32, int32, int32, error) {
+	// Always give Cubelets the CubeMaster download endpoint. That keeps the
+	// node-facing address uniform across local-disk and S3-backed artifacts and
+	// avoids per-node dependence on the object-store endpoint's reachability.
+	downloadURL := buildDownloadURL(effectiveArtifactDownloadBaseURL("", artifact), artifact.ArtifactID, artifact.DownloadToken)
 	spec := &imagev1.ImageSpec{
 		Image:        artifact.ArtifactID,
 		StorageMedia: imagev1.ImageStorageMediaType_ext4.String(),
 		Annotations: map[string]string{
 			constants.CubeAnnotationRootfsArtifactID:        artifact.ArtifactID,
-			constants.CubeAnnotationRootfsArtifactURL:       buildDownloadURL(artifact.MasterNodeIP, artifact.ArtifactID, artifact.DownloadToken),
+			constants.CubeAnnotationRootfsArtifactURL:       downloadURL,
 			constants.CubeAnnotationRootfsArtifactToken:     artifact.DownloadToken,
 			constants.CubeAnnotationRootfsArtifactSHA256:    artifact.Ext4SHA256,
 			constants.CubeAnnotationRootfsArtifactSizeBytes: strconv.FormatInt(artifact.Ext4SizeBytes, 10),
@@ -181,7 +257,7 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 	failed := int32(0)
 	var firstErr error
 	var lock sync.Mutex
-	sem := make(chan struct{}, defaultDistributionWorkers)
+	sem := make(chan struct{}, distributionWorkerCount())
 	var wg sync.WaitGroup
 	readyTargets := make([]*node.Node, 0, len(targets))
 	for _, target := range targets {
@@ -192,7 +268,10 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			replica := buildReplicaForDistribution(target, generatedReq, artifact.ArtifactID, jobID)
+			var replica ReplicaStatus
+			if trackReplicas {
+				replica = buildReplicaForDistribution(target, generatedReq, artifact.ArtifactID, jobID)
+			}
 			rsp, err := cubelet.CreateImage(ctx, cubelet.GetCubeletAddr(target.HostIP()), &imagev1.CreateImageRequest{
 				RequestID: uuid.New().String(),
 				Spec:      spec,
@@ -206,7 +285,7 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 				if firstErr == nil {
 					firstErr = err
 				}
-				if templateID != "" && generatedReq != nil {
+				if trackReplicas && templateID != "" && generatedReq != nil {
 					_ = UpsertReplica(ctx, templateID, generatedReq.InstanceType, replica)
 				}
 				return
@@ -226,7 +305,7 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 				} else {
 					replica.ErrorMessage = "empty create image response"
 				}
-				if templateID != "" && generatedReq != nil {
+				if trackReplicas && templateID != "" && generatedReq != nil {
 					_ = UpsertReplica(ctx, templateID, generatedReq.InstanceType, replica)
 				}
 				return
@@ -237,7 +316,7 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 			replica.ErrorMessage = ""
 			ready++
 			readyTargets = append(readyTargets, target)
-			if templateID != "" && generatedReq != nil {
+			if trackReplicas && templateID != "" && generatedReq != nil {
 				_ = UpsertReplica(ctx, templateID, generatedReq.InstanceType, replica)
 			}
 			// Record physical placement independently of the replica lifecycle so

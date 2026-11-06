@@ -26,8 +26,11 @@ spec:
       serviceAccountName: {{ include "cube.nodeServiceAccountName" . }}
       automountServiceAccountToken: true
       hostPID: {{ .Values.security.hostPID }}
-      terminationGracePeriodSeconds: {{ .Values.cubeNode.terminationGracePeriodSeconds }}
-      dnsPolicy: ClusterFirst
+      hostNetwork: {{ .Values.cubeNode.hostNetwork }}
+      terminationGracePeriodSeconds: {{ include "cube.nodeTerminationGracePeriodSeconds" . }}
+      # With hostNetwork the Pod shares the host netns; ClusterFirstWithHostNet
+      # keeps in-cluster DNS working from the host network namespace.
+      dnsPolicy: {{ if .Values.cubeNode.hostNetwork }}ClusterFirstWithHostNet{{ else }}ClusterFirst{{ end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -64,6 +67,20 @@ spec:
               value: run
             {{- with .Values.cubeNode.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.cubeS3lvol.enabled }}
+            - name: CUBE_S3LVOL_SOCKET
+              value: {{ include "cube.s3lvolSocketPath" . | quote }}
+            {{- end }}
+            {{- if .Values.cubeJuiceFS.enabled }}
+            - name: CUBE_JFS_ENABLED
+              value: "1"
+            - name: CUBE_JFS_MOUNT_PATH
+              value: {{ .Values.cubeJuiceFS.mountPath | quote }}
+            - name: CUBE_JFS_ROOT
+              value: {{ .Values.cubeJuiceFS.root | quote }}
+            - name: CUBE_JFS_CACHE_DIR
+              value: {{ .Values.cubeJuiceFS.cacheDir | quote }}
             {{- end }}
           ports:
             - name: cubelet-grpc
@@ -128,14 +145,27 @@ spec:
           volumeMounts:
             {{- include "cube.nodeDataplaneVolumeMounts" . | nindent 12 }}
           {{- if .Values.volumeCos.enabled }}
+            # File bind on the hostPath toolbox. cubelet staging overlays Cubelet/
+            # in place so this mount is not renamed aside with the directory.
             - name: volume-cos-conf
               mountPath: /usr/local/services/cubetoolbox/Cubelet/plugin/volume-cos.conf
               subPath: volume-cos.conf
               readOnly: true
           {{- end }}
+          {{- if eq (include "cube.volumeS3Enabled" .) "true" }}
+            # File bind on the hostPath toolbox. cubelet staging overlays Cubelet/
+            # in place so this mount is not renamed aside with the directory.
+            - name: volume-s3-conf
+              mountPath: /usr/local/services/cubetoolbox/Cubelet/plugin/volume-s3.conf
+              subPath: volume-s3.conf
+              readOnly: true
+          {{- end }}
+          {{- if .Values.cubeS3lvol.enabled }}
+            - name: s3lvol-rpc
+              mountPath: /var/run/s3lvol
+          {{- end }}
           resources:
             {{- toYaml .Values.cubeNode.resources | nindent 12 }}
-        {{- if .Values.cubeEgress.enabled }}
         - name: cube-egress
           image: {{ include "cube.cubeImage" (dict "image" .Values.images.cubeEgress "context" $) | quote }}
           imagePullPolicy: {{ .Values.images.cubeEgress.pullPolicy }}
@@ -201,7 +231,6 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- if .Values.cubeEgress.network.enabled }}
         - name: cube-egress-net
           image: {{ include "cube.cubeImage" (dict "image" .Values.images.cubeEgressNet "context" $) | quote }}
           imagePullPolicy: {{ .Values.images.cubeEgressNet.pullPolicy }}
@@ -254,7 +283,98 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- end }}
+        {{- if .Values.cubeS3lvol.enabled }}
+        - name: cube-s3lvol
+          image: {{ include "cube.cubeImage" (dict "image" .Values.images.cubeS3lvol "context" $) | quote }}
+          imagePullPolicy: {{ .Values.images.cubeS3lvol.pullPolicy }}
+          securityContext:
+            {{- include "cube.nodeDataplaneSecurityContext" . | nindent 12 }}
+          env:
+            {{- include "cube.timezoneEnv" . | nindent 12 }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: S3LVOL_ROOT
+              value: /opt/s3lvol
+            - name: RCOW_RPC_SOCK
+              value: {{ include "cube.s3lvolSocketPath" . | quote }}
+            - name: RCOW_S3_CFG
+              value: /etc/s3lvol/s3.cfg
+            - name: RCOW_WAL_IMG
+              value: /data/cubelet/rcow/wal_bdev.img
+            - name: RCOW_RUN_DIR
+              value: /var/run/s3lvol
+            - name: RCOW_LOG_DIR
+              value: /data/log/rcow
+            - name: RCOW_LISTEN_ADDR
+              value: {{ .Values.cubeS3lvol.listenAddr | quote }}
+            - name: RCOW_LISTEN_PORT
+              value: {{ .Values.cubeS3lvol.listenPort | quote }}
+            - name: RCOW_TGT_MEM_MB
+              value: {{ .Values.cubeS3lvol.tgtMemMB | quote }}
+            - name: RCOW_CACHE_HOT_BUFS
+              value: {{ .Values.cubeS3lvol.cacheHotBufs | quote }}
+            - name: RCOW_JOURNAL_MB
+              value: {{ .Values.cubeS3lvol.journalMB | quote }}
+            - name: RCOW_WAL_MB
+              value: {{ .Values.cubeS3lvol.walMB | quote }}
+            - name: RCOW_CACHE_MB
+              value: {{ .Values.cubeS3lvol.cacheMB | quote }}
+            {{- if .Values.cubeS3lvol.lvsName }}
+            - name: RCOW_LVS_NAME
+              value: {{ .Values.cubeS3lvol.lvsName | quote }}
+            {{- end }}
+            {{- if .Values.cubeS3lvol.cpuMask }}
+            - name: RCOW_TGT_CPUMASK
+              value: {{ .Values.cubeS3lvol.cpuMask | quote }}
+            {{- end }}
+          {{- if .Values.cubeS3lvol.probes.startup.enabled }}
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - {{ include "cube.s3lvolProbeCommand" . | replace "\r" "" | quote }}
+            timeoutSeconds: {{ .Values.cubeS3lvol.probes.startup.timeoutSeconds }}
+            periodSeconds: {{ .Values.cubeS3lvol.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.cubeS3lvol.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.cubeS3lvol.probes.readiness.enabled }}
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - {{ include "cube.s3lvolProbeCommand" . | replace "\r" "" | quote }}
+            timeoutSeconds: {{ .Values.cubeS3lvol.probes.readiness.timeoutSeconds }}
+            initialDelaySeconds: {{ .Values.cubeS3lvol.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.cubeS3lvol.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.cubeS3lvol.probes.readiness.failureThreshold }}
+          {{- end }}
+          volumeMounts:
+            - name: data-cubelet
+              mountPath: {{ .Values.hostPaths.dataCubelet }}
+            - name: data-log
+              mountPath: {{ .Values.hostPaths.dataLog }}
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: s3lvol-rpc
+              mountPath: /var/run/s3lvol
+            - name: s3lvol-shm
+              mountPath: /dev/shm
+            - name: s3lvol-cfg
+              mountPath: /etc/s3lvol
+              readOnly: true
+          {{- with .Values.cubeS3lvol.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- end }}
       volumes:
         - name: host-root
@@ -327,7 +447,12 @@ spec:
             secretName: {{ include "cube.volumeCosSecretName" . }}
             defaultMode: 0400
       {{- end }}
-      {{- if .Values.cubeEgress.enabled }}
+      {{- if eq (include "cube.volumeS3Enabled" .) "true" }}
+        - name: volume-s3-conf
+          secret:
+            secretName: {{ include "cube.volumeS3SecretName" . }}
+            defaultMode: 0400
+      {{- end }}
         - name: cube-egress-ca
           secret:
             secretName: {{ include "cube.egressCASecretName" . }}
@@ -335,5 +460,18 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+      {{- if .Values.cubeS3lvol.enabled }}
+        - name: s3lvol-rpc
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: s3lvol-shm
+          hostPath:
+            path: /dev/shm/cube-s3lvol
+            type: DirectoryOrCreate
+        - name: s3lvol-cfg
+          secret:
+            secretName: {{ include "cube.s3lvolSecretName" . }}
+            defaultMode: 0400
       {{- end }}
 {{- end }}

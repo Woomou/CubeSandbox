@@ -11,8 +11,6 @@ lang: zh-CN
 
 # LangChain 集成指南
 
-[English](../../guide/integrations/langchain.md)
-
 将调用 Python 工具的 [LangChain](https://github.com/langchain-ai/langchain) Agent 运行在
 [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) 的 MicroVM 中。由于 Cube 暴露了
 **与 E2B 兼容的 API**，把 LangChain 应用从 E2B 迁移到 Cube 通常只需改几个环境变量，同时还能为
@@ -486,7 +484,7 @@ finally:
 ## 参考资料
 
 - 可运行示例 —— `0.x`（LangChain 0.3.x）：[`examples/langchain-integration/0.x`](https://github.com/TencentCloud/CubeSandbox/tree/master/examples/langchain-integration/0.x) · `1.x`（LangChain 1.x）：[`examples/langchain-integration/1.x`](https://github.com/TencentCloud/CubeSandbox/tree/master/examples/langchain-integration/1.x)
-- 自带镜像：[`docs/guide/tutorials/bring-your-own-image.md`](../tutorials/bring-your-own-image.md)
+- 自定义模板镜像：[`docs/guide/tutorials/bring-your-own-image.md`](../tutorials/bring-your-own-image.md)
 - 从镜像创建模板：[`docs/guide/tutorials/template-from-image.md`](../tutorials/template-from-image.md)
 - 快照 / 克隆 / 回滚：[`docs/guide/snapshot-rollback-clone.md`](../snapshot-rollback-clone.md)
 - 凭证保管 + 出口控制：[`docs/guide/security-proxy.md`](../security-proxy.md)

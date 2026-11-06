@@ -17,13 +17,14 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // recover reconciles durable state files with live host TAP devices after
 // Cubelet restarts. Success states restore active ownership; cleanup-intent and
 // state-only records each receive one synchronous cleanup attempt and remain
-// durable for maintenance when that attempt fails.
+// durable for maintenance when that attempt fails. No-state pool TAPs are
+// quarantined for maintenance without blocking the network HTTP listener.
 func (s *NetworkController) recover() error {
 	records, err := s.store.Scan()
 	if err != nil {
@@ -438,9 +439,9 @@ func (s *NetworkController) recoverLiveTap(tap *tapDevice, record *StateRecord, 
 }
 
 func (s *NetworkController) recoverReadyTapWithoutState(tap *tapDevice) error {
-	// During smooth upgrades a no-state TAP may still carry old CubeVS port maps,
-	// TAP policy, metadata, or CubeEgress rules. Hold it in Cleaning and let the
-	// normal TapCleaner retry path prove it is clean before publishing Ready.
+	// No-state TAPs can retain old policy and port mappings. Disable their links
+	// before serving requests, then let maintenance remove that state. Installing
+	// policy for the whole idle pool must not hold up the HTTP listener.
 	owner := "nostate-" + strings.NewReplacer(".", "-", "/", "-", "\\", "-").Replace(tap.Name)
 	cleaningTap := &tapDevice{
 		Index: tap.Index,
@@ -449,20 +450,19 @@ func (s *NetworkController) recoverReadyTapWithoutState(tap *tapDevice) error {
 		InUse: tap.InUse,
 		File:  tap.File,
 	}
-	managed := &managedState{persistedState: persistedState{
-		SandboxID:     owner,
-		NetworkHandle: owner,
-		TapName:       cleaningTap.Name,
-		TapIfIndex:    cleaningTap.Index,
-		SandboxIP:     cleaningTap.IP.String(),
-	}, tap: cleaningTap, restoreBeforeCleanup: true}
 	if err := s.beginTapCleanup(cleaningTap, owner); err != nil {
 		return err
 	}
-	s.closeRuntimeTapOwnership(managed)
-	if err := s.cleanupTapOnce(managed, "", "recover_no_state_tap"); err != nil {
-		CubeLog.WithContext(context.Background()).Warnf("network runtime no-state TAP remains Cleaning after startup cleanup attempt: tap=%s err=%v", tap.Name, err)
+	if err := s.tapAdapter.Quarantine(cleaningTap); err != nil {
+		return fmt.Errorf("quarantine orphan TAP: %w", err)
 	}
+	// Retain a descriptor if discovery supplied one (production List normally
+	// returns identity only). Do not open or drain a queue during startup. Normal
+	// cleanup and reuse checks belong to maintenance. A second restart
+	// rediscovers the live TAP and quarantines it again, so no synthetic durable
+	// sandbox state is necessary for this ownerless pool entry.
+	s.poolTapFD(cleaningTap.Name, cleaningTap.File)
+	tap.File = nil
 	return nil
 }
 
@@ -777,16 +777,24 @@ func (s *NetworkController) claimRecoveredSuccessResources(state *managedState) 
 // uniquely from the IP, so no other goroutine can re-reference this tap between
 // the check and the destroy.
 //
-// Lookup is by deterministic tap name (RTM_GETLINK), not LinkList. A full dump
-// of every host interface on every pool-miss create races with concurrent TAP
-// churn and surfaces as netlink ErrDumpInterrupted under density load.
+// Lookup is by the current TAP name then the legacy z-prefixed name
+// (RTM_GETLINK), not LinkList. A full dump of every host interface on every
+// pool-miss create races with concurrent TAP churn and surfaces as netlink
+// ErrDumpInterrupted under density load.
 func (s *NetworkController) cleanupConflictingTap(ip net.IP) error {
-	tap, err := s.tapAdapter.GetByName(tapName(ip.String()))
-	if err != nil {
-		if isTapNotFound(err) {
-			return nil
+	var tap *tapDevice
+	for _, name := range candidateTapNames(ip.String()) {
+		found, err := s.tapAdapter.GetByName(name)
+		if err != nil {
+			if isTapNotFound(err) {
+				continue
+			}
+			return err
 		}
-		return err
+		if found != nil {
+			tap = found
+			break
+		}
 	}
 	if tap == nil {
 		return nil
@@ -794,7 +802,7 @@ func (s *NetworkController) cleanupConflictingTap(ip net.IP) error {
 	if err := s.checkTapConflict(tap, ip); err != nil {
 		return err
 	}
-	if err := s.tapAdapter.Destroy(tap.Index); err != nil {
+	if err := s.destroyTapIndex(tap.Index); err != nil {
 		return fmt.Errorf("destroy stale tap %s(%d): %w", tap.Name, tap.Index, err)
 	}
 	s.dropPooledTapFD(tap.Name)

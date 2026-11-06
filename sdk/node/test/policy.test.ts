@@ -8,6 +8,7 @@ import {
   convertE2BPerHostRules,
   normalizeRulesArg,
   renderInject,
+  SECRET_MAX_BYTES,
   serializeRule,
   validateAllowOutDomainsRequireDenyAll,
   type Rule,
@@ -53,6 +54,44 @@ describe("serializeRule", () => {
     });
   });
 
+  it("accepts a catch-all rule without injection", () => {
+    const wire = serializeRule({
+      name: "audit_all",
+      match: { host: "*", scheme: "http" },
+      action: { allow: true, audit: "metadata" },
+    });
+    expect(wire.match).toEqual({ host: "*", scheme: "http" });
+  });
+
+  it("serializes injection on a catch-all rule", () => {
+    const wire = serializeRule({
+      name: "leak",
+      match: { host: "*" },
+      action: { allow: true, inject: [{ header: "Authorization", secret: "sek" }] },
+    });
+    expect((wire.action as Record<string, unknown>).inject).toEqual([
+      { header: "Authorization", secret: "sek" },
+    ]);
+  });
+
+  it("still allows injection on a wildcard domain", () => {
+    const wire = serializeRule({
+      name: "scoped",
+      match: { host: "*.example.com" },
+      action: { allow: true, inject: [{ header: "Authorization", secret: "sek" }] },
+    });
+    expect((wire.match as Record<string, unknown>).host).toBe("*.example.com");
+  });
+
+  it("accepts a catch-all port other than 80 or 443", () => {
+    const wire = serializeRule({
+      name: "wide",
+      match: { sni: "*", port: 8443, scheme: "https" },
+      action: { allow: true },
+    });
+    expect(wire.match).toEqual({ sni: "*", port: 8443, scheme: "https" });
+  });
+
   it("serializes injected credentials", () => {
     const wire = serializeRule({
       name: "r1",
@@ -65,6 +104,31 @@ describe("serializeRule", () => {
     expect((wire.action as Record<string, unknown>).inject).toEqual([
       { header: "Authorization", secret: "sk_xxx", format: "Bearer ${SECRET}" },
     ]);
+  });
+
+  it("accepts an inject secret at the byte cap", () => {
+    const secret = "x".repeat(SECRET_MAX_BYTES);
+    const wire = serializeRule({
+      name: "r1",
+      match: { host: "api.example.com" },
+      action: { allow: true, inject: [{ header: "Authorization", secret }] },
+    });
+    expect((wire.action as Record<string, unknown>).inject).toEqual([
+      { header: "Authorization", secret },
+    ]);
+  });
+
+  it("rejects an inject secret over the byte cap", () => {
+    expect(() =>
+      serializeRule({
+        name: "r1",
+        match: { host: "api.example.com" },
+        action: {
+          allow: true,
+          inject: [{ header: "Authorization", secret: "x".repeat(SECRET_MAX_BYTES + 1) }],
+        },
+      }),
+    ).toThrow("exceeds 2048 bytes");
   });
 
   it("emits port and normalizes scheme casing on the wire", () => {
@@ -179,12 +243,27 @@ describe("convertE2BPerHostRules", () => {
     ]);
   });
 
-  it("fans out multiple hosts preserving order", () => {
+  it("converts a catch-all host key", () => {
     const rules = convertE2BPerHostRules({
-      "api.example.com": [{ transform: { headers: { "X-A": "1" } } }],
-      "api.other.com": [{ transform: { headers: { "X-B": "2" } } }],
+      "*": [{ transform: { headers: { Authorization: "sek" } } }],
     });
-    expect(rules.map((r) => r.match.host)).toEqual(["api.example.com", "api.other.com"]);
+    expect(rules).toEqual([
+      {
+        name: "e2b-transform-*",
+        match: { host: "*" },
+        action: { allow: true, inject: [{ header: "Authorization", secret: "sek" }] },
+      },
+    ]);
+  });
+
+  it("rejects a header value over the byte cap", () => {
+    expect(() =>
+      convertE2BPerHostRules({
+        "api.example.com": [
+          { transform: { headers: { Authorization: "x".repeat(SECRET_MAX_BYTES + 1) } } },
+        ],
+      }),
+    ).toThrow("exceeds 2048 bytes");
   });
 });
 

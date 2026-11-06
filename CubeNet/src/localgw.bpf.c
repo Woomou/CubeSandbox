@@ -11,12 +11,16 @@
 #include "nat.h"
 #include "skb.h"
 #include "tcp.h"
+#include "tcp_reset.h"
 
-/* Update a CubeEgress TCP session from the original reply tuple before DNAT
- * rewrites the sandbox-assigned destination address to mvm_inner_ip. A missing
- * or non-L7 session is intentionally non-blocking.
+/* Update a cube-dev TCP reply before DNAT rewrites the sandbox-assigned
+ * destination to mvm_inner_ip.
+ *
+ * Tracks L7 proxy sessions and node-local identity sessions (SNAT_PACKET
+ * delivered via cubegw0, no outer SNAT). A stale session is reset back to the
+ * sender and removed. Anything else is non-blocking and returns 0.
  */
-static __always_inline void update_l7_session_from_cubedev(struct __sk_buff *skb)
+static __always_inline int update_l7_session_from_cubedev(struct __sk_buff *skb)
 {
 	struct session_key key = {};
 	struct nat_session *sess;
@@ -26,9 +30,9 @@ static __always_inline void update_l7_session_from_cubedev(struct __sk_buff *skb
 	__u64 now;
 
 	if (!__pull_headers(skb, &l2, &l3, &l4))
-		return;
+		return 0;
 	if (l3->protocol != IPPROTO_TCP)
-		return;
+		return 0;
 
 	key.src_ip = l3->saddr;
 	key.dst_ip = l3->daddr;
@@ -37,12 +41,26 @@ static __always_inline void update_l7_session_from_cubedev(struct __sk_buff *skb
 	key.version = 0;
 	key.protocol = IPPROTO_TCP;
 	sess = lookup_session(&key);
-	if (!sess || sess->packet_class != L7PROXY_PACKET)
-		return;
+	if (!sess)
+		return 0;
+	/* Node-local TCP uses an identity tuple and is answered by the host
+	 * stack, so the reply also arrives on cube-dev. Without this update the
+	 * session stays SYN_SENT and the reaper resets it after 60s.
+	 */
+	if (sess->packet_class != L7PROXY_PACKET &&
+	    !(sess->packet_class == SNAT_PACKET &&
+	      sess->node_ifindex == cubegw0_ifindex))
+		return 0;
+
+	if (session_is_stale(sess)) {
+		delete_session_pair(&key, sess);
+		return tcp_send_reset(skb, skb->ingress_ifindex, l3->saddr);
+	}
 
 	now = bpf_ktime_get_ns();
 	update_session(IP_CT_DIR_REPLY, sess, now, l4->syn, l4->ack,
 		       l4->fin, l4->rst);
+	return 0;
 }
 
 /* This filter will be attached to the egress path of cube-dev device.
@@ -60,7 +78,11 @@ int from_envoy(struct __sk_buff *skb)
 	if (skb->protocol != bpf_htons(ETH_P_IP))
 		return TC_ACT_OK;
 
-	update_l7_session_from_cubedev(skb);
+	/* A stale (pre-rollback) L7 or node-local session gets its RST reflected
+	 * to the sender; stop before delivering the reply to the guest. */
+	ret = update_l7_session_from_cubedev(skb);
+	if (ret)
+		return ret;
 
 	ret = pull_headers(skb, &l2, &l3);
 	if (ret != TC_ACT_OK)

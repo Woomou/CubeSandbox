@@ -14,9 +14,6 @@ import (
 // package. Defined here so tests can substitute a fake; the real
 // *cubemaster.Client satisfies it implicitly.
 type CubeMasterClient interface {
-	GetNodes(ctx context.Context) (json.RawMessage, error)
-	ClusterVersions(ctx context.Context) (json.RawMessage, error)
-	GetNode(ctx context.Context, nodeID string) (json.RawMessage, error)
 	ListSandboxes(ctx context.Context) (json.RawMessage, error)
 
 	GetSandbox(ctx context.Context, sandboxID, instanceType string) (json.RawMessage, error)
@@ -31,6 +28,7 @@ type CubeMasterClient interface {
 
 	CreateSnapshot(ctx context.Context, body interface{}) (json.RawMessage, error)
 	ListSnapshots(ctx context.Context, params map[string]string) (json.RawMessage, error)
+	GetSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error)
 	DeleteSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error)
 	RollbackSandbox(ctx context.Context, sandboxID string, body interface{}) (json.RawMessage, error)
 

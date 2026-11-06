@@ -21,12 +21,11 @@ import (
 	fwk "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/framework"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/nodehealth"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type EventType string
@@ -53,8 +52,7 @@ func Init(ctx context.Context) error {
 	start := time.Now()
 	l.event = make(chan *Event, 1000)
 	l.cache = cache.New(0, 0)
-	l.imageCache = cache.New(0, 0)
-	l.templateNodeCache = cache.New(0, 0)
+	l.locality = newTemplateLocality()
 	l.db = db.Init(config.GetDbConfig())
 	l.dbAddr = config.GetDbConfig().Addr
 	l.totalSelfNodes = config.GetConfig().Common.DefaultHeadlessServiceNodesNum
@@ -64,7 +62,7 @@ func Init(ctx context.Context) error {
 		l.sortedNodesByClusters[k] = node.NodeList{}
 	}
 
-	if err := l.loadAllFromDB(); err != nil {
+	if err := l.loadAllFromDB(context.Background()); err != nil {
 		return fmt.Errorf("loadAllFromDB:%v", err)
 	}
 
@@ -179,19 +177,13 @@ func GetNode(id string) (*node.Node, bool) {
 	return nil, false
 }
 
-func metadataHealthTimeout() time.Duration {
-	return nodehealth.MetadataTimeout(config.GetConfig().Common.SyncMetaDataInterval)
-}
-
-func cloneNodeWithCurrentHealth(n *node.Node, now time.Time) *node.Node {
+// cloneNodeWithCurrentHealth returns a defensive copy of n; CubeMaster trusts
+// the CubeOps Healthy verdict without overriding it on sync staleness.
+func cloneNodeWithCurrentHealth(n *node.Node, _ time.Time) *node.Node {
 	if n == nil {
 		return nil
 	}
-	current := n.Clone()
-	status := nodehealth.EvaluateFromFacts(n.ReportedReady, n.MetaDataUpdateAt, now, metadataHealthTimeout())
-	current.Healthy = status.Healthy
-	current.UnhealthyReason = status.UnhealthyReason
-	return current
+	return n.Clone()
 }
 
 func GetNodesByIp(ip string) (*node.Node, bool) {
@@ -221,39 +213,6 @@ func NotifyEvent(e *Event) error {
 		return nil
 	default:
 		return errors.New("event full")
-	}
-}
-
-// EvictNode synchronously removes every scheduler-local view owned by nodeID.
-// It is used after a node deletion commits and by metadata reloads on replicas
-// that observe the deleted registration later.
-func EvictNode(nodeID string) {
-	if nodeID == "" {
-		return
-	}
-	SyncNodeTemplates(nodeID, nil)
-	if l.templateNodeCache != nil {
-		l.templateNodeCache.Delete(nodeID)
-	}
-	if l.cache == nil {
-		return
-	}
-	if existing, ok := l.cache.Get(nodeID); ok {
-		if n, valid := existing.(*node.Node); valid {
-			l.delNodeCache(n)
-			return
-		}
-	}
-	l.cache.Delete(nodeID)
-	// The cache entry may already be gone while a stale pointer still remains
-	// in any instance-type list. Without the original node we cannot derive its
-	// cluster, so remove the ID from every list.
-	l.lockSortedNodes.Lock()
-	defer l.lockSortedNodes.Unlock()
-	candidate := &node.Node{InsID: nodeID}
-	for product, nodes := range l.sortedNodesByClusters {
-		nodes.Remove(candidate)
-		l.sortedNodesByClusters[product] = nodes
 	}
 }
 
@@ -494,71 +453,30 @@ func HealthyMasterNodes() (num int64) {
 }
 
 func GetImageStateByNode(imageName string, nodeName string) *fwk.ImageStateSummary {
-	state := l.getImageCache(imageName)
-	if state == nil {
-		return nil
-	}
-	if state.HasNode(nodeName) {
+	state := l.locality.image(imageName)
+	if state != nil && state.HasNode(nodeName) {
 		return state
 	}
 	return nil
 }
 
 func RegisterTemplateReplica(templateID, nodeID string, sizeBytes int64) {
-	registerTemplateReplica(templateID, nodeID, sizeBytes, true)
+	if templateID == "" || nodeID == "" {
+		return
+	}
+	l.locality.register(templateID, nodeID, sizeBytes)
 }
 
 func DeregisterTemplateReplica(templateID, nodeID string) {
-	deregisterTemplateReplica(templateID, nodeID, true)
-}
-
-func registerTemplateReplica(templateID, nodeID string, sizeBytes int64, syncNodeTemplates bool) {
 	if templateID == "" || nodeID == "" {
 		return
 	}
-	state := l.getImageCache(templateID)
-	if state == nil {
-		ossClusterLabel := ""
-		if n, ok := GetNode(nodeID); ok && n != nil {
-			ossClusterLabel = n.OssClusterLabel
-		}
-		state = fwk.NewImageStateSummary(sizeBytes, ossClusterLabel, nodeID)
-		l.addImageCache(templateID, state)
-	} else {
-		if sizeBytes > 0 {
-			state.Size = sizeBytes
-		}
-		state.AddNode(nodeID)
-		state.UpdateAt = time.Now()
-	}
-	if state.OssClusterLabel != "" {
-		state.ScaledImageScore = scaledImageScore(state, GetHealthyNodesByInstanceType(-1, state.OssClusterLabel).Len())
-	}
-	if syncNodeTemplates {
-		recordNodeTemplateMembership(nodeID, templateID)
-	}
-}
-
-func deregisterTemplateReplica(templateID, nodeID string, syncNodeTemplates bool) {
-	if templateID == "" || nodeID == "" {
-		return
-	}
-	state := l.getImageCache(templateID)
-	if state != nil {
-		state.RemoveNode(nodeID)
-		if state.GetNumNodes() == 0 && l.imageCache != nil {
-			l.imageCache.Delete(templateID)
-		}
-	}
-	if syncNodeTemplates {
-		removeNodeTemplateMembership(nodeID, templateID)
-	}
+	l.locality.deregister(templateID, nodeID)
 }
 
 func InvalidateImageState(imageName string) {
-	if imageName == "" || l.imageCache == nil {
+	if imageName == "" {
 		return
 	}
-	l.imageCache.Delete(imageName)
-	removeTemplateMembershipFromAllNodes(imageName)
+	l.locality.invalidateTemplate(imageName)
 }

@@ -89,6 +89,53 @@ type dnsAllowRule struct {
 	domain string
 }
 
+// IsDNSCatchAll reports whether a host or SNI is the standalone "*" token.
+// Comparison matches the datapath: trim, drop one trailing dot, lowercase.
+// "*.example.com" is not a catch-all.
+func IsDNSCatchAll(raw string) bool {
+	token := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	return token == "*"
+}
+
+// makeCatchAllDNSAllowRule builds the single dns_allow_v2 entry for "*".
+// prefixlen 0 is the shortest LPM key, so every name matches it unless a
+// longer exact or "*." rule wins. An empty ports slice keeps port_count at 0,
+// which the datapath expands to {80/http, 443/https}. A non-empty slice writes
+// those tuples, the same way a per-host L7 rule does. The rule is L7-only: no
+// L3_ALLOWED bit, so learning does not open ports outside this set.
+func makeCatchAllDNSAllowRule(ports []DNSCatchAllPort) (dnsAllowRule, error) {
+	if len(ports) > maxL7PortsPerHost {
+		return dnsAllowRule{}, fmt.Errorf("catch-all exceeds %d L7 port tuples", maxL7PortsPerHost) //nolint:err113
+	}
+	value := dnsAllowValue{
+		NameLen: 1,
+		Flags:   uint8(netPolicyFlagL7Required),
+	}
+	if len(ports) == 0 {
+		return dnsAllowRule{value: value, domain: "*"}, nil
+	}
+	entries := make([]l7PortEntry, 0, len(ports))
+	seen := make(map[uint16]uint8, len(ports))
+	for _, p := range ports {
+		if p.Port == 0 || (p.Scheme != L7SchemeHTTP && p.Scheme != L7SchemeHTTPS) {
+			return dnsAllowRule{}, fmt.Errorf("invalid catch-all port %d scheme %d", p.Port, p.Scheme) //nolint:err113
+		}
+		if existing, ok := seen[p.Port]; ok && existing != p.Scheme {
+			return dnsAllowRule{}, fmt.Errorf("catch-all port %d scheme conflict", p.Port) //nolint:err113
+		}
+		if _, ok := seen[p.Port]; ok {
+			continue
+		}
+		seen[p.Port] = p.Scheme
+		entries = append(entries, l7PortEntry{
+			Port:   htonsPort(p.Port),
+			Scheme: p.Scheme,
+		})
+	}
+	applyPortsToDNSAllowValue(&value, entries)
+	return dnsAllowRule{value: value, domain: "*"}, nil
+}
+
 func buildDNSAllowRules(domains []string) ([]dnsAllowRule, error) {
 	rules := make([]dnsAllowRule, 0, len(domains))
 	indexByKey := make(map[dnsAllowKey]int, len(domains))
@@ -194,6 +241,46 @@ func cleanupDNSAllow(ifindex uint32) error {
 		return err
 	}
 	return flushDNSAllowInnerMap(inner)
+}
+
+// syncDNSAllowInner converges dns_allow_v2 for one TAP on the desired rules.
+//
+// Values are written as-is rather than through updateDNSAllowRule: that helper
+// unions the installed flags and port tuples into the new value, which is right
+// when several rules of one apply share a key, but on an update it would keep
+// ports the caller just removed. buildNetPolicyPlan already merges same-key
+// rules in userspace, so rules holds exactly the desired state.
+func syncDNSAllowInner(ifindex uint32, rules []dnsAllowRule) error {
+	dnsAllow, err := loadPinnedMap(MapNameDNSAllowV2)
+	if err != nil {
+		return err
+	}
+	defer dnsAllow.Close()
+
+	inner, err := acquireInnerMap(dnsAllow, ifindex, MapNameDNSAllowV2, newInnerDNSAllowMap)
+	if err != nil {
+		return err
+	}
+
+	desired := make(map[dnsAllowKey]struct{}, len(rules))
+	for _, rule := range rules {
+		desired[rule.key] = struct{}{}
+	}
+
+	stale, err := staleKeys(inner, desired, func(*dnsAllowValue) bool { return true })
+	if err != nil {
+		return err
+	}
+	if err := deleteKeys(inner, stale); err != nil {
+		return err
+	}
+
+	for _, rule := range rules {
+		if err := inner.Update(&rule.key, &rule.value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("dns allow update failed: %w, domain: %s", err, rule.domain)
+		}
+	}
+	return nil
 }
 
 // applyDNSAllow installs DNS allow rules parsed from MVMOptions.

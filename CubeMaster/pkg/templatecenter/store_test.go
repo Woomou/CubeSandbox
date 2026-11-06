@@ -7,6 +7,7 @@ package templatecenter
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -165,7 +166,7 @@ func TestCreateTemplateUsesRequestedDistributionScope(t *testing.T) {
 		}
 		return []ReplicaStatus{{NodeID: "node-a", NodeIP: "10.0.0.1", InstanceType: req.InstanceType, Status: ReplicaStatusReady}}, nil
 	})
-	patches.ApplyFunc(finalizeTemplateReplicas, func(ctx context.Context, templateID, instanceType, version, alias string, replicas []ReplicaStatus) (*TemplateInfo, string, error) {
+	patches.ApplyFunc(finalizeTemplateReplicas, func(ctx context.Context, templateID, jobID, instanceType, version string, replicas []ReplicaStatus) (*TemplateInfo, string, error) {
 		return &TemplateInfo{TemplateID: templateID, InstanceType: instanceType, Version: version, Replicas: replicas}, "", nil
 	})
 	patches.ApplyFunc(cleanupTemplateReplicas, func(ctx context.Context, templateID string) error {
@@ -199,19 +200,15 @@ func TestFinalizeTemplateReplicasClaimsAliasBeforePublishingReady(t *testing.T) 
 	defer patches.Reset()
 
 	var order []string
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		order = append(order, "claim")
-		return nil
-	})
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
 		order = append(order, "publish:"+status)
-		return nil
+		return "my-alias", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
 	replicas := []ReplicaStatus{{NodeID: "node-a", NodeIP: "10.0.0.1", Status: ReplicaStatusReady}}
-	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-order", "cubebox", "v2", "my-alias", replicas)
+	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-order", "job-order", "cubebox", "v2", replicas)
 	if err != nil {
 		t.Fatalf("finalizeTemplateReplicas returned error: %v", err)
 	}
@@ -224,7 +221,7 @@ func TestFinalizeTemplateReplicasClaimsAliasBeforePublishingReady(t *testing.T) 
 	if info.DisplayName != "my-alias" {
 		t.Fatalf("expected DisplayName propagated, got %q", info.DisplayName)
 	}
-	if !reflect.DeepEqual(order, []string{"claim", "publish:" + StatusReady}) {
+	if !reflect.DeepEqual(order, []string{"publish:" + StatusReady}) {
 		t.Fatalf("alias must be claimed before READY is published; got order=%v", order)
 	}
 }
@@ -236,24 +233,21 @@ func TestFinalizeTemplateReplicasSkipsAliasClaimWhenFailed(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	claimed := false
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		claimed = true
-		return nil
-	})
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
-		return nil
+	publishedStatus := ""
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
+		publishedStatus = status
+		return "", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
 	replicas := []ReplicaStatus{{NodeID: "node-a", Status: ReplicaStatusFailed, ErrorMessage: "boom"}}
-	_, _, err := finalizeTemplateReplicas(context.Background(), "tpl-failed", "cubebox", "v2", "my-alias", replicas)
+	_, _, err := finalizeTemplateReplicas(context.Background(), "tpl-failed", "job-failed", "cubebox", "v2", replicas)
 	if err == nil {
 		t.Fatalf("expected error for all-failed template")
 	}
-	if claimed {
-		t.Fatalf("alias must not be claimed for a FAILED template")
+	if publishedStatus != StatusFailed {
+		t.Fatalf("expected FAILED to be published, got %q", publishedStatus)
 	}
 }
 
@@ -266,13 +260,9 @@ func TestFinalizeTemplateReplicasClaimsAliasForPartiallyReady(t *testing.T) {
 	defer patches.Reset()
 
 	var order []string
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		order = append(order, "claim")
-		return nil
-	})
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
 		order = append(order, "publish:"+status)
-		return nil
+		return "my-alias", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
@@ -281,7 +271,7 @@ func TestFinalizeTemplateReplicasClaimsAliasForPartiallyReady(t *testing.T) {
 		{NodeID: "node-a", Status: ReplicaStatusReady},
 		{NodeID: "node-b", Status: ReplicaStatusFailed, ErrorMessage: "boom"},
 	}
-	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-partial", "cubebox", "v2", "my-alias", replicas)
+	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-partial", "job-partial", "cubebox", "v2", replicas)
 	if err != nil {
 		t.Fatalf("finalizeTemplateReplicas returned error: %v", err)
 	}
@@ -291,7 +281,7 @@ func TestFinalizeTemplateReplicasClaimsAliasForPartiallyReady(t *testing.T) {
 	if info == nil || info.Status != StatusPartiallyReady {
 		t.Fatalf("expected PARTIALLY_READY info, got %#v", info)
 	}
-	if !reflect.DeepEqual(order, []string{"claim", "publish:" + StatusPartiallyReady}) {
+	if !reflect.DeepEqual(order, []string{"publish:" + StatusPartiallyReady}) {
 		t.Fatalf("alias must be claimed before status is published; got order=%v", order)
 	}
 }
@@ -305,8 +295,9 @@ func TestFinalizeTemplateReplicasSurfacesClaimWarningOnNonDuplicateError(t *test
 	defer patches.Reset()
 
 	published := false
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		return errors.New("db unavailable")
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
+		published = true
+		return "", "template is ready but alias could not be claimed", nil
 	})
 	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
 		published = true
@@ -316,7 +307,7 @@ func TestFinalizeTemplateReplicasSurfacesClaimWarningOnNonDuplicateError(t *test
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
 	replicas := []ReplicaStatus{{NodeID: "node-a", Status: ReplicaStatusReady}}
-	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-warn", "cubebox", "v2", "my-alias", replicas)
+	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-warn", "job-warn", "cubebox", "v2", replicas)
 	if err != nil {
 		t.Fatalf("finalizeTemplateReplicas returned error: %v", err)
 	}
@@ -339,8 +330,8 @@ func TestFinalizeTemplateReplicasSwallowsDuplicateAliasError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		return &mysql.MySQLError{Number: 1062, Message: "duplicate entry"}
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
+		return "", "", nil
 	})
 	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
 		return nil
@@ -349,7 +340,7 @@ func TestFinalizeTemplateReplicasSwallowsDuplicateAliasError(t *testing.T) {
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
 	replicas := []ReplicaStatus{{NodeID: "node-a", Status: ReplicaStatusReady}}
-	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-dup", "cubebox", "v2", "my-alias", replicas)
+	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-dup", "job-dup", "cubebox", "v2", replicas)
 	if err != nil {
 		t.Fatalf("finalizeTemplateReplicas returned error: %v", err)
 	}
@@ -368,26 +359,18 @@ func TestFinalizeTemplateReplicasSkipsClaimForEmptyAlias(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	claimed := false
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		claimed = true
-		return nil
-	})
 	published := false
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
 		published = true
-		return nil
+		return "", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
 	replicas := []ReplicaStatus{{NodeID: "node-a", Status: ReplicaStatusReady}}
-	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-noalias", "cubebox", "v2", "", replicas)
+	info, claimWarning, err := finalizeTemplateReplicas(context.Background(), "tpl-noalias", "job-noalias", "cubebox", "v2", replicas)
 	if err != nil {
 		t.Fatalf("finalizeTemplateReplicas returned error: %v", err)
-	}
-	if claimed {
-		t.Fatalf("no alias must be claimed when alias is empty")
 	}
 	if !published || claimWarning != "" || info == nil || info.DisplayName != "" {
 		t.Fatalf("expected READY published, no warning, empty DisplayName; got warning=%q info=%#v", claimWarning, info)
@@ -407,25 +390,21 @@ func TestRefreshTemplateReplicaSummaryClaimsAliasBeforePublishingReady(t *testin
 	patches.ApplyFunc(ListReplicas, func(ctx context.Context, templateID string) ([]models.TemplateReplica, error) {
 		return []models.TemplateReplica{{NodeID: "node-a", Status: ReplicaStatusReady}}, nil
 	})
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		order = append(order, "claim")
-		return nil
-	})
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
 		order = append(order, "publish:"+status)
-		return nil
+		return "my-alias", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
-	claimWarning, err := refreshTemplateReplicaSummary(context.Background(), "tpl-redo", "my-alias")
+	claimWarning, err := refreshTemplateReplicaSummary(context.Background(), "tpl-redo", "job-redo")
 	if err != nil {
 		t.Fatalf("refreshTemplateReplicaSummary returned error: %v", err)
 	}
 	if claimWarning != "" {
 		t.Fatalf("unexpected claim warning: %q", claimWarning)
 	}
-	if !reflect.DeepEqual(order, []string{"claim", "publish:" + StatusReady}) {
+	if !reflect.DeepEqual(order, []string{"publish:" + StatusReady}) {
 		t.Fatalf("redo path must claim the alias before publishing READY; got order=%v", order)
 	}
 }
@@ -436,25 +415,22 @@ func TestRefreshTemplateReplicaSummarySkipsAliasClaimWhenFailed(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	claimed := false
+	publishedStatus := ""
 	patches.ApplyFunc(ListReplicas, func(ctx context.Context, templateID string) ([]models.TemplateReplica, error) {
 		return []models.TemplateReplica{{NodeID: "node-a", Status: ReplicaStatusFailed, ErrorMessage: "boom"}}, nil
 	})
-	patches.ApplyFunc(claimTemplateAlias, func(ctx context.Context, templateID, alias string, requireReady bool) error {
-		claimed = true
-		return nil
-	})
-	patches.ApplyFunc(UpdateDefinitionStatus, func(ctx context.Context, templateID, status, lastError string) error {
-		return nil
+	patches.ApplyFunc(publishTemplateStatusWithAlias, func(ctx context.Context, templateID, jobID, status, lastError string) (string, string, error) {
+		publishedStatus = status
+		return "", "", nil
 	})
 	patches.ApplyFunc(setTemplateLocalityCache, func(templateID string, replicas []ReplicaStatus) {})
 	patches.ApplyFunc(registerReadyTemplateReplicas, func(templateID string, replicas []ReplicaStatus) {})
 
-	if _, err := refreshTemplateReplicaSummary(context.Background(), "tpl-redo-failed", "my-alias"); err != nil {
+	if _, err := refreshTemplateReplicaSummary(context.Background(), "tpl-redo-failed", "job-redo-failed"); err != nil {
 		t.Fatalf("refreshTemplateReplicaSummary returned error: %v", err)
 	}
-	if claimed {
-		t.Fatalf("alias must not be claimed for a FAILED template on the redo path")
+	if publishedStatus != StatusFailed {
+		t.Fatalf("expected FAILED to be published, got %q", publishedStatus)
 	}
 }
 
@@ -490,7 +466,122 @@ func TestGetTemplateRequestAssignsRuntimeRequestID(t *testing.T) {
 	}
 }
 
+func TestGetTemplateRequestSurfacesAliasAnnotation(t *testing.T) {
+	templateID := "tpl-runtime-alias"
+	invalidateTemplateCaches(templateID)
+	defer invalidateTemplateCaches(templateID)
+
+	cached := &sandboxtypes.CreateCubeSandboxReq{
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "python-runtime",
+		},
+	}
+	if err := setTemplateRequestCache(templateID, cached); err != nil {
+		t.Fatalf("setTemplateRequestCache returned error: %v", err)
+	}
+
+	req, err := GetTemplateRequest(context.Background(), templateID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if got := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; got != "python-runtime" {
+		t.Fatalf("expected alias annotation python-runtime, got %q", got)
+	}
+}
+
+func TestGetTemplateRequestStampsSnapshotDisplayNameAsAlias(t *testing.T) {
+	snapshotID := "snap-alias-stamp"
+	invalidateTemplateCaches(snapshotID)
+	defer invalidateTemplateCaches(snapshotID)
+
+	// The stored snapshot request still carries the source template's alias.
+	stored := &sandboxtypes.CreateCubeSandboxReq{
+		Request: &sandboxtypes.Request{RequestID: "req-1"},
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-template-alias",
+		},
+		Labels: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-template-alias",
+		},
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored request: %v", err)
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(getSnapshotRecord, func(ctx context.Context, id string) (*models.SnapshotRecord, error) {
+		return &models.SnapshotRecord{
+			SnapshotID:  id,
+			DisplayName: "my-snap",
+			RequestJSON: string(storedJSON),
+			Status:      StatusReady,
+		}, nil
+	})
+
+	req, err := GetTemplateRequest(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if got := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; got != "my-snap" {
+		t.Fatalf("expected snapshot name my-snap as alias, got %q", got)
+	}
+	if _, ok := req.Labels[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("inherited source template alias must be scrubbed from labels")
+	}
+}
+
+// TestGetTemplateRequestClearsStaleAliasWhenDisplayNameEmpty verifies the
+// definition read path scrubs a leaked alias when display_name is empty.
+func TestGetTemplateRequestClearsStaleAliasWhenDisplayNameEmpty(t *testing.T) {
+	templateID := "tpl-alias-clear"
+	invalidateTemplateCaches(templateID)
+	defer invalidateTemplateCaches(templateID)
+
+	// The definition's request_json still carries a stale alias from the
+	// source template, but the definition itself has no display_name.
+	stored := &sandboxtypes.CreateCubeSandboxReq{
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-alias",
+		},
+		Labels: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-alias",
+		},
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored request: %v", err)
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(getSnapshotRecord, func(ctx context.Context, id string) (*models.SnapshotRecord, error) {
+		return nil, ErrSnapshotNotFound
+	})
+	patches.ApplyFunc(GetDefinition, func(ctx context.Context, id string) (*models.TemplateDefinition, error) {
+		return &models.TemplateDefinition{
+			TemplateID:  id,
+			DisplayName: "",
+			RequestJSON: string(storedJSON),
+		}, nil
+	})
+
+	req, err := GetTemplateRequest(context.Background(), templateID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if _, ok := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("stale alias annotation must be scrubbed when display_name is empty")
+	}
+	if _, ok := req.Labels[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("stale alias label must be scrubbed when display_name is empty")
+	}
+}
+
 func TestGetTemplateInfoPopulatesCreatedAtAndImageInfoFromDefinitionAndLatestJob(t *testing.T) {
+	stubSweepStore(t)
+
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
@@ -512,7 +603,7 @@ func TestGetTemplateInfoPopulatesCreatedAtAndImageInfoFromDefinitionAndLatestJob
 	patches.ApplyFunc(ListReplicas, func(ctx context.Context, templateID string) ([]models.TemplateReplica, error) {
 		return nil, nil
 	})
-	patches.ApplyFunc(getLatestTemplateImageJobByTemplateID, func(ctx context.Context, templateID string) (*models.TemplateImageJob, error) {
+	patches.ApplyFunc(getLatestCreateRedoImageJobByTemplateIDTx, func(tx *gorm.DB, templateID string) (*models.TemplateImageJob, error) {
 		return &models.TemplateImageJob{
 			TemplateID:        templateID,
 			SourceImageRef:    "docker.io/library/python:3.12",
@@ -817,8 +908,8 @@ func TestIsDeadlockError(t *testing.T) {
 	assert.True(t, isDeadlockError(&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}))
 	assert.True(t, isDeadlockError(&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"}))
 	assert.True(t, isDeadlockError(fmt.Errorf("claim fail: %w", &mysql.MySQLError{Number: 1213, Message: "Deadlock found"})))
-	assert.True(t, isDeadlockError(errors.New("ERROR: deadlock detected; SQLSTATE 40P01")))
-	assert.True(t, isDeadlockError(errors.New("ERROR: lock not available; SQLSTATE 55P03")))
+	assert.True(t, isDeadlockError(&pgconn.PgError{Code: "40P01", Message: "deadlock detected"}))
+	assert.True(t, isDeadlockError(fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "55P03", Message: "lock not available"})))
 	assert.False(t, isDeadlockError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
 	assert.False(t, isDeadlockError(errors.New("Error 1062 (23000): Duplicate entry for key 'alias_key'")))
 	assert.False(t, isDeadlockError(errors.New("connection reset by peer")))
@@ -885,74 +976,6 @@ func TestSyncCreateRedoImageJobAliasTx_UpdateFailureIsFatal(t *testing.T) {
 	err := syncCreateRedoImageJobAliasTx(&gorm.DB{}, "tpl-1", "new")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "update failed")
-}
-
-// TestCurrentJobAlias_ReadsSyncedAlias verifies currentJobAlias re-reads the
-// alias from the job's RequestJSON at finalize time (the in-memory req.Alias is
-// frozen at submit, so only a DB re-read honors an operator change made after
-// the build started — design §3.6, the P1 fix).
-func TestCurrentJobAlias_ReadsSyncedAlias(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return &models.TemplateImageJob{JobID: jobID, RequestJSON: `{"alias":"synced","source_image_ref":"img"}`}, nil
-	})
-	a, ok := currentJobAlias(context.Background(), "job-1")
-	assert.True(t, ok)
-	assert.Equal(t, "synced", a)
-}
-
-// TestCurrentJobAlias_HonorsClearedAlias verifies a cleared job RequestJSON
-// yields ("", true) — so finalize honors an operator clear instead of falling
-// back to the frozen create-time alias.
-func TestCurrentJobAlias_HonorsClearedAlias(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return &models.TemplateImageJob{JobID: jobID, RequestJSON: `{"source_image_ref":"img"}`}, nil // alias cleared
-	})
-	a, ok := currentJobAlias(context.Background(), "job-1")
-	assert.True(t, ok)
-	assert.Equal(t, "", a)
-}
-
-// TestCurrentJobAlias_ReadErrorSkipsClaim verifies a read failure returns
-// ok=false so finalize skips claim instead of falling back to a frozen alias.
-func TestCurrentJobAlias_ReadErrorSkipsClaim(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return nil, errors.New("db unavailable")
-	})
-	a, ok := currentJobAlias(context.Background(), "job-1")
-	assert.False(t, ok)
-	assert.Equal(t, "", a)
-	assert.Equal(t, "", aliasToClaimAtFinalize(context.Background(), "tpl-1", "job-1"),
-		"finalize must skip claim on read failure; never fall back to a frozen alias")
-}
-
-func TestAliasToClaimAtFinalize_PrefersDisplayName(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return &models.TemplateImageJob{JobID: jobID, RequestJSON: `{"alias":"from-job"}`}, nil
-	})
-	patches.ApplyFunc(GetDefinition, func(ctx context.Context, templateID string) (*models.TemplateDefinition, error) {
-		return &models.TemplateDefinition{TemplateID: templateID, DisplayName: "from-def"}, nil
-	})
-	assert.Equal(t, "from-def", aliasToClaimAtFinalize(context.Background(), "tpl-1", "job-1"))
-}
-
-func TestAliasToClaimAtFinalize_UsesJobAliasWhenDisplayNameEmpty(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return &models.TemplateImageJob{JobID: jobID, RequestJSON: `{"alias":"from-job"}`}, nil
-	})
-	patches.ApplyFunc(GetDefinition, func(ctx context.Context, templateID string) (*models.TemplateDefinition, error) {
-		return &models.TemplateDefinition{TemplateID: templateID, DisplayName: ""}, nil
-	})
-	assert.Equal(t, "from-job", aliasToClaimAtFinalize(context.Background(), "tpl-1", "job-1"))
 }
 
 // TestSetTemplateAlias_ValidatesAlias verifies that invalid alias strings
@@ -1056,6 +1079,36 @@ func TestIsDuplicateAliasError_WrappedPostgres23505(t *testing.T) {
 	assert.True(t, isDuplicateAliasError(wrapped), "23505 must remain detectable after %%w wrap")
 }
 
+func TestIsDuplicateAliasErrorRejectsMisleadingText(t *testing.T) {
+	wrappedLengthError := fmt.Errorf(
+		"claim alias for template tpl-cache-claim-fail-23505 fail: %w",
+		&pgconn.PgError{Code: "22001", Message: "value too long"},
+	)
+	for _, err := range []error{
+		wrappedLengthError,
+		errors.New("claim alias for template tpl-cache-claim-fail-23505 failed: SQLSTATE 22001"),
+		errors.New("unique_constraint mentioned in diagnostic text"),
+		errors.New("ERROR: value too long for type character varying(256) (SQLSTATE 22001)"),
+	} {
+		assert.False(t, isDuplicateAliasError(err))
+	}
+}
+
+func TestIsDuplicateAliasErrorPostgresSQLState(t *testing.T) {
+	for _, code := range []string{"23505"} {
+		inner := &pgconn.PgError{Code: code, Message: "duplicate key"}
+		assert.True(t, isDuplicateAliasError(inner))
+		assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", inner)))
+	}
+	assert.False(t, isDuplicateAliasError(&pgconn.PgError{Code: "22001", Message: "value too long"}))
+}
+
+func TestIsDuplicateAliasErrorMySQLCodes(t *testing.T) {
+	assert.True(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
+	assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"})))
+	assert.False(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1406, Message: "Data too long"}))
+}
+
 func TestSyncCreateRedoImageJobAliasTx_NoJobsSucceeds(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -1064,16 +1117,4 @@ func TestSyncCreateRedoImageJobAliasTx_NoJobsSucceeds(t *testing.T) {
 	})
 	require.NoError(t, syncCreateRedoImageJobAliasTx(&gorm.DB{}, "tpl-commit-origin", "new"),
 		"commit-origin templates with no CREATE/REDO jobs must still succeed")
-}
-
-func TestAliasToClaimAtFinalize_ClearedJobAndEmptyDisplayNameSkips(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
-		return &models.TemplateImageJob{JobID: jobID, RequestJSON: `{"source_image_ref":"img"}`}, nil
-	})
-	patches.ApplyFunc(GetDefinition, func(ctx context.Context, templateID string) (*models.TemplateDefinition, error) {
-		return &models.TemplateDefinition{TemplateID: templateID, DisplayName: ""}, nil
-	})
-	assert.Equal(t, "", aliasToClaimAtFinalize(context.Background(), "tpl-1", "job-1"))
 }

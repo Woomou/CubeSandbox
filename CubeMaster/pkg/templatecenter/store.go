@@ -16,7 +16,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
@@ -28,10 +28,14 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/qos"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/remotestatus"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxstatus"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -46,6 +50,7 @@ const (
 	StatusFailed         = "FAILED"
 	StatusCreating       = "CREATING"
 	StatusDeleting       = "DELETING"
+	StatusDeleted        = "DELETED"
 
 	TemplateKindTemplate = "template"
 	TemplateKindSnapshot = "snapshot"
@@ -73,8 +78,12 @@ const (
 )
 
 var (
-	ErrTemplateStoreNotInitialized  = errors.New("template store is not initialized")
-	ErrTemplateNotFound             = errors.New("template not found")
+	ErrTemplateStoreNotInitialized = errors.New("template store is not initialized")
+	ErrTemplateNotFound            = errors.New("template not found")
+	// ErrTemplateImageJobNotFound is the domain-level "no such build job".
+	// Handlers must be able to answer NotFound without importing gorm, so the
+	// repository translates gorm.ErrRecordNotFound into this.
+	ErrTemplateImageJobNotFound     = errors.New("template image job not found")
 	ErrTemplateIDRequired           = errors.New("template id is required")
 	ErrTemplateHasNoReadyReplica    = errors.New("template has no ready replica")
 	ErrNoTemplateNodes              = errors.New("no healthy nodes available for template creation")
@@ -82,7 +91,15 @@ var (
 	ErrTemplateAttemptInProgress    = errors.New("template attempt is already in progress")
 	ErrAliasNotApplicableToSnapshot = errors.New("alias is not applicable to snapshot")
 	ErrInvalidAlias                 = errors.New("alias is invalid")
+	ErrInvalidSnapshotName          = errors.New("snapshot name is invalid")
 	ErrTemplateNotReady             = errors.New("template is not ready")
+	// ErrFilesystemOnlyRollback rejects a rollback whose target snapshot has no
+	// guest memory. Rollback restores memory, so the artifact cannot satisfy
+	// it; creating a new sandbox from the snapshot is the supported path.
+	ErrFilesystemOnlyRollback = errors.New("snapshot is filesystem-only and cannot be rolled back")
+	// ErrFilesystemOnlySharedVolume rejects an fs-only snapshot of a sandbox
+	// with writable plugin volumes: the snapshot only contains the rootfs.
+	ErrFilesystemOnlySharedVolume = errors.New("filesystem-only snapshots do not support writable plugin volumes")
 )
 
 type localStore struct {
@@ -133,13 +150,14 @@ type TemplateInfo struct {
 	OriginHostFactsJSON       string          `json:"origin_host_facts_json,omitempty"`
 	DisplayName               string          `json:"display_name,omitempty"`
 	StorageBackend            string          `json:"storage_backend,omitempty"`
-	Retain                    bool            `json:"retain,omitempty"`
+	Backend                   string          `json:"backend,omitempty"`
 	RootfsSizeBytesAtSnapshot uint64          `json:"rootfs_size_bytes_at_snapshot,omitempty"`
 	LastError                 string          `json:"last_error,omitempty"`
 	CreatedAt                 string          `json:"created_at,omitempty"`
 	ImageInfo                 string          `json:"image_info,omitempty"`
 	JobID                     string          `json:"job_id,omitempty"`
 	Replicas                  []ReplicaStatus `json:"replicas,omitempty"`
+	ConfiguredQos             *qos.Config     `json:"configured_qos,omitempty"`
 
 	// CubeEgress CA bake metadata, surfaced for ops triage. Populated
 	// from the RootfsArtifact row pointed to by the first replica.
@@ -152,7 +170,7 @@ type TemplateInfo struct {
 }
 
 func templateInfoFromDefinition(def models.TemplateDefinition) TemplateInfo {
-	return TemplateInfo{
+	info := TemplateInfo{
 		TemplateID:                def.TemplateID,
 		InstanceType:              def.InstanceType,
 		Version:                   def.Version,
@@ -163,10 +181,12 @@ func templateInfoFromDefinition(def models.TemplateDefinition) TemplateInfo {
 		OriginHostFactsJSON:       def.OriginHostFactsJSON,
 		DisplayName:               def.DisplayName,
 		StorageBackend:            def.StorageBackend,
-		Retain:                    def.Retain,
+		Backend:                   def.StorageBackend,
 		RootfsSizeBytesAtSnapshot: def.RootfsSizeBytesAtSnapshot,
 		LastError:                 def.LastError,
 	}
+	info.ConfiguredQos = configuredQosFromCreateRequestJSON(def.RequestJSON)
+	return info
 }
 
 type replicaRunOptions struct {
@@ -181,21 +201,91 @@ type definitionCreateOptions struct {
 	OriginHostFactsJSON       string
 	DisplayName               string
 	StorageBackend            string
-	Retain                    bool
 	RootfsSizeBytesAtSnapshot uint64
 }
 
+// TemplateListOptions controls pagination of ListTemplatesWithOptions.
+// A zero value returns the full list (backwards compatible).
+type TemplateListOptions struct {
+	Limit  int
+	Offset int
+}
+
+// TemplateListResult carries the requested page plus the total entry count
+// measured before slicing, so paged clients can compute page counts.
+type TemplateListResult struct {
+	Templates []TemplateInfo
+	Total     int
+}
+
+// ListTemplates returns all templates (backwards compatible).
 func ListTemplates(ctx context.Context) ([]TemplateInfo, error) {
+	result, err := ListTemplatesWithOptions(ctx, TemplateListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return result.Templates, nil
+}
+
+// ListTemplatesWithOptions returns templates with optional limit/offset paging
+// over a totally ordered list, so pages concatenate to the unpaged result.
+func ListTemplatesWithOptions(ctx context.Context, opts TemplateListOptions) (*TemplateListResult, error) {
 	if !isReady() {
 		return nil, ErrTemplateStoreNotInitialized
 	}
-	var defs []models.TemplateDefinition
-	if err := store.db.WithContext(ctx).Table(constants.TemplateDefinitionTableName).
-		Order("updated_at desc").Find(&defs).Error; err != nil {
+	infos, err := listTemplatesCached(ctx)
+	if err != nil {
 		return nil, err
 	}
+	total := len(infos)
+	if opts.Limit <= 0 && opts.Offset <= 0 {
+		return &TemplateListResult{Templates: infos, Total: total}, nil
+	}
+	return &TemplateListResult{Templates: sliceTemplateInfos(infos, opts), Total: total}, nil
+}
+
+// listTemplatesCached serves the aggregate list from the query cache on a hit
+// and falls back to the DB query, which re-populates the cache.
+func listTemplatesCached(ctx context.Context) ([]TemplateInfo, error) {
+	if cached, ok := getCachedTemplateList(); ok {
+		return cached, nil
+	}
+	return listTemplatesFromDB(ctx)
+}
+
+// sliceTemplateInfos clamps offset/limit so out-of-range paging returns an
+// empty page instead of erroring; a non-positive limit keeps the tail intact.
+func sliceTemplateInfos(infos []TemplateInfo, opts TemplateListOptions) []TemplateInfo {
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(infos) {
+		return []TemplateInfo{}
+	}
+	infos = infos[offset:]
+	if opts.Limit > 0 && opts.Limit < len(infos) {
+		infos = infos[:opts.Limit]
+	}
+	return infos
+}
+
+// listTemplatesFromDB is the uncached ListTemplates implementation. Called by
+// ListTemplates on a cache miss and by the backstop refresh goroutine (which
+// must bypass the cache to avoid a self-hit). Re-caches the result before
+// returning so the next read hits the cache.
+func listTemplatesFromDB(ctx context.Context) ([]TemplateInfo, error) {
+	var defs []models.TemplateDefinition
+	if err := store.db.WithContext(ctx).Table(constants.TemplateDefinitionTableName).
+		Order("updated_at desc, template_id asc").Find(&defs).Error; err != nil {
+		return nil, err
+	}
+	// Only CREATE/REDO jobs carry the source image identity used for display.
+	// A COMMIT/MIGRATE/snapshot row carries no source image ref, and a MIGRATE
+	// row would otherwise win the attempt_no ordering and blank image_info.
 	var jobs []models.TemplateImageJob
 	if err := store.db.WithContext(ctx).Table(constants.TemplateImageJobTableName).
+		Where("operation IN ?", createRedoJobOperations).
 		Order("template_id asc, attempt_no desc, id desc").Find(&jobs).Error; err != nil {
 		return nil, err
 	}
@@ -208,11 +298,19 @@ func ListTemplates(ctx context.Context) ([]TemplateInfo, error) {
 		latestJobByTemplateID[job.TemplateID] = job
 	}
 
+	hiddenIDs, err := hiddenSnapshotIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make([]TemplateInfo, 0, len(defs))
 	for _, def := range defs {
 		// Pause-produced snaps are internal Resume artifacts (Kind=pause_snapshot).
 		// Keep them out of template/snapshot list surfaces.
 		if strings.EqualFold(strings.TrimSpace(def.Kind), pausesnap.KindPauseSnapshot) {
+			continue
+		}
+		if _, skip := hiddenIDs[def.TemplateID]; skip {
 			continue
 		}
 		imageInfo := extractImageInfoFromRequestJSON(def.RequestJSON)
@@ -235,36 +333,128 @@ func ListTemplates(ctx context.Context) ([]TemplateInfo, error) {
 		if _, ok := seen[job.TemplateID]; ok {
 			continue
 		}
+		if _, skip := hiddenIDs[job.TemplateID]; skip {
+			continue
+		}
 		out = append(out, templateInfoFromJob(&job))
 		seen[job.TemplateID] = struct{}{}
+	}
+	setTemplateListCache(out)
+	return out, nil
+}
+
+// hiddenSnapshotIDs returns DELETED/DELETING snapshot IDs so ListTemplates
+// can omit leftover definition or job rows for the same id.
+func hiddenSnapshotIDs(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := listSnapshotRecordsByStatus(ctx, StatusDeleted, StatusDeleting)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(rows))
+	for _, rec := range rows {
+		out[rec.SnapshotID] = struct{}{}
 	}
 	return out, nil
 }
 
+// errIfHiddenSnapshot returns ErrTemplateNotFound when a snapshot row exists
+// and rejects new use. Missing rows and an uninitialized store are ignored
+// so definition/job fallbacks still run.
+func errIfHiddenSnapshot(ctx context.Context, templateID string) error {
+	rec, err := getSnapshotRecord(ctx, templateID)
+	if err != nil {
+		if errors.Is(err, ErrSnapshotNotFound) || errors.Is(err, ErrTemplateStoreNotInitialized) {
+			return nil
+		}
+		return err
+	}
+	if rec != nil && snapshotRejectsNewUse(rec.Status) {
+		return ErrTemplateNotFound
+	}
+	return nil
+}
+
+// Init boots templatecenter for CubeMaster (the in-process monolith case).
+// It wires BOTH snapshot-side and template-side concerns — see
+// docs/dev/templatecenter-design.md §2.3 for the ownership split.
+//
+// When the standalone CubeTemplateCenter process calls Init, it gets
+// snapshot hooks it does not own (sandbox.SetAfterDestroySandboxSuccessHook
+// etc.) which only CubeMaster should set. Use InitForTemplateCenter instead
+// for that process.
 func Init(ctx context.Context) error {
+	return initCommon(ctx, true /* includeSnapshotSide */)
+}
+
+// InitForTemplateCenter boots templatecenter for the standalone
+// CubeTemplateCenter process. Skips snapshot-side wiring (snapshot
+// runtime-ref hooks, sandboxspec hooks, sandboxspec init, snapshot
+// reconciler) — those belong to CubeMaster and would otherwise double-register
+// hooks or leak goroutines that only CubeMaster should own.
+//
+// Template-side wiring kept here:
+//   - store.db (the canonical handle for template_* tables)
+//   - compat hooks (template compat table maintenance)
+//   - warm ready template locality (so CreateSandbox can hit locality quickly)
+//   - initial compat scan
+//
+// Artifact GC is deliberately NOT started here: its passes destroy artifacts
+// on nodes over the worker (cubelet) grpc pool, which only CubeMaster
+// initializes. Running it on TC would strand every candidate in
+// CLEANUP_PENDING and let the reconciler backstop drop the rows while the
+// node-side ext4 files leak. CubeMaster runs the GC; TC's reconciler keeps
+// only the data-deletion backstop for rows CubeMaster already marked.
+func InitForTemplateCenter(ctx context.Context) error {
+	return initCommon(ctx, false /* includeSnapshotSide */)
+}
+
+func initCommon(ctx context.Context, includeSnapshotSide bool) error {
 	_ = ctx
 	if config.GetDbConfig() == nil {
 		return ErrTemplateStoreNotInitialized
 	}
 	var initErr error
 	storeOnce.Do(func() {
-		// Schema is owned by pkg/base/dao/migrate and applied in main.go
+		// Schema is owned by pkgs/cubedb/migrate and applied in main.go
 		// before any business package Init runs; here we only attach to
 		// the existing *gorm.DB.
 		store.db = db.Init(config.GetDbConfig())
 		store.dbAddr = config.GetDbConfig().Addr
-		if initErr = sandboxspec.Init(store.db); initErr != nil {
-			return
+		if includeSnapshotSide {
+			if initErr = sandboxspec.Init(store.db); initErr != nil {
+				return
+			}
+			if initErr = sandboxstatus.Init(store.db); initErr != nil {
+				return
+			}
+			configureSnapshotRuntimeRefHooks()
+			configureSandboxSpecHooks()
 		}
-		pausesnap.Init(store.db)
-		configureSnapshotRuntimeRefHooks()
-		configureSandboxSpecHooks()
+		if includeSnapshotSide {
+			pausesnap.Init(store.db)
+		}
 		configureCompatHooks()
 		if warmErr := warmReadyTemplateLocality(ctx); warmErr != nil {
 			log.G(ctx).Warnf("warm ready template locality fail:%v", warmErr)
 		}
-		startSnapshotReconciler(ctx)
-		startArtifactGC(ctx)
+		if includeSnapshotSide {
+			startSnapshotReconciler(ctx)
+			// CubeMaster only. The stuck-job sweep replays the post-build
+			// pipeline (artifact registration + distribution + template
+			// definition), which is CubeMaster's responsibility -- the
+			// standalone CubeTemplateCenter process must never write that
+			// state, so it does not run this.
+			startImageJobReconciler(ctx)
+			remotestatus.Start(ctx, store.db)
+			// CubeMaster only: backstop refresh for the template query caches
+			// so a missed write-path invalidation never leaves stale data for
+			// longer than one refresh period.
+			startTemplateQueryCacheRefresh(ctx)
+			// CubeMaster only: artifact GC destroys node-side ext4 files over
+			// the worker (cubelet) grpc pool, which TC never initializes. See
+			// InitForTemplateCenter.
+			startArtifactGC(ctx)
+		}
 		scheduleInitialCompatScan(ctx)
 	})
 	return initErr
@@ -272,8 +462,21 @@ func Init(ctx context.Context) error {
 
 func configureSnapshotRuntimeRefHooks() {
 	releaseBySandboxID := func(ctx context.Context, sandboxID string) error {
+		// Look up the ref before releasing so we can trigger the tombstone
+		// finalizer for that snapshot afterward.
+		ref, refErr := GetActiveSnapshotRuntimeRefBySandbox(ctx, sandboxID)
+		if refErr != nil && !errors.Is(refErr, gorm.ErrRecordNotFound) {
+			log.G(ctx).Warnf("lookup snapshot runtime ref before destroy release failed: %v", refErr)
+		}
 		errReleasingRefs := ReleaseSnapshotRuntimeRefsBySandbox(ctx, sandboxID, snapshotRuntimeRefReleasedByDestroy)
 		errDeletingSpec := sandboxspec.Delete(ctx, sandboxID)
+		// Status is best-effort. A missing row must not fail destroy.
+		if errDeletingStatus := sandboxstatus.SoftDelete(ctx, sandboxID); errDeletingStatus != nil {
+			log.G(ctx).Warnf("sandbox status soft delete %s: %v", sandboxID, errDeletingStatus)
+		}
+		if ref != nil && strings.TrimSpace(ref.SnapshotID) != "" {
+			maybeFinalizeTombstone(ctx, ref.SnapshotID)
+		}
 		if errReleasingRefs != nil && errDeletingSpec != nil {
 			return errors.Join(errReleasingRefs, errDeletingSpec)
 		}
@@ -294,15 +497,44 @@ func configureSnapshotRuntimeRefHooks() {
 // still surface them here so future callers of the hook can react.
 func configureSandboxSpecHooks() {
 	sandbox.SetAfterCreateSandboxSuccessHook(func(ctx context.Context, sandboxID, hostID, hostIP string, req *sandboxtypes.CreateCubeSandboxReq) error {
-		return sandboxspec.Put(ctx, sandboxID, req, sandboxspec.PutOptions{
+		storedReq, err := cloneCreateRequest(req)
+		if err != nil {
+			return err
+		}
+		delete(storedReq.Annotations, sandbox.AnnotationPluginVolumeSources)
+		return sandboxspec.Put(ctx, sandboxID, storedReq, sandboxspec.PutOptions{
 			HostID: hostID,
 			HostIP: hostIP,
 		})
+	})
+	sandbox.SetTemplateQosLookupHook(func(ctx context.Context, templateID string) (*qos.Config, error) {
+		req, err := GetTemplateRequest(ctx, templateID)
+		if err != nil {
+			return nil, err
+		}
+		return qos.ParseAnnotations(
+			req.Annotations[constants.CubeAnnotationsNetWork],
+			req.Annotations[constants.CubeAnnotationsBlkQos],
+		)
 	})
 }
 
 func isReady() bool {
 	return store.db != nil
+}
+
+// IsReady reports whether the templatecenter store has been initialized.
+// Exported so the standalone CubeTemplateCenter process can use it in
+// its /health endpoint without probing via ListTemplates.
+func IsReady() bool {
+	return isReady()
+}
+
+// GetDB exposes the initialized gorm handle. The standalone
+// CubeTemplateCenter process needs it for the DB session locks used by its
+// background reconciler (design §7.2 / §9.3). Returns nil before Init.
+func GetDB() *gorm.DB {
+	return store.db
 }
 
 func NormalizeRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.CreateCubeSandboxReq, string, error) {
@@ -373,6 +605,10 @@ func normalizeStoredTemplateRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sa
 		return nil, err
 	}
 	delete(cloned.Annotations, constants.CubeAnnotationsAppSnapshotCreate)
+	// Runtime plugin metadata may contain opaque provider state. Persist only
+	// the stable volume IDs/mount declarations and resolve current metadata
+	// from t_cube_volume for every restore.
+	delete(cloned.Annotations, sandbox.AnnotationPluginVolumeSources)
 	cloned.SnapshotDir = ""
 	cloned.Timeout = nil
 	cloned.InsId = ""
@@ -442,7 +678,7 @@ func CreateTemplate(ctx context.Context, req *sandboxtypes.CreateCubeSandboxReq)
 	}
 	// The synchronous CreateCubeSandboxReq path carries no template alias (that
 	// is exclusive to CreateTemplateFromImageReq), so no alias is claimed here.
-	info, _, finalizeErr := finalizeTemplateReplicas(ctx, templateID, createReq.InstanceType, constants.GetAppSnapshotVersion(createReq.Annotations), "", replicas)
+	info, _, finalizeErr := finalizeTemplateReplicas(ctx, templateID, "", createReq.InstanceType, constants.GetAppSnapshotVersion(createReq.Annotations), replicas)
 	return info, finalizeErr
 }
 
@@ -456,6 +692,7 @@ func healthyTemplateNodes(instanceType string) []*node.Node {
 }
 
 func createTemplateReplicasOnNodes(ctx context.Context, templateID string, req *sandboxtypes.CreateCubeSandboxReq, targets []*node.Node, opts replicaRunOptions) ([]ReplicaStatus, error) {
+	targets = templateBuildTargets(storageBackendFromCreate(req), targets)
 	replicas := make([]ReplicaStatus, 0, len(targets))
 	envdVersions := make([]nodeEnvdVersion, 0, len(targets))
 	var lock sync.Mutex
@@ -540,6 +777,30 @@ func persistTemplateEnvdVersion(ctx context.Context, templateID, version string)
 	// Serialize the request_json read-modify-write against concurrent template
 	// request reads/writes for the same template to avoid a lost update.
 	return withTemplateWriteLock(templateID, func() error {
+		if rec, err := getSnapshotRecord(ctx, templateID); err == nil && rec != nil {
+			req, err := requestFromSnapshotJSON(rec.RequestJSON)
+			if err != nil {
+				return err
+			}
+			if req.Annotations == nil {
+				req.Annotations = make(map[string]string)
+			}
+			if req.Annotations[constants.CubeAnnotationComponentEnvdVersion] == version {
+				return nil
+			}
+			req.Annotations[constants.CubeAnnotationComponentEnvdVersion] = version
+			payload, err := json.Marshal(req)
+			if err != nil {
+				return err
+			}
+			if err := updateSnapshotFields(ctx, templateID, map[string]any{"request_json": string(payload)}); err != nil {
+				return err
+			}
+			templateDefinitionCache.Delete(templateID)
+			return nil
+		} else if err != nil && !errors.Is(err, ErrSnapshotNotFound) {
+			return err
+		}
 		def, err := GetDefinition(ctx, templateID)
 		if err != nil {
 			return err
@@ -598,6 +859,7 @@ func createReplicaOnNode(ctx context.Context, target *node.Node, req *sandboxtyp
 	rsp, err := cubelet.AppSnapshot(ctx, cubelet.GetCubeletAddr(target.HostIP()), &cubeboxv1.AppSnapshotRequest{
 		CreateRequest: cubeletReq,
 		SnapshotDir:   req.SnapshotDir,
+		Backend:       storageBackendFromCreate(nodeReq),
 	})
 	if err != nil {
 		replica.Phase = ReplicaPhaseFailed
@@ -669,7 +931,7 @@ func ensureRuntimeTemplateRequest(req *sandboxtypes.CreateCubeSandboxReq) {
 // already resolves — closing the create/claim publish-ordering race. The
 // returned claimWarning is non-empty when the alias could not be claimed for a
 // non-duplicate reason.
-func refreshTemplateReplicaSummary(ctx context.Context, templateID, alias string) (claimWarning string, err error) {
+func refreshTemplateReplicaSummary(ctx context.Context, templateID, jobID string) (claimWarning string, err error) {
 	replicas, err := ListReplicas(ctx, templateID)
 	if err != nil {
 		return "", err
@@ -679,14 +941,8 @@ func refreshTemplateReplicaSummary(ctx context.Context, templateID, alias string
 		current = append(current, replicaModelToStatus(replica))
 	}
 	status, lastError := summarizeStatus(current)
-	// NB: claimAliasForReadyTemplate and UpdateDefinitionStatus each use their own
-	// DB transaction. A crash between the two leaves the alias claimed but the
-	// status at its previous value — strictly safer than the reverse ordering, but
-	// not fully atomic.
-	if status != StatusFailed {
-		claimWarning, _ = claimAliasForReadyTemplate(ctx, templateID, alias)
-	}
-	if err := UpdateDefinitionStatus(ctx, templateID, status, lastError); err != nil {
+	_, claimWarning, err = publishTemplateStatusWithAlias(ctx, templateID, jobID, status, lastError)
+	if err != nil {
 		return "", err
 	}
 	localcache.InvalidateImageState(templateID)
@@ -697,8 +953,8 @@ func refreshTemplateReplicaSummary(ctx context.Context, templateID, alias string
 
 // createDefinitionWithOptions wraps createDefinitionTx in a real DB transaction
 // so the INSERT is atomic. Alias claiming is NOT done here — it happens
-// separately when the template reaches a non-FAILED status, before that status
-// is published (see claimAliasForReadyTemplate).
+// separately when the template reaches a non-FAILED status, as part of the
+// transaction that publishes that status.
 func createDefinitionWithOptions(ctx context.Context, templateID string, storedReq *sandboxtypes.CreateCubeSandboxReq, instanceType, version string, opts definitionCreateOptions) error {
 	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return createDefinitionTx(ctx, tx, templateID, storedReq, instanceType, version, opts)
@@ -709,7 +965,9 @@ func createDefinitionWithOptions(ctx context.Context, templateID string, storedR
 // wrapper around createDefinitionWithOptions for callers that don't set an
 // alias.
 func createDefinition(ctx context.Context, templateID string, storedReq *sandboxtypes.CreateCubeSandboxReq, instanceType, version string) error {
-	return createDefinitionWithOptions(ctx, templateID, storedReq, instanceType, version, definitionCreateOptions{})
+	return createDefinitionWithOptions(ctx, templateID, storedReq, instanceType, version, definitionCreateOptions{
+		StorageBackend: storageBackendFromCreate(storedReq),
+	})
 }
 
 // ensureTemplateDefinitionWithOptions checks whether a definition already exists
@@ -726,6 +984,8 @@ func ensureTemplateDefinitionWithOptions(ctx context.Context, templateID string,
 	if cacheErr := setTemplateRequestCache(templateID, storedReq); cacheErr != nil {
 		log.G(ctx).Warnf("set template request cache fail, template=%s err=%v", templateID, cacheErr)
 	}
+	// A new definition changes the aggregate list and the per-template info.
+	invalidateTemplateCaches(templateID)
 	return true, nil
 }
 
@@ -745,21 +1005,17 @@ func ensureTemplateDefinitionWithOptions(ctx context.Context, templateID string,
 // mutually-exclusive results: on success the alias is reflected in
 // TemplateInfo.DisplayName and the warning is empty; on a non-duplicate claim
 // failure the warning is set and DisplayName stays empty.
-func finalizeTemplateReplicas(ctx context.Context, templateID, instanceType, version, alias string, replicas []ReplicaStatus) (*TemplateInfo, string, error) {
+func finalizeTemplateReplicas(ctx context.Context, templateID, jobID, instanceType, version string, replicas []ReplicaStatus) (*TemplateInfo, string, error) {
 	setTemplateLocalityCache(templateID, replicas)
 	registerReadyTemplateReplicas(templateID, replicas)
+	// Replica/status changes alter both the per-template info (replica counts,
+	// status) and the aggregate list, so drop the query caches alongside the
+	// locality cache refresh above.
+	invalidateTemplateCaches(templateID)
 
 	status, lastError := summarizeStatus(replicas)
-	claimWarning := ""
-	displayName := ""
-	// NB: claimAliasForReadyTemplate and UpdateDefinitionStatus each use their own
-	// DB transaction. A crash between the two leaves the alias claimed but the
-	// status at its previous value — strictly safer than the reverse ordering, but
-	// not fully atomic.
-	if status != StatusFailed {
-		claimWarning, displayName = claimAliasForReadyTemplate(ctx, templateID, alias)
-	}
-	if err := UpdateDefinitionStatus(ctx, templateID, status, lastError); err != nil {
+	displayName, claimWarning, err := publishTemplateStatusWithAlias(ctx, templateID, jobID, status, lastError)
+	if err != nil {
 		return nil, "", err
 	}
 	info := &TemplateInfo{
@@ -794,16 +1050,31 @@ func UpdateDefinitionStatus(ctx context.Context, templateID, status, lastError s
 }
 
 func GetTemplateInfo(ctx context.Context, templateID string) (*TemplateInfo, error) {
-	def, err := GetDefinition(ctx, templateID)
-	if err != nil {
-		if !errors.Is(err, ErrTemplateNotFound) {
-			return nil, err
-		}
+	templateID = strings.TrimSpace(templateID)
+	if cached, ok := getCachedTemplateInfo(templateID); ok {
+		return cached, nil
+	}
+	return getTemplateInfoFromDB(ctx, templateID)
+}
+
+// getTemplateInfoFromDB is the uncached GetTemplateInfo implementation. Called
+// by GetTemplateInfo on a cache miss and by the backstop refresh goroutine.
+// Re-caches the result before returning so the next read hits the cache.
+func getTemplateInfoFromDB(ctx context.Context, templateID string) (*TemplateInfo, error) {
+	def, defErr := GetDefinition(ctx, templateID)
+	if defErr != nil && !errors.Is(defErr, ErrTemplateNotFound) {
+		return nil, defErr
+	}
+	if err := errIfHiddenSnapshot(ctx, templateID); err != nil {
+		return nil, err
+	}
+	if defErr != nil {
 		job, jobErr := getLatestTemplateImageJobByTemplateID(ctx, templateID)
 		if jobErr != nil {
-			return nil, err
+			return nil, defErr
 		}
 		info := templateInfoFromJob(job)
+		setTemplateInfoCache(templateID, &info)
 		return &info, nil
 	}
 	// Pause snaps are not user-visible templates/snapshots.
@@ -818,7 +1089,10 @@ func GetTemplateInfo(ctx context.Context, templateID string) (*TemplateInfo, err
 	out := &info
 	out.CreatedAt = formatUTCRFC3339(def.CreatedAt)
 	out.ImageInfo = extractImageInfoFromRequestJSON(def.RequestJSON)
-	if latestJob, jobErr := getLatestTemplateImageJobByTemplateID(ctx, templateID); jobErr == nil && latestJob != nil {
+	// Display fields come from the latest CREATE/REDO job only: a MIGRATE job
+	// carries no source image ref, and letting it win the attempt_no ordering
+	// would blank image_info right after `tpl merge`.
+	if latestJob, jobErr := getLatestCreateRedoImageJobByTemplateIDTx(store.db.WithContext(ctx), templateID); jobErr == nil && latestJob != nil {
 		out.ImageInfo = composeImageInfo(latestJob.SourceImageRef, latestJob.SourceImageDigest)
 		out.JobID = latestJobIDFromJob(latestJob)
 	}
@@ -843,6 +1117,7 @@ func GetTemplateInfo(ctx context.Context, templateID string) (*TemplateInfo, err
 		out.CubeEgressCATargetsWritten = artifact.CubeEgressCATargetsWritten
 		break
 	}
+	setTemplateInfoCache(templateID, out)
 	return out, nil
 }
 
@@ -857,7 +1132,7 @@ func templateInfoFromJob(job *models.TemplateImageJob) TemplateInfo {
 	if status == "" {
 		status = JobStatusPending
 	}
-	return TemplateInfo{
+	info := TemplateInfo{
 		TemplateID:   job.TemplateID,
 		InstanceType: job.InstanceType,
 		Version:      DefaultTemplateVersion,
@@ -867,6 +1142,41 @@ func templateInfoFromJob(job *models.TemplateImageJob) TemplateInfo {
 		ImageInfo:    composeImageInfo(job.SourceImageRef, job.SourceImageDigest),
 		JobID:        latestJobIDFromJob(job),
 	}
+	if job.RequestJSON != "" {
+		if job.Operation == JobOperationCommit {
+			// COMMIT jobs persist the sandbox create request, where template
+			// QoS is carried by the internal annotations rather than the public
+			// template-create qos field.
+			info.ConfiguredQos = configuredQosFromCreateRequestJSON(job.RequestJSON)
+		} else {
+			// CREATE and REDO jobs persist the public template-create request.
+			// LEGACY jobs decode through the same path; they predate the public
+			// qos field, so request.Qos is nil and ConfiguredQos stays unset.
+			request := &sandboxtypes.CreateTemplateFromImageReq{}
+			if err := json.Unmarshal([]byte(job.RequestJSON), request); err == nil {
+				info.ConfiguredQos = qos.Clone(request.Qos)
+			}
+		}
+	}
+	return info
+}
+
+func configuredQosFromCreateRequestJSON(raw string) *qos.Config {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	request := &sandboxtypes.CreateCubeSandboxReq{}
+	if err := json.Unmarshal([]byte(raw), request); err != nil || request.Annotations == nil {
+		return nil
+	}
+	configured, err := qos.ParseAnnotations(
+		request.Annotations[constants.CubeAnnotationsNetWork],
+		request.Annotations[constants.CubeAnnotationsBlkQos],
+	)
+	if err != nil {
+		return nil
+	}
+	return configured
 }
 
 func formatUTCRFC3339(ts time.Time) string {
@@ -980,88 +1290,268 @@ func ResolveTemplateIdentifier(ctx context.Context, identifier string) (string, 
 	return def.TemplateID, nil
 }
 
-// claimTemplateAlias atomically claims an alias for a template.
-//
-// requireReady=true is the operator SetTemplateAlias path (design §3.6 I2):
-// it MAY release the alias from any other holder (last-commit-wins transfer),
-// then claims the target only if status='READY'.
-//
-// requireReady=false is the create/redo finalize path: it MUST NOT release
-// other holders. If another template already occupies alias_key, the UPDATE
-// hits the unique index (1062/23505) and claimAliasForReadyTemplate treats
-// that as "READY without alias". Idempotent re-claim of an alias the target
-// already holds is confirmed via COUNT, not RowsAffected (MySQL rows-changed).
-func claimTemplateAlias(ctx context.Context, templateID, alias string, requireReady bool) error {
-	alias = strings.TrimSpace(alias)
-	if alias == "" {
+func claimTemplateAliasTx(tx *gorm.DB, templateID, alias string) error {
+	if err := tx.Table(constants.TemplateDefinitionTableName).
+		Where("alias_key = ? AND template_id <> ?", alias, templateID).
+		Update("display_name", "").Error; err != nil {
+		return fmt.Errorf("release stale alias %q fail: %w", alias, err)
+	}
+	if err := tx.Table(constants.TemplateDefinitionTableName).
+		Where("template_id = ? AND status = ?", templateID, StatusReady).
+		Update("display_name", alias).Error; err != nil {
+		return fmt.Errorf("claim alias %q for template %s fail: %w", alias, templateID, err)
+	}
+	var claimed int64
+	if err := tx.Table(constants.TemplateDefinitionTableName).
+		Where("template_id = ? AND alias_key = ? AND status = ?", templateID, alias, StatusReady).
+		Count(&claimed).Error; err != nil {
+		return fmt.Errorf("confirm alias claim for template %s fail: %w", templateID, err)
+	}
+	if claimed > 0 {
 		return nil
 	}
-	if !isReady() {
-		return ErrTemplateStoreNotInitialized
+	var exists int64
+	if err := tx.Table(constants.TemplateDefinitionTableName).
+		Where("template_id = ?", templateID).Count(&exists).Error; err != nil {
+		return fmt.Errorf("confirm existence for template %s fail: %w", templateID, err)
 	}
+	if exists > 0 {
+		return ErrTemplateNotReady
+	}
+	return ErrTemplateNotFound
+}
+
+func publishTemplateStatusWithAlias(ctx context.Context, templateID, jobID, status, lastError string) (displayName, claimWarning string, err error) {
+	if !isReady() {
+		return "", "", ErrTemplateStoreNotInitialized
+	}
+	alias := ""
+	claimantJobRowID := uint(0)
+	expectedStatus := ""
+	claimed := false
+	displacedTemplateID := ""
+	displacedHolderDeleting := false
+	claimWarning = ""
+	var claimErr error
+	run := func() error {
+		return retryOnceOnDeadlock(func() error {
+			alias = ""
+			claimantJobRowID = 0
+			expectedStatus = ""
+			claimed = false
+			displacedTemplateID = ""
+			displacedHolderDeleting = false
+			claimWarning = ""
+			claimErr = nil
+			return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				target, err := lockTemplateDefinitionTx(tx, templateID)
+				if err != nil {
+					return err
+				}
+				if target.Status == StatusDeleting {
+					return ErrTemplateNotFound
+				}
+				expectedStatus = target.Status
+				if jobID != "" {
+					job, err := getCreateRedoImageJobByIDTx(tx, templateID, jobID)
+					if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+						claimErr = err
+						return err
+					}
+					if err == nil {
+						claimantJobRowID = job.ID
+						alias = strings.TrimSpace(aliasFromRequestJSON(job.RequestJSON))
+						if strings.TrimSpace(target.DisplayName) != "" {
+							alias = strings.TrimSpace(target.DisplayName)
+						}
+					}
+				}
+				if status != StatusFailed && alias != "" {
+					claimResult, err := claimTemplateAliasByJobOrderTx(tx, templateID, claimantJobRowID, alias)
+					if err != nil {
+						claimErr = err
+						return err
+					}
+					claimed = claimResult.Claimed
+					displacedTemplateID = claimResult.DisplacedTemplateID
+					displacedHolderDeleting = claimResult.DisplacedHolderDeleting
+					claimWarning = claimResult.Warning
+				}
+				return tx.Table(constants.TemplateDefinitionTableName).
+					Where("template_id = ?", templateID).
+					Updates(map[string]any{
+						"status":     status,
+						"last_error": lastError,
+						"updated_at": time.Now(),
+					}).Error
+			})
+		})
+	}
+	err = run()
+	if err != nil && isDuplicateAliasError(err) {
+		err = run()
+	}
+	if err == nil {
+		invalidateTemplateAliasMutationCaches(templateID, displacedTemplateID)
+		if claimed {
+			if displacedTemplateID != "" {
+				// The DELETING branch never compares job order, so calling the
+				// released template a "newer template build" would assert an
+				// ordering that was never evaluated.
+				if displacedHolderDeleting {
+					log.G(ctx).Warnf("alias %q released from deleting template %s to template %s", alias, displacedTemplateID, templateID)
+				} else {
+					log.G(ctx).Warnf("alias %q transferred from template %s to newer template build %s", alias, displacedTemplateID, templateID)
+				}
+			}
+			return alias, claimWarning, nil
+		}
+		if claimWarning != "" {
+			log.G(ctx).Warnf("template %s is %s without alias %q: %s", templateID, status, alias, claimWarning)
+			return "", claimWarning, nil
+		}
+		if alias != "" && status != StatusFailed {
+			log.G(ctx).Infof("alias %q belongs to a newer template build; template %s is %s without alias", alias, templateID, status)
+		}
+		return "", "", nil
+	}
+	if claimErr == nil {
+		return "", "", err
+	}
+	if statusErr := publishTemplateStatusWithoutAlias(ctx, templateID, expectedStatus, status, lastError); statusErr != nil {
+		return "", "", statusErr
+	}
+	invalidateTemplateAliasMutationCaches(templateID, "")
+	if isDuplicateAliasError(claimErr) {
+		return "", "", nil
+	}
+	return "", fmt.Sprintf("template is ready but alias %q could not be claimed: %v", alias, claimErr), nil
+}
+
+func publishTemplateStatusWithoutAlias(ctx context.Context, templateID, expectedStatus, status, lastError string) error {
 	return retryOnceOnDeadlock(func() error {
 		return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			return claimTemplateAliasTx(tx, templateID, alias, requireReady)
+			target, err := lockTemplateDefinitionTx(tx, templateID)
+			if err != nil {
+				return err
+			}
+			if target.Status == StatusDeleting {
+				return ErrTemplateNotFound
+			}
+			if target.Status != expectedStatus {
+				return fmt.Errorf("template %s status changed from %s to %s while publishing without alias", templateID, expectedStatus, target.Status)
+			}
+			result := tx.Table(constants.TemplateDefinitionTableName).
+				Where("template_id = ? AND status = ?", templateID, expectedStatus).
+				Updates(map[string]any{
+					"status":     status,
+					"last_error": lastError,
+					"updated_at": time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			var published int64
+			if err := tx.Table(constants.TemplateDefinitionTableName).
+				Where("template_id = ? AND status <> ?", templateID, StatusDeleting).
+				Count(&published).Error; err != nil {
+				return err
+			}
+			if published == 0 {
+				return ErrTemplateNotFound
+			}
+			return nil
 		})
 	})
 }
 
-func claimTemplateAliasTx(tx *gorm.DB, templateID, alias string, requireReady bool) error {
-	// Status predicate for the claim/confirm. The shared create/redo path
-	// (claimAliasForReadyTemplate) only excludes DELETING — it legitimately
-	// claims at PARTIALLY_READY, before READY is published. The operator
-	// SetTemplateAlias path (requireReady) additionally requires READY so a
-	// target that starts rebuilding between GetDefinition and the claim can't
-	// receive an alias (design §3.5).
-	statusExpr := "status <> ?"
-	statusVal := StatusDeleting
-	if requireReady {
-		statusExpr = "status = ?"
-		statusVal = StatusReady
+type orderedAliasClaimResult struct {
+	Claimed                 bool
+	DisplacedTemplateID     string
+	DisplacedHolderDeleting bool
+	Warning                 string
+}
+
+func claimTemplateAliasByJobOrderTx(tx *gorm.DB, templateID string, claimantJobRowID uint, alias string) (orderedAliasClaimResult, error) {
+	var result orderedAliasClaimResult
+	holder := &models.TemplateDefinition{}
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Table(constants.TemplateDefinitionTableName).
+		Where("alias_key = ?", alias).
+		First(holder).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		update := tx.Table(constants.TemplateDefinitionTableName).
+			Where("template_id = ? AND status <> ?", templateID, StatusDeleting).
+			Update("display_name", alias)
+		if update.Error != nil {
+			return result, fmt.Errorf("claim alias %q for template %s fail: %w", alias, templateID, update.Error)
+		}
+		result.Claimed = update.RowsAffected > 0
+		return result, nil
 	}
-	// Release is operator-only. Create/redo must not clear a READY (or
-	// FAILED/DELETING) holder — uniqueness is enforced by alias_key.
-	if requireReady {
+	if err != nil {
+		return result, err
+	}
+	if holder.TemplateID == templateID {
+		result.Claimed = true
+		return result, nil
+	}
+	if holder.Status == StatusDeleting {
 		if err := tx.Table(constants.TemplateDefinitionTableName).
-			Where("alias_key = ? AND template_id <> ?",
-				alias, templateID).
+			Where("template_id = ? AND alias_key = ? AND status = ?", holder.TemplateID, alias, StatusDeleting).
 			Update("display_name", "").Error; err != nil {
-			return fmt.Errorf("release stale alias %q fail: %w", alias, err)
+			return result, fmt.Errorf("release alias %q from deleting template %s fail: %w", alias, holder.TemplateID, err)
 		}
+		if err := syncCreateRedoImageJobAliasTx(tx, holder.TemplateID, ""); err != nil {
+			return result, err
+		}
+		// The DELETING holder's display_name and job alias were cleared above,
+		// so it is a displaced holder regardless of whether the claimant ends
+		// up claiming the alias. Report it so the caller invalidates both IDs.
+		result.DisplacedTemplateID = holder.TemplateID
+		result.DisplacedHolderDeleting = true
+		update := tx.Table(constants.TemplateDefinitionTableName).
+			Where("template_id = ? AND status <> ?", templateID, StatusDeleting).
+			Update("display_name", alias)
+		if update.Error != nil {
+			return result, fmt.Errorf("claim alias %q for template %s fail: %w", alias, templateID, update.Error)
+		}
+		result.Claimed = update.RowsAffected > 0
+		return result, nil
+	}
+
+	// Order template generations globally by persisted row ID. The holder's
+	// newest generation is intentionally conservative even if it requested a
+	// different alias; alias-scoped or operator ordering needs persisted claim
+	// provenance rather than the per-template attempt number.
+	holderJob, err := getNewestCreateRedoImageJobByTemplateIDTx(tx, holder.TemplateID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		result.Warning = fmt.Sprintf("alias %q could not be ordered because holder template %s has no CREATE/REDO job metadata", alias, holder.TemplateID)
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	if claimantJobRowID <= holderJob.ID {
+		return result, nil
+	}
+
+	if err := tx.Table(constants.TemplateDefinitionTableName).
+		Where("template_id = ? AND alias_key = ?", holder.TemplateID, alias).
+		Update("display_name", "").Error; err != nil {
+		return result, fmt.Errorf("release alias %q from template %s fail: %w", alias, holder.TemplateID, err)
+	}
+	if err := syncCreateRedoImageJobAliasTx(tx, holder.TemplateID, ""); err != nil {
+		return result, err
 	}
 	if err := tx.Table(constants.TemplateDefinitionTableName).
-		Where(fmt.Sprintf("template_id = ? AND %s", statusExpr), templateID, statusVal).
+		Where("template_id = ? AND status <> ?", templateID, StatusDeleting).
 		Update("display_name", alias).Error; err != nil {
-		return fmt.Errorf("claim alias %q for template %s fail: %w", alias, templateID, err)
+		return result, fmt.Errorf("claim alias %q for template %s fail: %w", alias, templateID, err)
 	}
-	// Confirm the target still exists, holds the alias, and satisfies the
-	// status predicate. If it was hard-deleted / flipped to DELETING /
-	// (operator path) no longer READY between GetDefinition and this
-	// transaction, the confirm matches 0 rows and returning here rolls
-	// back the release so the original holder keeps its alias. A SELECT
-	// (not RowsAffected) avoids MySQL's rows-changed conflation.
-	var claimed int64
-	if err := tx.Table(constants.TemplateDefinitionTableName).
-		Where(fmt.Sprintf("template_id = ? AND alias_key = ? AND %s", statusExpr), templateID, alias, statusVal).
-		Count(&claimed).Error; err != nil {
-		return fmt.Errorf("confirm alias claim for template %s fail: %w", templateID, err)
-	}
-	if claimed == 0 {
-		// Operator path: distinguish "deleted" (404) from "exists but no
-		// longer READY" (409, retry once it rebuilds to READY).
-		if requireReady {
-			var exists int64
-			if err := tx.Table(constants.TemplateDefinitionTableName).
-				Where("template_id = ?", templateID).Count(&exists).Error; err != nil {
-				return fmt.Errorf("confirm existence for template %s fail: %w", templateID, err)
-			}
-			if exists > 0 {
-				return ErrTemplateNotReady
-			}
-		}
-		return ErrTemplateNotFound
-	}
-	return nil
+	result.Claimed = true
+	result.DisplacedTemplateID = holder.TemplateID
+	return result, nil
 }
 
 func lockTemplateDefinitionTx(tx *gorm.DB, templateID string) (*models.TemplateDefinition, error) {
@@ -1079,15 +1569,41 @@ func lockTemplateDefinitionTx(tx *gorm.DB, templateID string) (*models.TemplateD
 	return def, nil
 }
 
+// getTemplateByAliasTx resolves the current alias holder, excluding DELETING
+// templates: read paths (sandbox create by alias, detail/list display) must
+// never treat a template that is being deleted as the alias holder.
 func getTemplateByAliasTx(tx *gorm.DB, alias string) (*models.TemplateDefinition, error) {
+	return getTemplateByAliasFilteredTx(tx, alias, true)
+}
+
+// getTemplateByAliasAnyStatusTx resolves the alias holder without filtering
+// DELETING rows. Alias writes release the previous holder by alias_key alone
+// (claimTemplateAliasTx matches every row whose alias_key matches, with no
+// status predicate), so callers that must invalidate the displaced holder need
+// this unfiltered view: getTemplateByAliasTx would report "not found" for a
+// DELETING holder and silently skip invalidating a row that the write did
+// mutate.
+func getTemplateByAliasAnyStatusTx(tx *gorm.DB, alias string) (*models.TemplateDefinition, error) {
+	return getTemplateByAliasFilteredTx(tx, alias, false)
+}
+
+// getTemplateByAliasFilteredTx is the shared implementation behind both alias
+// lookups. They differ only in whether DELETING rows are excluded — the
+// distinction between "who currently holds this alias" (reads) and "which rows
+// an alias write actually mutated" (cache invalidation). Rows are matched by
+// alias_key, not display_name, because alias_key is the unique constraint the
+// write path actually updates.
+func getTemplateByAliasFilteredTx(tx *gorm.DB, alias string, excludeDeleting bool) (*models.TemplateDefinition, error) {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		return nil, ErrTemplateNotFound
 	}
+	query := tx.Table(constants.TemplateDefinitionTableName).Where("alias_key = ?", alias)
+	if excludeDeleting {
+		query = query.Where("status <> ?", StatusDeleting)
+	}
 	def := &models.TemplateDefinition{}
-	err := tx.Table(constants.TemplateDefinitionTableName).
-		Where("alias_key = ? AND status <> ?", alias, StatusDeleting).
-		First(def).Error
+	err := query.First(def).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrTemplateNotFound
@@ -1105,25 +1621,24 @@ func isDuplicateAliasError(err error) bool {
 	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
 		return true
 	}
-	// pgconn.PgError has Code == "23505" for unique_violation. We check via
-	// string matching on the error message as a fallback because the pgx
-	// driver may not be imported in all build configurations.
-	s := err.Error()
-	return strings.Contains(s, "23505") || strings.Contains(s, "unique_constraint")
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // isDeadlockError reports transient lock errors worth one retry in the alias
 // release+claim transaction: InnoDB deadlock (1213) / lock-wait-timeout (1205),
 // and the PostgreSQL equivalents 40P01 (deadlock_detected) / 55P03
-// (lock_not_available). PG codes are string-matched like isDuplicateAliasError
-// because pgx may not be imported in all build configurations.
+// (lock_not_available).
 func isDeadlockError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1205 || mysqlErr.Number == 1213) {
 		return true
 	}
-	s := err.Error()
-	return strings.Contains(s, "40P01") || strings.Contains(s, "55P03")
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "40P01" || pgErr.Code == "55P03"
 }
 
 func retryOnceOnDeadlock(run func() error) error {
@@ -1141,31 +1656,6 @@ func retryOnceOnDeadlock(run func() error) error {
 // HTTP 409 / RetCode=ErrorCode_Conflict without duplicating the driver
 // detection logic. See design §3.3.
 func IsDuplicateAliasError(err error) bool { return isDuplicateAliasError(err) }
-
-// claimAliasForReadyTemplate is the shared alias-claim helper used by both the
-// image-job and redo paths. It is called for a template that has reached a
-// non-FAILED status, and — per the create/claim ordering fix — runs *before*
-// that status is published, so a client that later observes READY is guaranteed
-// the alias already resolves. Returns a warning string (non-empty only if the
-// claim failed for a non-duplicate reason) and the claimed DisplayName
-// (the alias itself on success); the two are mutually exclusive.
-func claimAliasForReadyTemplate(ctx context.Context, templateID, alias string) (claimWarning, displayName string) {
-	alias = strings.TrimSpace(alias)
-	if alias == "" {
-		return "", ""
-	}
-	if claimErr := claimTemplateAlias(ctx, templateID, alias, false); claimErr != nil {
-		if isDuplicateAliasError(claimErr) {
-			log.G(ctx).Infof("alias %q concurrently claimed by another template; template %s is READY without alias", alias, templateID)
-			return "", ""
-		}
-		log.G(ctx).Warnf("claim alias %q for template %s fail: %v", alias, templateID, claimErr)
-		return fmt.Sprintf("template is ready but alias %q could not be claimed: %v", alias, claimErr), ""
-	}
-	// The claim just wrote display_name = alias, so the claimed display name is
-	// the alias itself — no read-back needed.
-	return "", alias
-}
 
 // SetTemplateAlias atomically sets, transfers, or clears the alias (display_name)
 // of an existing template-kind definition.
@@ -1225,7 +1715,9 @@ func setTemplateAliasLocked(ctx context.Context, templateID, alias string) error
 	if !isReady() {
 		return ErrTemplateStoreNotInitialized
 	}
-	return retryOnceOnDeadlock(func() error {
+	oldHolderToInvalidate := ""
+	err := retryOnceOnDeadlock(func() error {
+		oldHolderToInvalidate = ""
 		return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			def, err := lockTemplateDefinitionTx(tx, templateID)
 			if err != nil {
@@ -1255,12 +1747,12 @@ func setTemplateAliasLocked(ctx context.Context, templateID, alias string) error
 				return ErrTemplateNotReady
 			}
 			oldHolder := ""
-			if cur, err := getTemplateByAliasTx(tx, alias); err == nil && cur != nil && cur.TemplateID != templateID {
+			if cur, err := getTemplateByAliasAnyStatusTx(tx, alias); err == nil && cur != nil && cur.TemplateID != templateID {
 				oldHolder = cur.TemplateID
 			} else if err != nil && !errors.Is(err, ErrTemplateNotFound) {
 				return err
 			}
-			if err := claimTemplateAliasTx(tx, templateID, alias, true); err != nil {
+			if err := claimTemplateAliasTx(tx, templateID, alias); err != nil {
 				return err
 			}
 			if err := syncCreateRedoImageJobAliasTx(tx, templateID, alias); err != nil {
@@ -1270,10 +1762,16 @@ func setTemplateAliasLocked(ctx context.Context, templateID, alias string) error
 				if err := syncCreateRedoImageJobAliasTx(tx, oldHolder, ""); err != nil {
 					return err
 				}
+				oldHolderToInvalidate = oldHolder
 			}
 			return nil
 		})
 	})
+	if err != nil {
+		return err
+	}
+	invalidateTemplateAliasMutationCaches(templateID, oldHolderToInvalidate)
+	return nil
 }
 
 // applyAliasToRequestJSON returns payload with its "alias" field set to alias
@@ -1315,36 +1813,6 @@ func aliasFromRequestJSON(payload string) string {
 	}
 	a, _ := m["alias"].(string)
 	return a
-}
-
-// currentJobAlias re-reads the alias from the image job's stored RequestJSON.
-// Returns ok=false only on a read failure so finalize can skip claim (design
-// §3.6); a successfully-read "" is a real "cleared". Callers MUST NOT fall
-// back to a submit-time frozen alias when ok is false.
-func currentJobAlias(ctx context.Context, jobID string) (string, bool) {
-	job, err := getTemplateImageJobRecordByID(ctx, jobID)
-	if err != nil || job == nil {
-		return "", false
-	}
-	return aliasFromRequestJSON(job.RequestJSON), true
-}
-
-// aliasToClaimAtFinalize is the create/redo finalize alias (design §3.6):
-//  1. currentJobAlias ok=false → skip claim (empty)
-//  2. definition.DisplayName nonempty → claim DisplayName (covers operator SET
-//     during an in-flight redo; does NOT cover CLEAR)
-//  3. otherwise claim the job alias (first create, or operator CLEAR that
-//     already synced RequestJSON to "")
-func aliasToClaimAtFinalize(ctx context.Context, templateID, jobID string) string {
-	jobAlias, ok := currentJobAlias(ctx, jobID)
-	if !ok {
-		return ""
-	}
-	def, err := GetDefinition(ctx, templateID)
-	if err == nil && strings.TrimSpace(def.DisplayName) != "" {
-		return strings.TrimSpace(def.DisplayName)
-	}
-	return jobAlias
 }
 
 // syncCreateRedoImageJobAliasTx writes the operator alias into every CREATE
@@ -1389,6 +1857,34 @@ func GetTemplateRequest(ctx context.Context, templateID string) (*sandboxtypes.C
 		var req *sandboxtypes.CreateCubeSandboxReq
 		err := withTemplateReadLock(templateID, func() error {
 			dbStart := time.Now()
+			if rec, snapErr := getSnapshotRecord(ctx, templateID); snapErr == nil && rec != nil {
+				if snapshotRejectsNewUse(rec.Status) {
+					return ErrTemplateNotFound
+				}
+				reportTemplateMetric(ctx, constants.MySQL, store.dbAddr, constants.ActionTemplateGetDefinition, time.Since(dbStart), 0)
+				parsed, err := requestFromSnapshotJSON(rec.RequestJSON)
+				if err != nil {
+					return err
+				}
+				req = parsed
+				// Stamp the snapshot's display_name as the alias, replacing the
+				// source template's inherited one.
+				delete(req.Labels, constants.CubeAnnotationAppSnapshotTemplateAlias)
+				if name := strings.TrimSpace(rec.DisplayName); name != "" {
+					req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias] = name
+				} else {
+					delete(req.Annotations, constants.CubeAnnotationAppSnapshotTemplateAlias)
+				}
+				if err = applyStoredCreateBackend(req, rec.Backend); err != nil {
+					return err
+				}
+				if err = setTemplateRequestCache(templateID, req); err != nil {
+					log.G(ctx).Warnf("set snapshot request cache fail, snapshot=%s err=%v", templateID, err)
+				}
+				return nil
+			} else if snapErr != nil && !errors.Is(snapErr, ErrSnapshotNotFound) {
+				return snapErr
+			}
 			def, err := GetDefinition(ctx, templateID)
 			reportTemplateMetric(ctx, constants.MySQL, store.dbAddr, constants.ActionTemplateGetDefinition, time.Since(dbStart), 0)
 			if err != nil {
@@ -1401,7 +1897,17 @@ func GetTemplateRequest(ctx context.Context, templateID string) (*sandboxtypes.C
 			if req.Annotations == nil {
 				req.Annotations = make(map[string]string)
 			}
+			// Carry the alias on the cached request so later hits need no extra lookup.
+			if alias := strings.TrimSpace(def.DisplayName); alias != "" {
+				req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias] = alias
+			} else {
+				delete(req.Annotations, constants.CubeAnnotationAppSnapshotTemplateAlias)
+				delete(req.Labels, constants.CubeAnnotationAppSnapshotTemplateAlias)
+			}
 			constants.NormalizeAppSnapshotAnnotations(req.Annotations)
+			if err = applyStoredCreateBackend(req, def.StorageBackend); err != nil {
+				return err
+			}
 			if err = setTemplateRequestCache(templateID, req); err != nil {
 				log.G(ctx).Warnf("set template request cache fail, template=%s err=%v", templateID, err)
 			}
@@ -1436,6 +1942,55 @@ func ListReplicas(ctx context.Context, templateID string) ([]models.TemplateRepl
 		Where("template_id = ?", templateID).
 		Order("node_id asc").Find(&replicas).Error
 	return replicas, err
+}
+
+// maxListReplicasBatchSize bounds the IN predicate below: MySQL prepared
+// statements cap placeholders at 65535, so ids are queried in chunks.
+const maxListReplicasBatchSize = 1000
+
+// ListReplicasForTemplates returns replicas grouped by templateID via
+// chunked IN queries; any batch failure aborts with that error.
+func ListReplicasForTemplates(ctx context.Context, templateIDs []string) (map[string][]ReplicaStatus, error) {
+	if !isReady() {
+		return nil, ErrTemplateStoreNotInitialized
+	}
+	ids := dedupeTemplateIDs(templateIDs)
+	out := make(map[string][]ReplicaStatus, len(ids))
+	for start := 0; start < len(ids); start += maxListReplicasBatchSize {
+		end := start + maxListReplicasBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		var replicas []models.TemplateReplica
+		err := store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
+			Where("template_id IN ?", batch).
+			Order("template_id asc, node_id asc").Find(&replicas).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, replica := range replicas {
+			out[replica.TemplateID] = append(out[replica.TemplateID], replicaModelToStatus(replica))
+		}
+	}
+	return out, nil
+}
+
+// dedupeTemplateIDs removes duplicate ids while preserving first-seen order.
+func dedupeTemplateIDs(templateIDs []string) []string {
+	seen := make(map[string]struct{}, len(templateIDs))
+	out := make([]string, 0, len(templateIDs))
+	for _, id := range templateIDs {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func normalizeComponentVersion(value string) string {
@@ -1482,42 +2037,24 @@ func normalizeCompatPolicy(policy string) string {
 	}
 }
 
-func compareCompatDimension(bound, current string) (stale bool, unknown bool) {
-	bound = normalizeComponentVersion(bound)
-	current = normalizeComponentVersion(current)
-	if bound == "" || current == "" {
-		return false, true
-	}
-	return bound != current, false
+// hasRestorePin reports whether the replica froze guest-image, cube-agent,
+// kernel, and cube-shim. guest-image and cube-agent alone were already stored
+// for the 0.4.0 compat matrix; without kernel and shim the replica was not
+// created with component multi-version restore, and create would follow live
+// toolbox paths for those components.
+func hasRestorePin(replica ReplicaStatus) bool {
+	guest := normalizeComponentVersion(replica.GuestImageVersion)
+	agent := normalizeComponentVersion(replica.AgentVersion)
+	kernel := normalizeComponentVersion(replica.KernelVersion)
+	shim := normalizeComponentVersion(replica.ShimVersion)
+	return guest != "" && agent != "" && kernel != "" && shim != ""
 }
 
-func evaluateCompat(replica ReplicaStatus, currentGuestImage, currentAgent, _ string) string {
-	policy := normalizeCompatPolicy(replica.CompatPolicy)
-	dimensions := []struct {
-		bound   string
-		current string
-		active  bool
-	}{
-		{replica.GuestImageVersion, currentGuestImage, true},
-		{replica.AgentVersion, currentAgent, policy != CompatPolicyGuestOnly},
+func evaluateCompat(replica ReplicaStatus, _, _, _ string) string {
+	if hasRestorePin(replica) {
+		return CompatStatusOK
 	}
-	seenUnknown := false
-	for _, dim := range dimensions {
-		if !dim.active {
-			continue
-		}
-		stale, unknown := compareCompatDimension(dim.bound, dim.current)
-		if stale {
-			return CompatStatusStale
-		}
-		if unknown {
-			seenUnknown = true
-		}
-	}
-	if seenUnknown {
-		return CompatStatusUnknown
-	}
-	return CompatStatusOK
+	return CompatStatusUnknown
 }
 
 func isReplicaSchedulable(replica ReplicaStatus) bool {
@@ -1525,8 +2062,8 @@ func isReplicaSchedulable(replica ReplicaStatus) bool {
 }
 
 // bindGuestVersionToReplica records pin versions on the replica. CompatStatus
-// still compares guest[+agent] only; kernel/shim are stored for create inject
-// and do not participate in evaluateCompat.
+// is OK only when guest, agent, kernel, and shim are all pinned so live
+// toolbox drift does not mark a multi-version replica as needing rebuild.
 func bindGuestVersionToReplica(replica *ReplicaStatus, guestImageVersion, agentVersion, kernelVersion, shimVersion string) {
 	if replica == nil {
 		return
@@ -1868,13 +2405,27 @@ func applyTemplateRequest(templateReq, reqInOut *sandboxtypes.CreateCubeSandboxR
 	}
 	reqInOut.Volumes = append(reqInOut.Volumes, templateReq.Volumes...)
 	for i, templateCtr := range templateReq.Containers {
+		if templateCtr == nil {
+			continue
+		}
 		if len(reqInOut.Containers) <= i {
 			reqInOut.Containers = append(reqInOut.Containers, templateCtr)
 			continue
 		}
 		if reqInOut.Containers[i] == nil {
 			reqInOut.Containers[i] = templateCtr
+			continue
 		}
+		ctr := reqInOut.Containers[i]
+		if ctr.LivenessProbe == nil {
+			ctr.LivenessProbe = templateCtr.LivenessProbe
+		}
+	}
+	if reqInOut.RestartPolicy == "" {
+		reqInOut.RestartPolicy = templateReq.RestartPolicy
+	}
+	if reqInOut.RestartBackoff == nil {
+		reqInOut.RestartBackoff = templateReq.RestartBackoff
 	}
 	if reqInOut.NetworkType == "" {
 		reqInOut.NetworkType = templateReq.NetworkType

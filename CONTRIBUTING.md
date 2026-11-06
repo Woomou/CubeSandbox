@@ -44,9 +44,7 @@ Cube Sandbox provides a Docker-based builder image for a consistent build enviro
 # Build the builder image
 make builder-image
 
-# From mainland China, source apt packages from China-reachable mirrors: the
-# Ubuntu apt archive plus the llvm.sh installer and clang-14 packages (the LLVM
-# GPG key still comes from apt.llvm.org)
+# From mainland China, source apt packages from China-reachable mirrors
 make builder-image MIRROR=cn
 
 # Start an interactive shell inside the builder
@@ -60,6 +58,9 @@ make cubemaster
 make cubelet
 make agent
 make shim
+
+# Remove local Go/Rust build artifacts (not global caches)
+make clean
 ```
 
 See the [Makefile](./Makefile) for the full list of build targets.

@@ -16,9 +16,10 @@ How it works:
 
 import os
 from e2b_code_interpreter import Sandbox
-from env_utils import load_local_dotenv
+from env_utils import ensure_dev_sidecar, load_local_dotenv
 
 load_local_dotenv()
+ensure_dev_sidecar()
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
 
@@ -30,7 +31,7 @@ with Sandbox.create(
     result = sandbox.commands.run(
         "curl -s --max-time 3 https://example.com -o /dev/null -w '%{http_code}' || echo 'blocked'"
     )
-    print("internet access blocked:", result.stdout.strip() == "blocked" or result.exit_code != 0)
+    print("internet access blocked:", "blocked" in result.stdout or result.exit_code != 0)
 
     # Internal sandbox logic still works normally
     result = sandbox.commands.run("echo 'isolated execution ok'")

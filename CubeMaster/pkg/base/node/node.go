@@ -30,6 +30,16 @@ type HostFacts struct {
 	KVMModuleTaint        string `json:"kvm_module_taint,omitempty"`
 }
 
+// IsZero reports whether no meaningful host fact was collected.
+func (f *HostFacts) IsZero() bool {
+	if f == nil {
+		return true
+	}
+	return f.CPUVendor == "" && f.CPUModel == "" && f.CPUIDHash == "" &&
+		f.HostKernelRelease == "" && f.HostKernelFingerprint == "" && f.KVMAPIVersion == 0 &&
+		f.KVMModuleFingerprint == "" && f.KVMModuleTaint == ""
+}
+
 type Node struct {
 	Index int    `json:"Index,omitempty"`
 	InsID string `json:"InstanceID,omitempty"`
@@ -69,7 +79,7 @@ type Node struct {
 
 	MetaDataUpdateAt time.Time `json:"MetaDataUpdateAt,omitempty"`
 
-	ReportedReady bool `json:"-"`
+	ReportedReady bool `json:"ReportedReady,omitempty"`
 
 	Healthy bool `json:"Healthy"`
 
@@ -100,9 +110,16 @@ type Node struct {
 	RealTimeCreateNum int64 `json:"RealTimeCreateNum,omitempty"`
 
 	LocalCreateNum int64 `json:"LocalCreateNum,omitempty"`
-	NicQueues      int64 `json:"nic_queues,omitempty"`
 
-	NodeLabels map[string]string `json:"NodeLabels,omitempty"`
+	NicQueues int64 `json:"nic_queues,omitempty"`
+
+	NodeLabels     map[string]string `json:"NodeLabels,omitempty"`
+	LocalTemplates []string          `json:"LocalTemplates,omitempty"`
+
+	// Versions carries the real version of each component installed on the
+	// node. Populated by CubeOps /internal/v1/nodes; consumed by templatecenter
+	// compat scan via localcache.GetNode.
+	Versions []ComponentVersion `json:"Versions,omitempty"`
 
 	// HostFacts carries the host-level identity (CPU feature set, host kernel,
 	// KVM ABI) used for cross-node snapshot restore compatibility. A local copy
@@ -190,16 +207,30 @@ func (n *Node) Clone() *Node {
 		return nil
 	}
 	// Clone provides a best-effort read-side snapshot. Mutable counters such
-	// as LocalCreateNum and schedulingDisabled are refreshed via atomic loads
-	// after the structural copy so cloned read models stay aligned with the
-	// write path under concurrent updates.
+	// such as LocalCreateNum and schedulingDisabled are read
+	// atomically. Fields are copied explicitly so the atomic noCopy marker is
+	// never copied by value.
 	localCreateNum := atomic.LoadInt64(&n.LocalCreateNum)
 	schedulingDisabled := n.SchedulingDisabled()
-	cloned := *n
-	cloned.LocalCreateNum = localCreateNum
-	cloned.schedulingDisabled = atomic.Bool{}
+	cloned := &Node{
+		Index: n.Index, InsID: n.InsID, UUID: n.UUID, IP: n.IP,
+		CpuTotal: n.CpuTotal, MemMBTotal: n.MemMBTotal, Zone: n.Zone, Region: n.Region,
+		SystemDiskSize: n.SystemDiskSize, DataDiskSize: n.DataDiskSize,
+		CPUType: n.CPUType, ClusterLabel: n.ClusterLabel, InstanceType: n.InstanceType,
+		OssClusterLabel: n.OssClusterLabel, DeviceClass: n.DeviceClass, DeviceID: n.DeviceID,
+		MachineHostIP: n.MachineHostIP, InstanceFamily: n.InstanceFamily,
+		DedicatedClusterId: n.DedicatedClusterId, HostStatus: n.HostStatus,
+		CreateConcurrentNum: n.CreateConcurrentNum, MaxMvmLimit: n.MaxMvmLimit,
+		QuotaCpu: n.QuotaCpu, QuotaMem: n.QuotaMem, MetaDataUpdateAt: n.MetaDataUpdateAt,
+		ReportedReady: n.ReportedReady, Healthy: n.Healthy, UnhealthyReason: n.UnhealthyReason,
+		Score: n.Score, QuotaCpuUsage: n.QuotaCpuUsage, QuotaMemUsage: n.QuotaMemUsage,
+		CpuUtil: n.CpuUtil, CpuLoadUsage: n.CpuLoadUsage, MemUsage: n.MemUsage,
+		DataDiskUsagePer: n.DataDiskUsagePer, StorageDiskUsagePer: n.StorageDiskUsagePer,
+		SysDiskUsagePer: n.SysDiskUsagePer, MvmNum: n.MvmNum, MetricUpdate: n.MetricUpdate,
+		MetricLocalUpdateAt: n.MetricLocalUpdateAt, RealTimeCreateNum: n.RealTimeCreateNum,
+		LocalCreateNum: localCreateNum, NicQueues: n.NicQueues,
+	}
 	cloned.SetSchedulingDisabled(schedulingDisabled)
-	cloned.labelsCache = nil
 	if n.VirtualNodeQuotaArray != nil {
 		cloned.VirtualNodeQuotaArray = append([]int64(nil), n.VirtualNodeQuotaArray...)
 	}
@@ -209,11 +240,17 @@ func (n *Node) Clone() *Node {
 			cloned.NodeLabels[k] = v
 		}
 	}
+	if n.LocalTemplates != nil {
+		cloned.LocalTemplates = append([]string(nil), n.LocalTemplates...)
+	}
 	if n.HostFacts != nil {
 		hf := *n.HostFacts
 		cloned.HostFacts = &hf
 	}
-	return &cloned
+	if n.Versions != nil {
+		cloned.Versions = append([]ComponentVersion(nil), n.Versions...)
+	}
+	return cloned
 }
 
 func (n *Node) labelsCacheStore() *nodeLabelsCacheStore {
@@ -435,4 +472,17 @@ func (l NodeScoreList) AllSortByScore() NodeScoreList {
 		return l[i].Score > l[j].Score
 	})
 	return l
+}
+
+// ComponentVersion carries the real version of one component installed on a
+// node. Mirrors CubeOps model.ComponentVersion and Cubelet-side
+// masterclient.ComponentVersion. JSON tags match CubeOps SchedulerNode.Versions
+// so data flows CubeOps → localcache without translation.
+type ComponentVersion struct {
+	Component string `json:"component"`
+	Version   string `json:"version,omitempty"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Variant   string `json:"variant,omitempty"`
 }

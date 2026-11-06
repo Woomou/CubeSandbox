@@ -10,11 +10,11 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 type Config struct {
@@ -44,6 +44,11 @@ func (l *local) Init(ctx context.Context, opts *workflow.InitInfo) error {
 func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error {
 	if opts == nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "opts nil")
+	}
+
+	// A restart already knows its sandbox ID. Do not mint a new one.
+	if workflow.ReuseFor(opts).CubeboxMeta && opts.SandboxID != "" {
+		return nil
 	}
 
 	// Resume-from-pause (and other same-ID recreate paths) pass an explicit

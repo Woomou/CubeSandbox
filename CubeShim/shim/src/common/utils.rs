@@ -341,6 +341,12 @@ impl Utils {
             Err(e) => Err(format!("resolve ivshmem path failed:{}", e)),
         };
 
+        // Regular-sandbox host logs. Template builds write under
+        // /data/log/template and never create this dir, so this is a no-op
+        // for app_snapshot_create. Task.Delete on a live shim is not enough:
+        // after a crash containerd reaps via the delete subcommand.
+        let ret_logdir = crate::container::remove_sandbox_log_dir_sync(sandbox_id);
+
         let mut err_msg = String::new();
         if let Err(e) = ret_vmdir {
             err_msg = err_msg + e.as_str();
@@ -351,6 +357,10 @@ impl Utils {
         }
 
         if let Err(e) = ret_ivshmem {
+            err_msg = err_msg + e.as_str();
+        }
+
+        if let Err(e) = ret_logdir {
             err_msg = err_msg + e.as_str();
         }
 
@@ -516,7 +526,25 @@ impl Utils {
 impl AsyncUtils {
     pub const PASSFD_LISTENER_PORT: u32 = 1027;
 
+    /// Bound for the vsock CONNECT/OK handshake; bounds the handshake only,
+    /// not how long a guest takes to boot.
+    pub const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub async fn connect_agent(sandbox_id: &String) -> CResult<Client> {
+        tokio::time::timeout(
+            Self::AGENT_CONNECT_TIMEOUT,
+            Self::connect_agent_inner(sandbox_id),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "connect agent timed out after {}s",
+                Self::AGENT_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn connect_agent_inner(sandbox_id: &String) -> CResult<Client> {
         let addr = Utils::vsock_path(sandbox_id);
 
         let mut stream = UnixStream::connect(&addr)

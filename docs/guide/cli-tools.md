@@ -8,11 +8,12 @@ Use these tools from trusted operator machines only. They bypass the public Cube
 
 | Tool | Run From | Talks To | Main Use |
 |------|----------|----------|----------|
-| `cubemastercli` | Control node, jumpserver, or any host that can reach CubeMaster | CubeMaster HTTP API, default port `8089` | Cluster-wide sandbox, node, template, snapshot, and volume operations |
+| `cubemastercli` | Control node, jumpserver, or any host that can reach CubeMaster | CubeMaster HTTP API, default port `8089` | Cluster-wide sandbox, template, snapshot, and volume operations |
+| `cubeopscli` | Control node, jumpserver, or any host that can reach CubeOps | CubeOps HTTP API, default port `3010` | Node list, isolate/unisolate, delete node |
 | `cubecli` | The compute node that runs Cubelet and containerd | Local Cubelet/containerd state | Per-node sandbox/container inspection, container shell, logs, storage cleanup, local runtime debugging |
 | `cube-runtime` | The compute node that hosts the sandbox MVM | Local CubeShim hybrid-vsock/debug console | Enter the guest MVM or run low-level VM snapshot helpers |
 
-The one-click installer creates `/usr/local/bin` symlinks for `cube-runtime`, `containerd-shim-cube-rs`, and `cubecli`. `cubemastercli` is included in the release package and is installed on the Terraform jumpserver.
+The one-click installer creates `/usr/local/bin` symlinks for `cube-runtime`, `containerd-shim-cube-rs`, `cubecli`, `cubemastercli`, and `cubeopscli`. `cubemastercli` and `cubeopscli` are included in the release package and installed on the Terraform jumpserver.
 
 ## `cubemastercli`
 
@@ -26,9 +27,6 @@ cubemastercli --address <cubemaster-host> --port 8089 version
 Common cluster checks:
 
 ```bash
-# List all nodes and their health/scheduling status.
-cubemastercli --address <cubemaster-host> --port 8089 node list
-
 # List all sandboxes known to CubeMaster.
 cubemastercli --address <cubemaster-host> --port 8089 list --all
 
@@ -56,7 +54,17 @@ cubemastercli --address <cubemaster-host> --port 8089 tpl create-from-image \
   --writable-layer-size 1G \
   --expose-port 49983 \
   --probe 49983
+
+# Migrate a READY template artifact into TC-managed storage.
+# Typical case: historical artifacts still live on local disk and the cluster later enables s3Backed=true.
+cubemastercli --address <cubemaster-host> --port 8089 tpl merge <template-id>
+
+# If the same maintenance also needs to repopulate nodes, run redo after merge.
+# Redo handles node-side redistribution and may rebuild when the old artifact is no longer reusable.
+cubemastercli --address <cubemaster-host> --port 8089 tpl redo --template-id <template-id>
 ```
+
+For historical image-based templates, keep the wording consistent in runbooks: **`tpl merge` solves historical artifact storage convergence, while `tpl redo` solves node-side redistribution / rebuild when needed.** The common scenario is enabling `s3Backed=true` after templates already exist on CubeMaster local disk; `tpl merge` moves those legacy artifacts into S3-backed storage, and `tpl redo` is only needed if you also want to repopulate target nodes.
 
 Destructive operations should be used carefully:
 
@@ -66,6 +74,26 @@ cubemastercli --address <cubemaster-host> --port 8089 cubebox destroy <sandbox-i
 ```
 
 For multi-node deployment and template distribution context, see [Multi-Node Cluster](./multi-node-deploy.md).
+
+## `cubeopscli`
+
+`cubeopscli` is the node management CLI. It targets CubeOps, so commands need `--address` and `--port` unless running on a host where the defaults are correct.
+
+```bash
+cubeopscli --address <cubeops-host> --port 3010 node list
+cubeopscli --address <cubeops-host> --port 3010 node isolate <node-id>
+cubeopscli --address <cubeops-host> --port 3010 node unisolate <node-id>
+cubeopscli --address <cubeops-host> --port 3010 node delete <node-id>
+cubeopscli --version
+cubeopscli version
+cubeopscli version --versiononly
+```
+
+Deleting a node requires it to be **isolated and free of sandboxes**; in a batch, a failure on one node does not stop the rest, and the command exits non-zero if any deletion fails. `delete` is aliased as `rm`; use `--force` to delete when the sandbox inventory cannot be verified (isolation is still required).
+
+`cubeopscli --version` and `cubeopscli version` print the release version (e.g. `cubeopscli v0.7.0 (<commit>) built at <timestamp>`); `cubeopscli version --versiononly` prints just the semantic version.
+
+For adding, isolating, and deleting nodes, see [Node Operations](./node-operations.md).
 
 ## `cubecli`
 

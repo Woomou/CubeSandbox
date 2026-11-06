@@ -20,7 +20,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fmt, fs};
 
 use once_cell::sync::Lazy;
@@ -652,10 +652,16 @@ pub fn ssh_command_ip_with_auth(
     timeout: u8,
 ) -> Result<String, SshCommandError> {
     let mut s = String::new();
+    let mut e = String::new();
 
     let mut counter = 0;
     loop {
-        match (|| -> Result<(), SshCommandError> {
+        // Reset captured stdout/stderr for each retry attempt so we only
+        // report the output of the final (failed) attempt.
+        s.clear();
+        e.clear();
+
+        let mut closure = || -> Result<(), SshCommandError> {
             let tcp =
                 TcpStream::connect(format!("{}:22", ip)).map_err(SshCommandError::Connection)?;
             let mut sess = Session::new().unwrap();
@@ -674,6 +680,7 @@ pub fn ssh_command_ip_with_auth(
             // Intentionally ignore these results here as their failure
             // does not precipitate a repeat
             let _ = channel.read_to_string(&mut s);
+            let _ = channel.stderr().read_to_string(&mut e);
             let _ = channel.close();
             let _ = channel.wait_close();
 
@@ -684,9 +691,11 @@ pub fn ssh_command_ip_with_auth(
             } else {
                 Ok(())
             }
-        })() {
+        };
+
+        match closure() {
             Ok(_) => break,
-            Err(e) => {
+            Err(err) => {
                 counter += 1;
                 if counter >= retries {
                     eprintln!(
@@ -694,13 +703,14 @@ pub fn ssh_command_ip_with_auth(
                          command=\"{}\"\n\
                          auth=\"{:#?}\"\n\
                          ip=\"{}\"\n\
-                         output=\"{}\"\n\
+                         stdout=\"{}\"\n\
+                         stderr=\"{}\"\n\
                          error=\"{:?}\"\n\
                          \n==== End ssh command outout ====\n\n",
-                        command, auth, ip, s, e
+                        command, auth, ip, s, e, err
                     );
 
-                    return Err(e);
+                    return Err(err);
                 }
             }
         };
@@ -739,6 +749,32 @@ pub fn exec_host_command_output(command: &str) -> Output {
         .args(["-c", command])
         .output()
         .unwrap_or_else(|_| panic!("Expected '{}' to run", command))
+}
+
+/// Open a host-initiated vsock connection to the guest `port` through the hybrid vsock
+/// Unix socket, consuming the `OK <local_port>` ack.
+pub fn vsock_connect_port(socket: &str, port: u32) -> io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
+
+    // Read byte by byte so that nothing past the ack line is consumed.
+    let mut ack = Vec::new();
+    let mut byte = [0u8; 1];
+    while ack.last() != Some(&b'\n') {
+        if stream.read(&mut byte)? == 0 {
+            return Err(io::Error::from(io::ErrorKind::ConnectionReset));
+        }
+        ack.push(byte[0]);
+    }
+    if !ack.starts_with(b"OK ") {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("unexpected vsock ack: {:?}", String::from_utf8_lossy(&ack)),
+        ));
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    Ok(stream)
 }
 
 pub fn kill_child(child: &mut Child) {
@@ -1184,6 +1220,63 @@ impl Guest {
             expected_log,
             "guest passfd log does not contain the expected payload"
         );
+    }
+
+    /// Start a guest vsock echo server on CID=3 PORT=16.
+    pub fn start_vsock_echo_listener(&self) {
+        self.ssh_command(
+            "sudo sh -c 'nohup socat \
+             SOCKET-LISTEN:40:0:x00x00x10x00x00x00x03x00x00x00x00x00x00x00,fork \
+             EXEC:cat > /dev/null 2>&1 &'",
+        )
+        .unwrap();
+    }
+
+    /// Stream `size` bytes from the host to the guest echo server and check that the very
+    /// same bytes come back, so both the RX and TX virtqueues carry the full payload.
+    /// Returns the time from the first byte sent to the last byte received.
+    pub fn vsock_echo(&self, socket: &str, size: usize) -> Duration {
+        let mut stream = (0..30)
+            .find_map(|_| {
+                if let Ok(s) = vsock_connect_port(socket, 16) {
+                    return Some(s);
+                }
+                thread::sleep(Duration::from_secs(1));
+                None
+            })
+            .expect("Failed to connect to the guest vsock echo server after 30 attempts");
+
+        let mut seed: u32 = 0x1234_5678;
+        let data: Vec<u8> = (0..size)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let mut echoed = vec![0u8; size];
+
+        // Bound the writer too: on a stall `read_exact()` panics, but the scope still has
+        // to join the writer before unwinding.
+        let mut writer = stream.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let start = Instant::now();
+        thread::scope(|s| {
+            let w = s.spawn(|| writer.write_all(&data));
+            stream
+                .read_exact(&mut echoed)
+                .expect("vsock echo stalled or the connection was closed");
+            w.join().unwrap().expect("Failed to write to vsock");
+        });
+        let elapsed = start.elapsed();
+
+        if let Some(pos) = data.iter().zip(&echoed).position(|(a, b)| a != b) {
+            panic!("vsock echo data mismatch at byte {pos} of {size}");
+        }
+        elapsed
     }
 
     #[cfg(target_arch = "x86_64")]

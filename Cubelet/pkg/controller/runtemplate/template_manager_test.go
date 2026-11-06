@@ -133,7 +133,7 @@ func TestEnsureCubeRunTemplateReturnsClone(t *testing.T) {
 		templatetypes.CubeComponentCubeShim: {Component: templatetypes.MachineComponent{Version: "v1"}},
 	})
 
-	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-clone")
+	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-clone", "xfs")
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestEnsureCubeRunTemplateHydratesCloneNotCache(t *testing.T) {
 		t.Fatalf("seed template: %v", err)
 	}
 
-	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-hydrate")
+	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-hydrate", "xfs")
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestConcurrentEnsureMutatesClonesOnly(t *testing.T) {
 			defer done.Done()
 			start.Done()
 			start.Wait()
-			got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-race")
+			got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-race", "xfs")
 			if err != nil {
 				t.Errorf("ensure: %v", err)
 				return
@@ -298,5 +298,177 @@ func newLocalRunTemplateForPath(templateID, snapshotPath string) *templatetypes.
 		Snapshot: templatetypes.LocalSnapshot{
 			Snapshot: templatetypes.Snapshot{Path: snapshotPath},
 		},
+	}
+}
+
+func TestRecoveredMetadataHome(t *testing.T) {
+	baseDir := t.TempDir()
+	home := filepath.Join(baseDir, "tpl-s3")
+	metaDir := filepath.Join(home, "metadata")
+	configPath := filepath.Join(metaDir, "snapshot", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	template := recoveredS3LocalTemplate(home, metaDir)
+	if template == nil {
+		t.Fatal("expected recovered template")
+	}
+	if template.TemplateID != "tpl-s3" {
+		t.Fatalf("id=%q", template.TemplateID)
+	}
+	if template.Snapshot.Snapshot.Path != metaDir {
+		t.Fatalf("path=%q", template.Snapshot.Snapshot.Path)
+	}
+}
+
+// A pause package is a run template as far as recovery is concerned: it is
+// what a cross-node Resume has locally when the original tpl-* was never
+// built on this node.
+func TestRecoveredMetadataHomeAcceptsPausePackage(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "snap-pause-1")
+	metaDir := filepath.Join(home, "metadata")
+	if err := os.MkdirAll(filepath.Dir(metadataHomeConfigPath(home)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(metadataHomeConfigPath(home), []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	template := recoveredS3LocalTemplate(home, metaDir)
+	if template == nil {
+		t.Fatal("expected recovered template")
+	}
+	if template.TemplateID != "snap-pause-1" {
+		t.Fatalf("id=%q, want snap-pause-1", template.TemplateID)
+	}
+}
+
+func TestS3RecoveryIDsListsPackageHomesWhenIDUnknown(t *testing.T) {
+	root := t.TempDir()
+	snapshots := filepath.Join(root, "snapshots")
+	pause := filepath.Join(root, "pause-snapshots")
+	for _, dir := range []string{
+		filepath.Join(snapshots, "tpl-b"),
+		filepath.Join(snapshots, "tpl-a"),
+		filepath.Join(snapshots, "tpl-tmp.tmp"),
+		filepath.Join(snapshots, "deadbeefdeadbeefdeadbeef"),
+		filepath.Join(pause, "tpl-b"),
+		filepath.Join(pause, "snap-pause-1"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(snapshots, "not-a-package"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	got := s3RecoveryIDs(context.Background(), "", []string{snapshots, pause, filepath.Join(root, "missing")})
+	want := []string{"snap-pause-1", "tpl-a", "tpl-b"}
+	if len(got) != len(want) {
+		t.Fatalf("ids=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ids=%v, want %v", got, want)
+		}
+	}
+
+	one := s3RecoveryIDs(context.Background(), " tpl-only ", []string{snapshots})
+	if len(one) != 1 || one[0] != "tpl-only" {
+		t.Fatalf("specific id=%v, want [tpl-only]", one)
+	}
+}
+
+// An unmounted or absent package must not blow up the recovery attempt; the
+// caller treats it as a plain miss.
+func TestMountS3PackageMetadataForRecoveryTolerAtesMissingPackage(t *testing.T) {
+	mountS3PackageMetadataForRecovery(context.Background(), "")
+	mountS3PackageMetadataForRecovery(context.Background(), "snap-does-not-exist")
+}
+
+// A cold XFS lookup must stay local, including when its template is missing.
+// JFS may use a shared package only after its own local lookup misses.
+func TestEnsureCubeRunTemplateRecoveryIsolatesBackends(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backend string
+		local   bool
+		global  bool
+	}{
+		{name: "xfs_local", backend: "xfs", local: true},
+		{name: "xfs_missing", backend: "xfs"},
+		{name: "default_local", backend: "", local: true},
+		{name: "jfs_local", backend: "jfs", local: true},
+		{name: "jfs_shared", backend: "jfs", global: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := newReadyTemplateManager(t)
+			root := t.TempDir()
+			id := "tpl-backend-isolation-" + filepath.Base(root)
+			expectedBackend := tc.backend
+			if expectedBackend == "" {
+				expectedBackend = "xfs"
+			}
+			home := filepath.Join(root, "snapshots", id)
+			sharedHome := filepath.Join(root, "shared", id)
+			makeHome := func(home string) {
+				t.Helper()
+				path := metadataHomeConfigPath(home)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.local {
+				makeHome(home)
+			}
+			if tc.global {
+				makeHome(sharedHome)
+			}
+			oldRoot, oldGlobal := recoverySnapshotKindRoot, findGlobalJFSRuntimeSnapshot
+			t.Cleanup(func() { recoverySnapshotKindRoot, findGlobalJFSRuntimeSnapshot = oldRoot, oldGlobal })
+			recoverySnapshotKindRoot = func(backend, kind string) string {
+				if backend != expectedBackend {
+					t.Fatalf("%s request accessed %s storage", expectedBackend, backend)
+				}
+				return filepath.Join(root, kind)
+			}
+			globalCalls := 0
+			findGlobalJFSRuntimeSnapshot = func(snapshotID string) (*storage.JFSGlobalRuntimeSnapshot, error) {
+				globalCalls++
+				if !tc.global {
+					t.Fatal("unexpected shared JFS scan")
+				}
+				if snapshotID != id {
+					t.Fatalf("snapshot ID = %s", snapshotID)
+				}
+				return &storage.JFSGlobalRuntimeSnapshot{Home: sharedHome}, nil
+			}
+			got, err := manager.EnsureCubeRunTemplate(context.Background(), id, tc.backend)
+			if !tc.local && !tc.global {
+				if err == nil || got != nil {
+					t.Fatalf("missing template: got=%v err=%v", got, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				expectedHome := home
+				if tc.global {
+					expectedHome = sharedHome
+				}
+				if got == nil || got.Snapshot.Snapshot.Path != filepath.Join(expectedHome, storage.SnapshotMetadataDir) {
+					t.Fatalf("wrong recovered template: %+v", got)
+				}
+			}
+			if tc.global && globalCalls != 1 {
+				t.Fatalf("shared scans = %d, want 1", globalCalls)
+			}
+		})
 	}
 }

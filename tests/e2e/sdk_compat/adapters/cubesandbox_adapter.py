@@ -35,6 +35,8 @@ class CubeSandboxAdapter(SandboxAdapter):
         if isinstance(extra_metadata, dict):
             merged_metadata.update(extra_metadata)
         timeout = opts.pop("timeout", config.create_timeout)
+        if config.cube_template_id:
+            opts.setdefault("template", config.cube_template_id)
         sandbox = None
         try:
             sandbox = Sandbox.create(
@@ -54,11 +56,17 @@ class CubeSandboxAdapter(SandboxAdapter):
         cls,
         sandbox_id: str,
         config: SdkE2EConfig,
+        *,
+        timeout: int | None = None,
     ) -> "CubeSandboxAdapter":
         from cubesandbox import Sandbox
 
         sdk_config = cls._sdk_config(config)
-        return cls(Sandbox.connect(sandbox_id, config=sdk_config), sdk_config=sdk_config, e2e_config=config)
+        return cls(
+            Sandbox.connect(sandbox_id, timeout=timeout, config=sdk_config),
+            sdk_config=sdk_config,
+            e2e_config=config,
+        )
 
     @classmethod
     def list_sandboxes(cls, config: SdkE2EConfig) -> list[dict[str, Any]]:
@@ -96,6 +104,9 @@ class CubeSandboxAdapter(SandboxAdapter):
             raw=raw,
         )
 
+    def is_running(self) -> bool:
+        return bool(self._sandbox.is_running())
+
     def run_command(self, command: str, *, user: str = "root", timeout: int = 30) -> CommandResult:
         result = self._sandbox.commands.run(command, user=user, timeout=timeout)
         return CommandResult(
@@ -109,6 +120,15 @@ class CubeSandboxAdapter(SandboxAdapter):
 
     def read_file(self, path: str, *, user: str = "root") -> str:
         return self._sandbox.files.read(path, user=user)
+
+    def write_bytes(self, path: str, content: bytes, *, user: str = "root") -> None:
+        self._sandbox.files.write(path, content, user=user)
+
+    def read_bytes(self, path: str, *, user: str = "root") -> bytes:
+        return bytes(self._sandbox.files.read(path, format="bytes", user=user))
+
+    def read_stream(self, path: str, *, user: str = "root") -> bytes:
+        return b"".join(self._sandbox.files.read(path, format="stream", user=user))
 
     def list_files(self, path: str) -> list[dict[str, Any]]:
         return list(self._sandbox.files.list(path))
@@ -184,8 +204,17 @@ class CubeSandboxAdapter(SandboxAdapter):
             raise errors[0]
         return events
 
-    def run_code(self, code: str, *, timeout: int = 60) -> CodeResult:
-        execution = self._sandbox.run_code(code, timeout=timeout)
+    def run_code(
+        self,
+        code: str,
+        *,
+        env_vars: dict[str, str] | None = None,
+        timeout: int = 60,
+    ) -> CodeResult:
+        kwargs = {"timeout": timeout}
+        if env_vars is not None:
+            kwargs["envs"] = env_vars
+        execution = self._sandbox.run_code(code, **kwargs)
         stdout = _normalize_log_lines(execution.logs.stdout) if execution.logs else []
         stderr = _normalize_log_lines(execution.logs.stderr) if execution.logs else []
         return CodeResult(
@@ -201,16 +230,20 @@ class CubeSandboxAdapter(SandboxAdapter):
     def resume_or_connect(self, *, timeout: int = 60) -> "CubeSandboxAdapter":
         return type(self).connect(self.sandbox_id, self._e2e_config or SdkE2EConfig.from_env())
 
+    def resume_idle_timeout(self, timeout: int | None) -> "CubeSandboxAdapter":
+        self._sandbox.resume(timeout=timeout)
+        return self
+
     def set_timeout(self, timeout: int) -> None:
         self._sandbox.set_timeout(timeout)
 
-    def create_snapshot(self) -> str:
-        return str(self._sandbox.create_snapshot().snapshot_id)
+    def create_snapshot(self, name: str | None = None, *, mode: str | None = None) -> str:
+        return str(self._sandbox.create_snapshot(name=name, mode=mode).snapshot_id)
 
-    def delete_snapshot(self, snapshot_id: str) -> None:
+    def delete_snapshot(self, snapshot_id: str) -> bool:
         from cubesandbox import Sandbox
 
-        Sandbox.delete_snapshot(snapshot_id, config=self._sdk_config)
+        return bool(Sandbox.delete_snapshot(snapshot_id, config=self._sdk_config))
 
     def rollback(self, snapshot_id: str) -> dict[str, Any]:
         return dict(self._sandbox.rollback(snapshot_id))
@@ -225,6 +258,24 @@ class CubeSandboxAdapter(SandboxAdapter):
             for sandbox in self._sandbox.clone(n=n, concurrency=concurrency)
         ]
 
+    def fork(
+        self, count: int = 1, *, timeout: int | None = None
+    ) -> list[tuple["CubeSandboxAdapter" | None, Exception | None]]:
+        results = self._sandbox.fork(count, timeout=timeout)
+        return [
+            (
+                type(self)(
+                    item,
+                    sdk_config=self._sdk_config,
+                    e2e_config=self._e2e_config,
+                ),
+                None,
+            )
+            if isinstance(item, self._sandbox.__class__)
+            else (None, item)
+            for item in results
+        ]
+
     def list_snapshot_ids(self) -> set[str]:
         from cubesandbox import Sandbox
 
@@ -234,8 +285,20 @@ class CubeSandboxAdapter(SandboxAdapter):
         )
         return {str(snapshot.snapshot_id) for snapshot in snapshots}
 
+    def list_snapshot_ids_by_name(self, name: str) -> set[str]:
+        from cubesandbox import Sandbox
+
+        snapshots, _ = Sandbox.list_snapshots(
+            name=name,
+            config=self._sdk_config,
+        )
+        return {str(snapshot.snapshot_id) for snapshot in snapshots}
+
     def get_host(self, port: int) -> str:
         return str(self._sandbox.get_host(port))
+
+    def get_exposed_port_endpoint(self, port: int) -> str:
+        return self._sandbox.get_exposed_port_endpoint(port)
 
     def traffic_access_token(self) -> str | None:
         token = getattr(self._sandbox, "traffic_access_token", None)
@@ -249,6 +312,15 @@ class CubeSandboxAdapter(SandboxAdapter):
             if key in raw and raw[key]:
                 return str(raw[key])
         return None
+
+    def mcp_url(self) -> str:
+        return str(self._sandbox.get_mcp_url())
+
+    def mcp_token(self) -> str | None:
+        return self._sandbox.get_mcp_token()
+
+    def update_network(self, network: dict | None = None) -> None:
+        self._sandbox.update_network(network)
 
     def kill(self) -> None:
         self._sandbox.kill()

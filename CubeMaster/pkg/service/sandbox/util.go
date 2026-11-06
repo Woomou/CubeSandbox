@@ -14,9 +14,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/tencentcloud/CubeSandbox/CubeDB/dao"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeboximages "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	dbmodels "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
@@ -26,6 +23,11 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeboximages "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/sandboxrestart"
+	"github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode"
 	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -73,9 +75,21 @@ func checkAndGetReqResource(req *types.CreateCubeSandboxReq) (*selctx.RequestRes
 				res.EnforceSnapshotStorage = true
 			}
 		}
+		if strings.EqualFold(strings.TrimSpace(req.Annotations[constants.CubeAnnotationSnapshotAllowNonLocal]), "true") {
+			res.AllowNonLocalTemplate = true
+			res.EnforceSnapshotStorage = false
+			if len(req.DistributionScope) > 0 && len(res.TemplateNodeScope) == 0 {
+				res.TemplateNodeScope = append([]string(nil), req.DistributionScope...)
+			}
+		}
 	}
 
 	return res, nil
+}
+
+// RequestResources exposes checkAndGetReqResource for restore placement.
+func RequestResources(req *types.CreateCubeSandboxReq) (*selctx.RequestResource, error) {
+	return checkAndGetReqResource(req)
 }
 
 func checkParam(req *types.CreateCubeSandboxReq) error {
@@ -87,22 +101,29 @@ func checkParam(req *types.CreateCubeSandboxReq) error {
 		return ret.Err(errorcode.ErrorCode_MasterParamsError, "containers param is nil")
 	}
 
-	if req.CubeNetworkConfig != nil {
-		if req.CubeNetworkConfig.MaskRequestHost != nil {
-			if err := validateMaskRequestHost(*req.CubeNetworkConfig.MaskRequestHost); err != nil {
-				return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
-			}
-		}
-		for i, rule := range req.CubeNetworkConfig.Rules {
-			if rule == nil {
-				continue
-			}
-			if err := validateEgressRuleMatch(rule.Match, i); err != nil {
-				return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
-			}
+	return validateCubeNetworkConfig(req.CubeNetworkConfig)
+}
+
+// validateCubeNetworkConfig runs the server-side egress policy checks shared by
+// sandbox creation and in-place network updates, so the update path cannot
+// accept a policy that creation would have rejected.
+func validateCubeNetworkConfig(cfg *types.CubeNetworkConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.MaskRequestHost != nil {
+		if err := validateMaskRequestHost(*cfg.MaskRequestHost); err != nil {
+			return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 		}
 	}
-
+	for i, rule := range cfg.Rules {
+		if rule == nil {
+			continue
+		}
+		if err := validateEgressRuleMatch(rule.Match, i); err != nil {
+			return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
+		}
+	}
 	return nil
 }
 
@@ -199,14 +220,14 @@ func getReqResource(req *types.CreateCubeSandboxReq) (cpu, mem resource.Quantity
 			err = ret.Err(errorcode.ErrorCode_MasterParamsError, "request Resources nil")
 			break
 		}
-		ctncpuQuantity, err := resource.ParseQuantity(ctr.Resources.Cpu)
-		if err != nil {
-			err = fmt.Errorf("parse container %q cpu limit: %w", ctr.Name, err)
+		ctncpuQuantity, cpuErr := resource.ParseQuantity(ctr.Resources.Cpu)
+		if cpuErr != nil {
+			err = fmt.Errorf("parse container %q cpu limit: %w", ctr.Name, cpuErr)
 			break
 		}
-		ctnmemQuantity, err := resource.ParseQuantity(ctr.Resources.Mem)
-		if err != nil {
-			err = fmt.Errorf("parse container %q mem limit: %w", ctr.Name, err)
+		ctnmemQuantity, memErr := resource.ParseQuantity(ctr.Resources.Mem)
+		if memErr != nil {
+			err = fmt.Errorf("parse container %q mem limit: %w", ctr.Name, memErr)
 			break
 		}
 		cpu.Add(ctncpuQuantity)
@@ -250,8 +271,8 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 	if err := checkParam(req); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("[hostdir] ConstructCubeletReq: annotations=%v volumes_before_inject=%d",
-		req.Annotations, len(req.Volumes))
+	log.G(ctx).Infof("[hostdir] ConstructCubeletReq: annotation_count=%d volumes_before_inject=%d",
+		len(req.Annotations), len(req.Volumes))
 
 	// Normalize the sandbox idle timeout into a concrete value.
 	timeoutSeconds, err := resolveTimeoutSeconds(req.Timeout, config.GetConfig().CubeletConf.DefaultTimeoutInsec)
@@ -262,13 +283,18 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 
 	out := &cubebox.RunCubeSandboxRequest{
 		RequestID:         req.RequestID,
-		Labels:            req.Labels,
+		SnapshotMode:      snapshotmode.Normalize(req.SnapshotMode).String(),
+		Labels:            stripUserCubeMasterLabels(req.Labels),
 		InstanceType:      req.InstanceType,
 		NetworkType:       req.NetworkType,
 		Annotations:       make(map[string]string),
 		RuntimeHandler:    req.RuntimeHandler,
 		Namespace:         req.Namespace,
 		CubeNetworkConfig: mapCubeNetworkConfig(req.CubeNetworkConfig),
+	}
+	if b, ok, err := constants.OptionalSnapshotBackend(req.Backend); err == nil && ok {
+		out.Backend = b
+		out.Annotations[constants.CubeAnnotationStorageBackend] = b
 	}
 	log.G(ctx).Infof(
 		"ConstructCubeletReq: instance_type=%s network_type=%s cube_network_config=%s",
@@ -296,9 +322,18 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 	if err = checkAndGetVolumes(req, out); err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 	}
+	if sourceMetadata, ok := req.Annotations[AnnotationPluginVolumeSources]; ok {
+		out.Annotations[AnnotationPluginVolumeSources] = sourceMetadata
+	} else {
+		delete(out.Annotations, AnnotationPluginVolumeSources)
+	}
 	// Sync any annotations added by checkAndGetVolumes (e.g. plugin-volume-sources)
-	// into the outgoing RunCubeSandboxRequest.
+	// into the outgoing RunCubeSandboxRequest. Do not re-add keys
+	// checkAndGetAnnotation already dropped (pause / restore-base).
 	for k, v := range req.Annotations {
+		if rejectUserCubeMasterAnnotation(k) {
+			continue
+		}
 		if _, exists := out.Annotations[k]; !exists {
 			out.Annotations[k] = v
 		}
@@ -311,8 +346,113 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 	if err = getExposedPorts(req, out); err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 	}
+	if err = applyRestartPolicy(req, out); err != nil {
+		return nil, ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
+	}
 
 	return out, nil
+}
+
+// applyRestartPolicy maps restart fields onto the Cubelet request. Restart
+// fields are ordinary create fields; there is no feature gate.
+func applyRestartPolicy(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandboxRequest) error {
+	if req == nil || out == nil {
+		return nil
+	}
+	asked := strings.TrimSpace(req.RestartPolicy) != "" || req.RestartBackoff != nil || req.LivenessProbe != nil || containerHasLiveness(req)
+	if !asked {
+		return nil
+	}
+	policy, ok := normalizeRestartPolicy(req.RestartPolicy)
+	if !ok {
+		return fmt.Errorf("invalid restart policy %q", req.RestartPolicy)
+	}
+	out.RestartPolicy = policy
+	if req.RestartBackoff != nil {
+		out.RestartBackoff = req.RestartBackoff
+	}
+	for i, cnt := range req.Containers {
+		if cnt == nil || cnt.LivenessProbe == nil || i >= len(out.Containers) {
+			continue
+		}
+		out.Containers[i].LivenessProbe = cnt.LivenessProbe
+	}
+	if req.LivenessProbe != nil && len(out.Containers) > 0 && out.Containers[0].GetLivenessProbe() == nil {
+		out.Containers[0].LivenessProbe = req.LivenessProbe
+	}
+	if policy != sandboxrestart.WireNever {
+		clampMaxRestarts(out)
+	}
+	return nil
+}
+
+func clampMaxRestarts(out *cubebox.RunCubeSandboxRequest) {
+	if config.GetConfig() == nil || config.GetConfig().CubeletConf == nil {
+		return
+	}
+	capN := config.GetConfig().CubeletConf.MaxRestartsCap
+	if capN <= 0 {
+		return
+	}
+	if out.RestartBackoff == nil {
+		out.RestartBackoff = &cubebox.RestartBackoffConfig{}
+	}
+	if out.RestartBackoff.MaxRestarts <= 0 || out.RestartBackoff.MaxRestarts > capN {
+		out.RestartBackoff.MaxRestarts = capN
+	}
+}
+
+// CopyTemplateRestartFields fills policy, backoff and the top-level probe
+// the caller left empty. Container probes are copied by the template merge.
+func CopyTemplateRestartFields(templateReq, req *types.CreateCubeSandboxReq) {
+	if templateReq == nil || req == nil {
+		return
+	}
+	if strings.TrimSpace(req.RestartPolicy) == "" {
+		req.RestartPolicy = templateReq.RestartPolicy
+	}
+	if req.RestartBackoff == nil {
+		req.RestartBackoff = templateReq.RestartBackoff
+	}
+	if req.LivenessProbe == nil {
+		req.LivenessProbe = templateReq.LivenessProbe
+	}
+}
+
+func containerHasLiveness(req *types.CreateCubeSandboxReq) bool {
+	for _, c := range req.Containers {
+		if c != nil && c.LivenessProbe != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRestartLiveness rejects a Never policy combined with a liveness
+// probe. A probe under Never can never restart the sandbox, so it would only
+// kill it; refusing the request is clearer than silently ignoring the probe.
+// The caller decides the transport status; CubeMaster maps the error to
+// MasterParamsError (130400) and CubeAPI surfaces that as HTTP 400.
+//
+// The check runs after template merge, so a probe contributed by a template
+// is considered too.
+func ValidateRestartLiveness(req *types.CreateCubeSandboxReq) error {
+	if req == nil {
+		return nil
+	}
+	policy, ok := normalizeRestartPolicy(req.RestartPolicy)
+	if !ok || policy != sandboxrestart.WireNever {
+		return nil
+	}
+	if req.LivenessProbe != nil || containerHasLiveness(req) {
+		return fmt.Errorf("liveness_probe requires restart policy OnFailure or Always")
+	}
+	return nil
+}
+
+// normalizeRestartPolicy accepts k8s names and the on-wire RESTART_POLICY_* values.
+func normalizeRestartPolicy(raw string) (string, bool) {
+	return sandboxrestart.Normalize(raw)
 }
 
 func mapCubeNetworkConfig(in *types.CubeNetworkConfig) *cubebox.CubeNetworkConfig {
@@ -763,6 +903,10 @@ func checkAndGetVolumes(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSan
 			}
 		}
 	}
+	// plugin-volume-sources contains runtime driver/private_data resolved from
+	// t_cube_volume. Never reuse a value inherited from a snapshot or an
+	// earlier construction pass; rebuild it from current VolumeRecord rows.
+	delete(req.Annotations, AnnotationPluginVolumeSources)
 
 	if req.Volumes != nil {
 		for _, e := range req.Volumes {
@@ -770,9 +914,15 @@ func checkAndGetVolumes(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSan
 				return fmt.Errorf("volume name must not be empty")
 			}
 
-			// Identify plugin volumes by name appearing in plugin-volume-mounts
-			// annotation, or by having a nil VolumeSource.
-			if e.VolumeSource == nil || pluginVolumeNames[e.Name] {
+			// Identify plugin volumes by annotation, nil source (the CubeAPI
+			// representation), or the native PluginVolume source.
+			explicitPlugin := e.VolumeSource != nil && e.VolumeSource.PluginVolume != nil
+			if explicitPlugin {
+				if volumeID := strings.TrimSpace(e.VolumeSource.PluginVolume.Options["volume_id"]); volumeID != "" && volumeID != e.Name {
+					return fmt.Errorf("volume [%s]: plugin volume_id %q must match volume name", e.Name, volumeID)
+				}
+			}
+			if e.VolumeSource == nil || explicitPlugin || pluginVolumeNames[e.Name] {
 				record, err := resolveVolumeRecord(e.Name)
 				if err != nil {
 					return fmt.Errorf("volume [%s]: %w", e.Name, err)
@@ -880,12 +1030,17 @@ func checkAndGetAnnotation(req *types.CreateCubeSandboxReq, out *cubebox.RunCube
 		out.Annotations[constants.CubeAnnotationsVIPs] = v
 	}
 
+	// Seed the legacy instance-type defaults. Template-managed annotations on
+	// the request overwrite these values in the copy loop below.
 	out.Annotations[constants.CubeAnnotationsBlkQos] = getBlkQosAnnotation(req)
 	out.Annotations[constants.CubeAnnotationsFSQos] = getFsQosAnnotation(req)
 	for k, v := range req.Annotations {
 
 		if strings.HasPrefix(k, constants.CubeAnnotationsPrefix) ||
 			strings.HasPrefix(k, constants.CubeAnnotationsCloadPrefix) {
+			if rejectUserCubeMasterAnnotation(k) {
+				continue
+			}
 			out.Annotations[k] = v
 		}
 	}
@@ -923,6 +1078,38 @@ func setCreateTimeEnvVarsAnnotation(out map[string]string, envVars map[string]st
 	}
 	out[constants.CubeAnnotationCreateTimeEnvVars] = string(payload)
 	return nil
+}
+
+// rejectUserCubeMasterAnnotation drops Create annotations (and the same
+// keys on Labels) that only Master or Cubelet may stamp. Forwarding them
+// lets a client pin cube.master.pause.snapshot.id on a running sandbox
+// and make CleanupTemplate no-op for another tenant's pause catalog.
+func rejectUserCubeMasterAnnotation(key string) bool {
+	switch strings.TrimSpace(key) {
+	case constants.CubeAnnotationPauseSnapshotID,
+		constants.CubeAnnotationLaunchMemorySnapshotID,
+		constants.CubeAnnotationRuntimeRestoreSnapshotID,
+		constants.CubeAnnotationRuntimeRestoreSnapshotAttachedAt:
+		return true
+	default:
+		return false
+	}
+}
+
+// stripUserCubeMasterLabels copies user Labels without the platform keys
+// rejectUserCubeMasterAnnotation already drops from Annotations.
+func stripUserCubeMasterLabels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if rejectUserCubeMasterAnnotation(k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func getBlkQosAnnotation(req *types.CreateCubeSandboxReq) string {
@@ -1140,7 +1327,6 @@ func pluginVolumeWireVolume(name string) *cubebox.Volume {
 //
 // private_data is omitted from the JSON object when empty.
 func appendPluginVolumeSourceAnnotation(req *types.CreateCubeSandboxReq, name, driver, privateData string) error {
-	const key = "plugin-volume-sources"
 	type entry struct {
 		Name        string `json:"name"`
 		Driver      string `json:"driver"`
@@ -1150,16 +1336,31 @@ func appendPluginVolumeSourceAnnotation(req *types.CreateCubeSandboxReq, name, d
 		req.Annotations = make(map[string]string)
 	}
 	var entries []entry
-	if raw := req.Annotations[key]; raw != "" {
+	if raw := req.Annotations[AnnotationPluginVolumeSources]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 			return err
 		}
 	}
-	entries = append(entries, entry{Name: name, Driver: driver, PrivateData: privateData})
-	b, err := json.Marshal(entries)
+	next := entry{Name: name, Driver: driver, PrivateData: privateData}
+	found := false
+	out := entries[:0]
+	for _, existing := range entries {
+		if existing.Name != name {
+			out = append(out, existing)
+			continue
+		}
+		if !found {
+			out = append(out, next)
+			found = true
+		}
+	}
+	if !found {
+		out = append(out, next)
+	}
+	b, err := json.Marshal(out)
 	if err != nil {
 		return err
 	}
-	req.Annotations[key] = string(b)
+	req.Annotations[AnnotationPluginVolumeSources] = string(b)
 	return nil
 }

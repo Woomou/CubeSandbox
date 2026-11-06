@@ -9,8 +9,8 @@ and execute shell commands — all from your local machine using the E2B Python 
 
 **Cube Sandbox** is a lightweight MicroVM platform fully compatible with the [E2B SDK](https://e2b.dev). Its architecture is split into two planes:
 
-- **Control Plane**: Manages the sandbox lifecycle. Each `Sandbox.create()` call boots a new KVM MicroVM from a template snapshot in under 50ms. Commands flow through CubeAPI/Master to Cubelet, which uses `cube-agent` (PID 1) inside the VM to start the `envd` service.
-- **Data Plane**: Handles high-frequency code execution and file interaction. Traffic is routed via CubeProxy directly to the `envd` agent inside the sandbox, allowing for the execution of Python or Shell scripts in a secured environment. The sandbox is fully isolated with its own kernel, filesystem, and network.
+- **Control Plane**: Manages the sandbox lifecycle. Each `Sandbox.create()` call boots a new KVM MicroVM from a template snapshot in under 50ms. In the official `sandbox-code` image used in this example, the create request reaches Cubelet, which uses `cube-agent` (PID 1) inside the VM to start `envd`.
+- **Data Plane**: Handles code execution through the sandbox's code interpreter, while requests such as `commands.run` and `files.read/write` are routed via CubeProxy directly to `envd` inside the sandbox. The sandbox is fully isolated with its own kernel, filesystem, and network.
 
 When the `with` block exits, the sandbox is automatically deleted.
 
@@ -21,7 +21,7 @@ When the `with` block exits, the sandbox is automatically deleted.
         ┌─────────────────────────────┴─────────────────────────────┐
         │                                                           │
  [ 1. Control Plane ]                                     [ 2. Data Plane ]
-(e.g., Sandbox.create)                                  (e.g., run_code, commands.run)
+(e.g., Sandbox.create)                       (e.g., run_code, commands.run, files.read/write)
         │                                                           │
         ▼  REST API (Port 3000)                                     ▼  WSS / HTTP
      CubeAPI                                                    CubeProxy
@@ -34,14 +34,14 @@ When the `with` block exits, the sandbox is automatically deleted.
      Cubelet ──────────────┼──► cube-agent ──► envd  ◄──────────┼───┘
                            │     (PID 1)         │              │
                            │                     ▼              │
-                           │                Python / Shell      │
+                           │          Code Interpreter / envd   │
                            └────────────────────────────────────┘
 ```
 
 ## 2. Prerequisites
 
 - A running Cube Sandbox deployment
-- Python 3.8+
+- Python 3.9+ (`cubesandbox` and `e2b-code-interpreter` dependencies)
 
 ```bash
 pip install -r requirements.txt
@@ -78,6 +78,21 @@ cp .env.example .env
 After that, you can run any example script directly without manually exporting
 the variables first.
 
+**Local dev outside the cluster:** If `*.cube.app` does not resolve, set
+`CUBE_REMOTE_PROXY_BASE=https://<node-ip>:443` in `.env` (CubeProxy commonly
+uses 443/8080/9090). `load_local_dotenv()` only loads `.env`; E2B data-plane
+scripts call `ensure_dev_sidecar()` to start the sibling
+[`examples/e2b-dev-sidecar/`](../e2b-dev-sidecar/) proxy and patch the
+**E2B SDK** (`e2b_code_interpreter`) so its traffic is routed through the
+sidecar. Requires the full repo clone; if sidecar setup fails, scripts warn
+and continue. Control-plane-only scripts (e.g. `create.py`) skip the sidecar.
+Scripts using the `cubesandbox` SDK in this directory (e.g. `auto-kill.py`) are
+**not** patched and still need `*.cube.app` DNS or other routing outside the
+cluster. `apply_create_time_envs()` uses HTTP only when the dev sidecar is
+active; otherwise `/init` defaults to HTTPS (override with `CUBE_ENVD_INIT_SCHEME`
+only for deployments that intentionally use plaintext HTTP). Tune per-attempt
+latency with `CUBE_ENVD_INIT_ATTEMPT_TIMEOUT_S` (default `5` seconds).
+
 Or export directly:
 
 ```bash
@@ -98,9 +113,9 @@ python exec_code.py
 Expected output:
 
 ```
-Python 3.x.x (...)
 hello cube
-sum(1..100) = 5050
+
+Execution(Results: [], Logs: Logs(stdout: ['hello cube\n'], stderr: []), Error: None)
 ```
 
 ### Step 4 — Execute Shell Commands
@@ -131,6 +146,9 @@ hello cube
 | `network_allowlist.py` | `allow_out` — whitelist specific CIDRs, block everything else |
 | `network_denylist.py` | `deny_out` — block specific CIDRs, allow the rest |
 | `restrict_public_access.py` | `network={"allow_public_traffic": False}` — require a per-sandbox token on every public-URL request |
+| `sandbox-in-sandbox.py` | Control plane — inside sandbox A, use the `cubesandbox` SDK to `Sandbox.connect()` to sandbox B and run commands |
+| `sandbox-curl-sandbox.py` | Data plane — start an HTTP service in sandbox B, then `curl` it from sandbox A via CubeProxy Host routing |
+| `sandbox-port-mapping.py` | Host port mapping — `curl` B's service from sandbox A via the node-level `hostIP:hostPort` DNAT (template `--expose-port`) |
 
 ### exec_code.py — Run Python Code
 
@@ -159,7 +177,7 @@ python create_with_envs.py
 Expected output:
 
 ```text
-user-session-test
+session is user-session-test
 ```
 
 ### pause.py — Pause & Resume
@@ -256,6 +274,89 @@ requests.get(url)
 requests.get(url, headers={"e2b-traffic-access-token": sandbox.traffic_access_token})
 ```
 
+### Sandbox-to-Sandbox Access
+
+These scripts demonstrate how one sandbox talks to another. They create
+sandboxes A and B, then reach B from inside A — through the **control plane**
+(SDK), through **CubeProxy** (Host-header routing), and through the
+**node host-port mapping** (eBPF DNAT). For the mechanics of each option,
+how to choose, and the prerequisites and limits (egress policy,
+`allow_public_traffic` token, endpoint lifecycle), see the
+[sandbox-to-sandbox guide](../../docs/guide/sandbox-to-sandbox.md).
+
+```text
+sandbox-in-sandbox.py (control plane / SDK)
+
+  local script                sandbox A                    sandbox B
+      │                     ┌────────────────┐          ┌──────────────┐
+      ├─ Sandbox.create ───►│ pip install    │          │              │
+      ├─ Sandbox.create ────┼───────────────►│          │              │
+      │                     │ cubesandbox    │ connect  │              │
+      │                     │ Sandbox.connect├─────────►│ commands.run │
+      │                     └────────────────┘          └──────────────┘
+      │                          │ CubeAPI :3000 (create/connect)
+      │                          │ CubeProxy :80  (commands.run → envd)
+
+sandbox-curl-sandbox.py (data plane / HTTP)
+
+  sandbox A ── curl ──► CubeProxy :80 ── Host: <port>-<sandboxID-B>.cube.app ──► service in B
+```
+
+Script-specific environment variables:
+
+- `CUBE_INNER_API_URL` / `CUBE_PROXY_NODE_IP` — CubeAPI / CubeProxy addresses
+  as seen from inside the sandbox. By default a loopback host from `.env` is
+  rewritten to the node's egress IP (`127.0.0.1` inside a sandbox points at
+  the sandbox itself).
+- `CUBE_PIP_INDEX_URL` — pip index used by `sandbox-in-sandbox.py` inside A
+  (e.g. an internal mirror). Note pip runs inside the sandbox, so the guest
+  DNS must resolve the index host — guest DNS comes from the template's
+  `--dns` or the cubelet `default_dns_servers`; rebuild the template with
+  `--dns` if the default public resolver is unreachable in your lab.
+- `CUBE_SERVICE_PORT` — service port for `sandbox-port-mapping.py`
+  (default 8080). The service port of both curl-based scripts must be
+  declared in the template's `--expose-port` (`sandbox-curl-sandbox.py`
+  always uses 8080).
+- `allow_public_traffic=False` on B works too — the curl example forwards
+  B's `traffic_access_token` automatically.
+
+```bash
+# A installs the cubesandbox SDK, connects to B, runs a command there
+python sandbox-in-sandbox.py
+
+# B serves HTTP on :8080, A curls it through CubeProxy
+python sandbox-curl-sandbox.py
+
+# B serves HTTP on an exposed port, A curls the node's hostIP:hostPort mapping
+python sandbox-port-mapping.py
+```
+
+Expected output of `sandbox-in-sandbox.py`:
+
+```text
+[outer] sandbox A: 6d8a025c...  sandbox B: 1b26d1bb...
+[inner] connecting to sandbox B: 1b26d1bb...
+hello-from-B
+```
+
+Expected output of `sandbox-curl-sandbox.py`:
+
+```text
+[outer] service host: 8080-23af3202....cube.app
+[inner:A] curl -sS --fail --resolve 8080-23af3202....cube.app:80:<node-ip> http://...
+hello-from-B-service
+[outer] OK: sandbox A reached the service in sandbox B
+```
+
+Expected output of `sandbox-port-mapping.py`:
+
+```text
+[outer] B exposed endpoint (host port mapping): 9.135.152.214:20006
+[inner:A] curl -sS --fail --max-time 10 http://9.135.152.214:20006/
+hello-from-B-portmapping
+[outer] OK: sandbox A reached B via the node host-port mapping
+```
+
 ## 5. Troubleshooting
 
 | Symptom | Likely Cause | Fix |
@@ -264,6 +365,8 @@ requests.get(url, headers={"e2b-traffic-access-token": sandbox.traffic_access_to
 | `Template not found` | Wrong template ID | Re-run `cubemastercli tpl list` |
 | `Connection refused` | CubeAPI not reachable | Check `E2B_API_URL` and port 3000 |
 | `Sandbox timeout` | Sandbox exceeded its TTL | Increase `timeout` in `Sandbox.create()` |
+| `create_with_envs.py` prints `session is ` with no value | cubebox/VNC templates may drop create-time envs | Example best-effort calls `apply_create_time_envs()` (warn-only on failure); use `commands.run(..., envs={...})` if needed |
+| `CUBE_REMOTE_PROXY_BASE` set but sidecar inactive | Partial repo copy or sidecar setup failed | Use full repo; check warnings. Control-plane scripts still run; data-plane needs sidecar or DNS |
 
 ## 6. Directory Structure
 
@@ -284,6 +387,9 @@ code-sandbox-quickstart/
 ├── network_allowlist.py       # Outbound CIDR allowlist
 ├── network_denylist.py        # Outbound CIDR denylist
 ├── restrict_public_access.py  # Token-gated public URL access
+├── sandbox-in-sandbox.py      # Sandbox A uses the SDK to run commands in B
+├── sandbox-curl-sandbox.py    # Sandbox A curls an HTTP service in B
+├── sandbox-port-mapping.py    # Sandbox A curls B via node hostIP:hostPort DNAT
 ├── requirements.txt           # Python dependencies
 └── .env.example               # Environment variable template
 ```

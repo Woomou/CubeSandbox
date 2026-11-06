@@ -100,6 +100,8 @@
 #   CUBE_MASTER_IP        cubemaster address, default 127.0.0.1
 #                         (multi-node cluster: the control node)
 #   CUBE_MASTER_PORT      cubemaster port, default 8089
+#   CUBE_OPS_IP           CubeOps address used to list all registered nodes; defaults to CUBE_MASTER_IP
+#   CUBE_OPS_PORT         CubeOps internal API port, default 3010
 #   CUBE_PROXY_NODE_IP    CubeProxy address used to reach sandboxes, default 127.0.0.1
 #   CUBE_PROXY_PORT_HTTP  CubeProxy HTTP port, default 80
 #   OUTPUT_MD             report output path, default /tmp/cubebench_<timestamp>.md
@@ -610,6 +612,8 @@ cmd_run() {
 	# of showing the operator which deployment is targeted.
 	export CUBE_MASTER_IP="${CUBE_MASTER_IP:-127.0.0.1}"
 	export CUBE_MASTER_PORT="${CUBE_MASTER_PORT:-8089}"
+	export CUBE_OPS_IP="${CUBE_OPS_IP:-$CUBE_MASTER_IP}"
+	export CUBE_OPS_PORT="${CUBE_OPS_PORT:-3010}"
 
 	# Prove the harness can actually operate BEFORE asking the operator to
 	# authorize a destructive run. If a dependency is missing or cubemaster is
@@ -618,7 +622,7 @@ cmd_run() {
 	# against (e.g. the default CUBE_MASTER_IP=127.0.0.1 pointing nowhere on a
 	# real cluster). So check deps and reachability first; both only need the
 	# CUBE_MASTER_IP/PORT defaults resolved just above.
-	require_cmds "${PYTHON_BIN}" awk jq cubemastercli || exit 1
+	require_cmds "${PYTHON_BIN}" awk jq cubemastercli cubeopscli || exit 1
 
 	# Talking to CubeMaster is the first thing that can fail on a cluster, where
 	# the default 127.0.0.1 is wrong; say so here instead of failing later on. A
@@ -675,8 +679,8 @@ cmd_run() {
 	# (Total is GetHealthyNodesByInstanceType().Len()), so a 2-node cluster with one
 	# peer down would also report 1 — and cubecli would leave the down peer's
 	# sandboxes behind while list --all (also healthy-only) never sees them, so the
-	# reset would look clean when it is not. Prove single-node with `node list`,
-	# which hits /internal/node -> GetNodes(-1) and returns ALL nodes regardless of
+	# reset would look clean when it is not. Prove single-node with CubeOps'
+	# authoritative `node list`, which returns ALL registered nodes regardless of
 	# health; only take the fast path when the total node count is exactly 1 (and
 	# this host actually runs Cubelet). Otherwise fall back to the cluster-wide
 	# destroy, which at least covers every currently-healthy node.
@@ -910,8 +914,8 @@ section_3_3() {
 	if [ ! -r "$CUBELET_CONF" ]; then
 		reason="this machine does not run Cubelet (no ${CUBELET_CONF})"
 	else
-		# Count TOTAL nodes via `node list` (GetNodes(-1), every node regardless of
-		# health), not get_node_count's `list --all` which is HEALTHY-only. On a
+		# Count TOTAL nodes via CubeOps' authoritative `node list`, not
+		# get_node_count's `list --all` which is HEALTHY-only. On a
 		# 2-node cluster with one peer down, the healthy count is 1, so the density
 		# test would run — but once the peer rejoins, get_sandbox_count (also
 		# list --all) starts counting its sandboxes while free(1) on this host never
@@ -926,7 +930,7 @@ section_3_3() {
 			# multi-node cluster, and this section would then attribute cluster-wide
 			# memory to this single host. Skip instead, matching the comment's
 			# "refusing to guess this is a single-node deployment".
-			reason="could not determine the Cubelet node count (cubemaster node list error or no nodes); refusing to guess this is a single-node deployment"
+			reason="could not determine the Cubelet node count (cubeopscli node list error or no nodes); refusing to guess this is a single-node deployment"
 		elif [ "$nodes" -gt 1 ]; then
 			reason="the cluster has ${nodes} Cubelet nodes, so sandboxes are spread over hosts this script cannot measure"
 		fi
@@ -1323,6 +1327,10 @@ cubemaster() {
 	cubemastercli --address "${CUBE_MASTER_IP}" --port "${CUBE_MASTER_PORT}" "$@"
 }
 
+cubeops() {
+	cubeopscli --address "${CUBE_OPS_IP}" --port "${CUBE_OPS_PORT}" "$@"
+}
+
 sdk_version() {
 	# The cubesandbox SDK version the 4.x sections benchmark against. Prefer the
 	# concrete version installed into the venv (populated by prepare_snapshot_bench
@@ -1562,6 +1570,45 @@ check_host_quota() {
 	color_echo "WARNING: raising host.quota lets the benchmark pack more sandboxes than the node's RAM can back; the density test (section 3.3) then risks a whole-machine OOM. Leave headroom or watch memory while it runs." >&2
 }
 
+parse_lscpu_field() {
+	local field="$1"
+	awk -F: -v field="$field" '
+		{
+			key=$1
+			value=$2
+			gsub(/^[ \t]+|[ \t]+$/, "", key)
+			if (key == field) {
+				gsub(/^[ \t]+|[ \t]+$/, "", value)
+				print value
+				exit
+			}
+		}'
+}
+
+parse_cpu_config() {
+	awk -F: '
+		{
+			key=$1
+			value=$2
+			gsub(/^[ \t]+|[ \t]+$/, "", key)
+			gsub(/^[ \t]+|[ \t]+$/, "", value)
+			if (key == "CPU(s)" && cpus == "") cpus=value
+			if (key == "Socket(s)" && sock == "") sock=value
+			if (key == "Core(s) per socket" && cps == "") cps=value
+			if (key == "Thread(s) per core" && tpc == "") tpc=value
+		}
+		END {
+			if (cpus !~ /^[1-9][0-9]*$/ || sock !~ /^[1-9][0-9]*$/ ||
+				cps !~ /^[1-9][0-9]*$/ || tpc !~ /^[1-9][0-9]*$/) {
+				print "unknown"
+				exit
+			}
+			printf "%s logical CPU%s (%s socket%s, %s core%s/socket, %s thread%s/core)",
+				cpus, cpus == 1 ? "" : "s", sock, sock == 1 ? "" : "s",
+				cps, cps == 1 ? "" : "s", tpc, tpc == 1 ? "" : "s"
+		}'
+}
+
 print_test_env() {
 	local os kernel arch cpu_model cpu_cfg numa mem disk
 	local nodes local_cubelet=0
@@ -1588,24 +1635,14 @@ print_test_env() {
 	kernel="$(uname -sr)"
 	arch="$(uname -m)"
 
-	cpu_model="$(lscpu 2>/dev/null | awk -F: '/^Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+	cpu_model="$(LC_ALL=C lscpu 2>/dev/null | parse_lscpu_field "Model name")"
 	[ -z "$cpu_model" ] && cpu_model="$(awk -F: '/model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
 	[ -z "$cpu_model" ] && cpu_model="unknown"
 
-	cpu_cfg="$(lscpu 2>/dev/null | awk -F: '
-		/^CPU\(s\)/            {gsub(/^[ \t]+/,"",$2); cpus=$2}
-		/^Socket\(s\)/         {gsub(/^[ \t]+/,"",$2); sock=$2}
-		/^Core\(s\) per socket/{gsub(/^[ \t]+/,"",$2); cps=$2}
-		/^Thread\(s\) per core/{gsub(/^[ \t]+/,"",$2); tpc=$2}
-		END{printf "%s vCPU (%s socket x %s core/socket x %s thread/core)", cpus, sock, cps, tpc}')"
-	# lscpu absent -> the awk above still prints the template with empty fields, so
-	# test for that (a bare "vCPU" with no leading digit) as well as a truly empty
-	# string, and fall back to unknown to keep the table cell well-formed.
-	case "$cpu_cfg" in
-	'' | ' vCPU '*) cpu_cfg="unknown" ;;
-	esac
+	cpu_cfg="$(LC_ALL=C lscpu 2>/dev/null | parse_cpu_config)"
+	[ -n "$cpu_cfg" ] || cpu_cfg="unknown"
 
-	numa="$(lscpu 2>/dev/null | awk -F: '/^NUMA node\(s\)/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+	numa="$(LC_ALL=C lscpu 2>/dev/null | parse_lscpu_field "NUMA node(s)")"
 	[ -z "$numa" ] && numa="unknown"
 
 	# LC_ALL=C so free(1) prints the C-locale "Mem:" header the awk pattern below
@@ -1716,13 +1753,14 @@ get_node_count() {
 }
 
 get_total_node_count() {
-	# Unlike `list --all` (which counts HEALTHY Cubelets only), `node list` hits
-	# /internal/node -> GetNodes(-1) and returns EVERY node regardless of health.
-	# Emit the count only when the request succeeds, so an unreachable cubemaster
-	# yields empty (never a bogus "0") and the caller keeps the safe fallback.
+	# Unlike CubeMaster's `list --all` (which counts HEALTHY Cubelets only),
+	# CubeOps is the authoritative node registry and returns EVERY node regardless
+	# of health. Emit the count only when the request succeeds, so unreachable
+	# CubeOps yields empty (never a bogus "0") and the caller keeps the safe
+	# fallback. cubeopscli returns the node array directly, without a data envelope.
 	local json
-	json="$(cubemaster node list --json 2>/dev/null)" || return 1
-	printf '%s' "$json" | jq -e '(.data // []) | length' 2>/dev/null
+	json="$(cubeops node list --json 2>/dev/null)" || return 1
+	printf '%s' "$json" | jq -e 'if type == "array" then length else error("expected node array") end' 2>/dev/null
 }
 
 run_mvm_bench() {

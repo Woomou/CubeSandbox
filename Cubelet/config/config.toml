@@ -43,6 +43,8 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     # Static-only cadence for node status and resource reporting.
     # Do not configure this in dynamicconf/conf.yaml.
     node_status_update_frequency = "1s"
+    cubeops_addr = ""
+    cubeops_timeout = "10m"
 
   [plugins."io.cubelet.internal.v1.volume"]
   [plugins."io.cubelet.internal.v1.shimlog"]
@@ -102,12 +104,17 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     storage_backend = "cubecow"
 
     # Working directory for the cubelet storage plugin. cubecow reflink volumes land at
-    # <data_path>/cubecow-reflink, so the filesystem backing data_path must support
+    # <data_path>/xfs/objects, so the filesystem backing data_path must support
     # FICLONE (e.g. xfs with `-m reflink=1` or btrfs).
     data_path = "/data/cubelet/storage"
 
     # Parent directory for volume plugin host_path mounts (Attach --volume-base-dir).
     volume_plugin_base_dir = "/data/cube-shared/volume"
+
+    [[plugins."io.cubelet.internal.v1.storage".volume_plugins]]
+      name        = "s3"
+      type        = "binary"
+      binary_path = "/usr/local/services/cubetoolbox/Cubelet/plugin/cube-volume-s3"
 
     [[plugins."io.cubelet.internal.v1.storage".volume_plugins]]
       name        = "cos"
@@ -120,6 +127,27 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     format = "compact"
     file = "/data/log/cubecow/cubecow.log"
     rotation = "daily"
+
+    [plugins."io.cubelet.internal.v1.storage".cow.s3]
+    # CubeS3lvol opt-in. Default false: cubelet does not probe s3lvol.
+    # One-click flips this from ONE_CLICK_ENABLE_S3LVOL.
+    enable = false
+    socket_path = "/var/run/s3lvol.sock"
+
+    [plugins."io.cubelet.internal.v1.storage".cow.jfs]
+    # backend=jfs: the reflink Store on a JuiceFS mount (cube-sandbox-jfs.service).
+    # Objects and packages live under <mount_path>/<root>/nodes/<node_name>/ and
+    # are cloned with copy_file_range, a metadata-only clone on JuiceFS.
+    # Default false: jfs requests fail with "jfs storage is not configured".
+    enable = false
+    mount_path = "/data/cubelet/jfs"
+    root = "cube"
+    # node_name defaults to the node's primary IPv4; it must be unique and stable per node.
+    # node_name = ""
+    # The JuiceFS client's cache dir (CUBE_JFS_CACHE_DIR, colon-separated). A
+    # package is ready for cross-node restore once none of its blocks is in
+    # the --writeback staging area under it.
+    # cache_dir = "/data/cubelet/jfs-cache"
 
     # Only needed when switching back to the legacy ext4 / raw / reflink-pool
     # backend: change storage_backend to the corresponding value (e.g. "ext4")
@@ -143,19 +171,35 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
       [plugins."io.cubelet.internal.v1.cubebox".runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
     #cube_host_shared_dir = "/run/cube-containers/shared/sandboxes/"
-    cubetool_base_dir = "/usr/local/services/cubetoolbox"
   [plugins."io.cubelet.cubebox-service.v1.cubebox-service"]
     destroy_dead_line = "60s"
     dead_container_ttl = "1h"
+    # How long a recorded "a shim may have been spawned" intent may keep a
+    # sandbox's tap, IP and volumes allocated once no process can be found for
+    # it anywhere on the host (no recorded pid, no bundle pid file). Every
+    # other piece of evidence is consulted first, so this only ever decides a
+    # record that names no live holder at all. It exists because the intent is
+    # written before the shim starts: a crash or a handled failure in that
+    # window would otherwise make the sandbox permanently un-reclaimable.
+    # "0" disables the bound (fail closed forever).
+    shim_intent_ttl = "10m"
   [plugins."io.cubelet.images-service.v1.images-service"]
     [plugins."io.cubelet.images-service.v1.images-service".image_gc]
       max_unused_time_interval = "1d"
       detection_interval = "1m"
       max_deletion_per_cycle = 10
       free_disk_threshold_percent = 10
-  [plugins."io.cubelet.internal.v1.gc-service"]
-    gc_interval = "30s"
+  [plugins."io.cubelet.cubebox-service.v1.gc-service"]
     cleanup_interval = "5s"
+    # Failed cleanups before a sandbox is quarantined: alerted once, and
+    # retried every 10m instead of every cleanup_interval. Quarantine frees
+    # nothing — the tap/IP and volumes stay held and pool capacity stays
+    # reduced until the holder is gone (see `cubecli diag tap-holders`).
+    # Set to 0 to keep retrying at full rate and never quarantine.
+    max_cleanup_attempts = 60
+    # Quarantined sandboxes are still retried so manual holder reclamation is
+    # sufficient to recover. Keep this much slower than cleanup_interval.
+    quarantine_retry_interval = "10m"
 
   [plugins."io.cubelet.workflow.v1.workflow"]
     [plugins."io.cubelet.workflow.v1.workflow".flows]
@@ -190,8 +234,10 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     content_sharing_policy = "shared"
     no_sync = true
 
-  [plugins."io.containerd.monitor.v1.cgroups"]
-    no_prometheus = false
+  # Keep containerd's generic container_* task metrics off /v1/metrics.
+  # Sandbox CPU and memory metrics are at /v1/metrics/resource.
+  [plugins."io.containerd.monitor.task.v1.cgroups"]
+    no_prometheus = true
   [plugins."io.containerd.runtime.v2.task"]
     # Declare both platforms so the same config runs on amd64 and arm64 hosts;
     # containerd matches image manifests against the host's native platform.

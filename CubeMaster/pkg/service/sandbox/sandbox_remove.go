@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -22,10 +20,13 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxlock"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
 	volrefcount "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/refcount"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *types.DeleteCubeSandboxRes) {
@@ -65,6 +66,7 @@ func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *
 	}
 	destroyReq.Annotations[constants.CubeAnnotationsKillReason] = reason
 	collectMemoryOption(req, destroyReq)
+	stampDestroyStorageBackend(ctx, req.SandboxID, destroyReq)
 	if config.GetConfig().Common.CubeDestroyCheckFilter {
 
 		if req.Filter == nil || req.Filter.LabelSelector == nil {
@@ -231,4 +233,25 @@ func callCubelet(ctx context.Context, callEp string, req *cubebox.DestroyCubeSan
 
 		return nil
 	})
+}
+
+// stampDestroyStorageBackend copies the sandbox's persisted CoW backend onto
+// the Cubelet Destroy request so S3 sandboxes delete on the S3 Store.
+func stampDestroyStorageBackend(ctx context.Context, sandboxID string, req *cubebox.DestroyCubeSandboxRequest) {
+	if req == nil {
+		return
+	}
+	if req.Annotations == nil {
+		req.Annotations = map[string]string{}
+	}
+	if strings.TrimSpace(req.Annotations[constants.CubeAnnotationStorageBackend]) != "" {
+		return
+	}
+	spec, err := sandboxspec.Get(ctx, sandboxID)
+	if err != nil || spec == nil {
+		return
+	}
+	if b, ok, err := constants.OptionalSnapshotBackend(spec.Backend); err == nil && ok {
+		req.Annotations[constants.CubeAnnotationStorageBackend] = b
+	}
 }

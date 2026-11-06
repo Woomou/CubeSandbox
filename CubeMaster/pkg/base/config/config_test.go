@@ -7,10 +7,11 @@ package config
 
 import (
 	"fmt"
-	"math"
+
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
@@ -52,6 +53,23 @@ func TestInit(t *testing.T) {
 	assert.True(t, expectCpu.Equal(gotCpu))
 }
 
+func TestPreComHandleConfDistributionWorkersDefault(t *testing.T) {
+	// Unset (or non-positive) distribution_workers falls back to the built-in
+	// default of 4, matching the historical hardcoded defaultDistributionWorkers.
+	cfg := &Config{Common: &CommonConf{}}
+	assert.NoError(t, preComHandleConf(cfg))
+	assert.Equal(t, 4, cfg.Common.DistributionWorkers)
+
+	cfg = &Config{Common: &CommonConf{DistributionWorkers: -1}}
+	assert.NoError(t, preComHandleConf(cfg))
+	assert.Equal(t, 4, cfg.Common.DistributionWorkers)
+
+	// An explicit positive value is preserved.
+	cfg = &Config{Common: &CommonConf{DistributionWorkers: 16}}
+	assert.NoError(t, preComHandleConf(cfg))
+	assert.Equal(t, 16, cfg.Common.DistributionWorkers)
+}
+
 func TestNestedLogSettingsUseSnakeCaseOnRoundTrip(t *testing.T) {
 	var cfg Config
 	err := yaml.Unmarshal([]byte("log:\n  file_size: 100\n  file_num: 10\n  enable_log_metric: true\n"), &cfg)
@@ -75,6 +93,26 @@ func TestNestedLogSettingsUseSnakeCaseOnRoundTrip(t *testing.T) {
 	assert.NotContains(t, text, "enableLogMetric:")
 }
 
+func TestPreHandleCubeletConfAppSnapshotTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		set  int
+		want int
+	}{
+		{name: "unset", want: 300},
+		{name: "negative", set: -1, want: 300},
+		{name: "configured", set: 600, want: 600},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{CubeletConf: &CubeletConf{AppSnapshotTimeoutInSec: tt.set}}
+			assert.NoError(t, preHandleCubeletConf(cfg))
+			assert.Equal(t, tt.want, cfg.CubeletConf.AppSnapshotTimeoutInSec)
+		})
+	}
+}
+
 func TestGetEffectiveNodeMaxMemReservedInMBFallsBackForSmallNodes(t *testing.T) {
 	sconf := &SchedulerConf{
 		NodeMaxMemReservedInMB: 10 * 1024,
@@ -93,141 +131,43 @@ func TestGetEffectiveNodeMaxMemReservedInMBKeepsConfiguredValue(t *testing.T) {
 	assert.Equal(t, int64(512), got)
 }
 
-func TestPreHandleSchedulerOvercommitAndIgnoreDefaults(t *testing.T) {
+func TestPreHandleSchedulerIgnoreRedisAllocationDefault(t *testing.T) {
 	cfg := &Config{Scheduler: &WrapperSchedulerConf{}}
 	err := preHandleScheduler(cfg)
 	assert.NoError(t, err)
 
 	assert.NotNil(t, cfg.Scheduler.IgnoreRedisAllocation)
 	assert.False(t, cfg.Scheduler.ShouldIgnoreRedisAllocation())
-
-	ratio := cfg.Scheduler.GetEffectiveOvercommitRatio("cubebox")
-	assert.Equal(t, 3.0, ratio.CPURatio)
-	assert.Equal(t, 2.0, ratio.MemRatio)
 }
 
-func TestGetEffectiveOvercommitRatioPrecedence(t *testing.T) {
-	sconf := &SchedulerConf{
-		OvercommitRatio: &OvercommitRatioConf{CPURatio: 6.0, MemRatio: 4.0},
-		OvercommitRatioByType: map[string]OvercommitRatioConf{
-			"cubebox_gpu": {CPURatio: 1.0, MemRatio: 1.0},
+func TestHasDeprecatedOvercommitConfig(t *testing.T) {
+	assert.False(t, (&SchedulerConf{}).hasDeprecatedOvercommitConfig())
+
+	assert.True(t, (&SchedulerConf{
+		DeprecatedOvercommitRatio: &deprecatedOvercommitRatioConf{CPURatio: 3, MemRatio: 2},
+	}).hasDeprecatedOvercommitConfig())
+
+	assert.True(t, (&SchedulerConf{
+		DeprecatedOvercommitRatioByType: map[string]deprecatedOvercommitRatioConf{
+			"cubebox_gpu": {CPURatio: 1, MemRatio: 1},
 		},
-	}
+	}).hasDeprecatedOvercommitConfig())
 
-	// per-type override wins
-	gpu := sconf.GetEffectiveOvercommitRatio("cubebox_gpu")
-	assert.Equal(t, 1.0, gpu.CPURatio)
-	assert.Equal(t, 1.0, gpu.MemRatio)
-
-	// fall back to global ratio
-	other := sconf.GetEffectiveOvercommitRatio("cubebox")
-	assert.Equal(t, 6.0, other.CPURatio)
-	assert.Equal(t, 4.0, other.MemRatio)
-
-	// fall back to built-in default when nothing configured
-	empty := &SchedulerConf{}
-	def := empty.GetEffectiveOvercommitRatio("cubebox")
-	assert.Equal(t, 3.0, def.CPURatio)
-	assert.Equal(t, 2.0, def.MemRatio)
+	var nilConf *SchedulerConf
+	assert.False(t, nilConf.hasDeprecatedOvercommitConfig())
 }
 
-func TestEffectiveQuotaAndAllocated(t *testing.T) {
+func TestEffectiveAllocated(t *testing.T) {
 	ignore := false
-	sconf := &SchedulerConf{
-		IgnoreRedisAllocation: &ignore,
-		OvercommitRatio:       &OvercommitRatioConf{CPURatio: 6.0, MemRatio: 4.0},
-	}
-
-	assert.Equal(t, int64(48000), sconf.EffectiveQuotaCpu("cubebox", 8000))
-	assert.Equal(t, int64(64000), sconf.EffectiveQuotaMem("cubebox", 16000))
-	// allocation kept when not ignoring
+	sconf := &SchedulerConf{IgnoreRedisAllocation: &ignore}
 	assert.Equal(t, int64(1234), sconf.EffectiveAllocated(1234))
 
-	// allocation kept by default (not ignoring)
 	defaultConf := &SchedulerConf{}
 	assert.Equal(t, int64(1234), defaultConf.EffectiveAllocated(1234))
 
-	// allocation zeroed when explicitly ignoring
 	ignoreTrue := true
 	ignoring := &SchedulerConf{IgnoreRedisAllocation: &ignoreTrue}
 	assert.Equal(t, int64(0), ignoring.EffectiveAllocated(1234))
-}
-
-func TestOvercommitRatioSanitizesNonPositive(t *testing.T) {
-	sconf := &SchedulerConf{
-		OvercommitRatio: &OvercommitRatioConf{CPURatio: 0, MemRatio: -1},
-	}
-	ratio := sconf.GetEffectiveOvercommitRatio("cubebox")
-	assert.Equal(t, 3.0, ratio.CPURatio)
-	assert.Equal(t, 2.0, ratio.MemRatio)
-}
-
-func TestOvercommitRatioSanitizesNaNAndInf(t *testing.T) {
-	cases := []OvercommitRatioConf{
-		{CPURatio: math.NaN(), MemRatio: math.NaN()},
-		{CPURatio: math.Inf(1), MemRatio: math.Inf(1)},
-		{CPURatio: math.Inf(-1), MemRatio: math.Inf(-1)},
-	}
-	for _, c := range cases {
-		sconf := &SchedulerConf{OvercommitRatio: &c}
-		ratio := sconf.GetEffectiveOvercommitRatio("cubebox")
-		assert.Equal(t, 3.0, ratio.CPURatio)
-		assert.Equal(t, 2.0, ratio.MemRatio)
-
-		// capacity arithmetic must stay finite after sanitizing
-		assert.Equal(t, int64(24000), sconf.EffectiveQuotaCpu("cubebox", 8000))
-		assert.Equal(t, int64(32000), sconf.EffectiveQuotaMem("cubebox", 16000))
-	}
-}
-
-func TestPreHandleSchedulerSanitizesPerTypeRatios(t *testing.T) {
-	cfg := &Config{Scheduler: &WrapperSchedulerConf{
-		SchedulerConf: SchedulerConf{
-			OvercommitRatioByType: map[string]OvercommitRatioConf{
-				"bad_zero": {CPURatio: 0, MemRatio: -1},
-				"bad_nan":  {CPURatio: math.NaN(), MemRatio: math.Inf(1)},
-				"good":     {CPURatio: 8, MemRatio: 5},
-			},
-		},
-	}}
-	err := preHandleScheduler(cfg)
-	assert.NoError(t, err)
-
-	// malformed per-type ratios are normalized to defaults at init time
-	bz := cfg.Scheduler.OvercommitRatioByType["bad_zero"]
-	assert.Equal(t, 3.0, bz.CPURatio)
-	assert.Equal(t, 2.0, bz.MemRatio)
-
-	bn := cfg.Scheduler.OvercommitRatioByType["bad_nan"]
-	assert.Equal(t, 3.0, bn.CPURatio)
-	assert.Equal(t, 2.0, bn.MemRatio)
-
-	// valid per-type ratios are preserved
-	g := cfg.Scheduler.OvercommitRatioByType["good"]
-	assert.Equal(t, 8.0, g.CPURatio)
-	assert.Equal(t, 5.0, g.MemRatio)
-}
-
-func TestFloatToInt64Clamped(t *testing.T) {
-	assert.Equal(t, int64(0), floatToInt64Clamped(math.NaN()))
-	assert.Equal(t, int64(math.MaxInt64), floatToInt64Clamped(math.Inf(1)))
-	assert.Equal(t, int64(math.MinInt64), floatToInt64Clamped(math.Inf(-1)))
-	// overflow beyond int64 range clamps instead of wrapping to garbage
-	assert.Equal(t, int64(math.MaxInt64), floatToInt64Clamped(1e30))
-	assert.Equal(t, int64(math.MinInt64), floatToInt64Clamped(-1e30))
-	// normal values convert (truncate toward zero) as usual
-	assert.Equal(t, int64(42), floatToInt64Clamped(42.9))
-	assert.Equal(t, int64(0), floatToInt64Clamped(0))
-}
-
-func TestEffectiveQuotaClampsOverflow(t *testing.T) {
-	// A huge quota combined with a large overcommit ratio must not wrap to a
-	// garbage int64; it clamps to MaxInt64 instead.
-	sconf := &SchedulerConf{
-		OvercommitRatio: &OvercommitRatioConf{CPURatio: 1e6, MemRatio: 1e6},
-	}
-	assert.Equal(t, int64(math.MaxInt64), sconf.EffectiveQuotaCpu("cubebox", math.MaxInt64))
-	assert.Equal(t, int64(math.MaxInt64), sconf.EffectiveQuotaMem("cubebox", math.MaxInt64))
 }
 
 func TestNodeAffinitySelectorAllowedKeySet(t *testing.T) {
@@ -345,4 +285,48 @@ func TestGetAllowedHostMountPrefixes_DefaultDefensiveCopy(t *testing.T) {
 	// package-level default must not be affected
 	got2 := GetAllowedHostMountPrefixes()
 	assert.Equal(t, "/data/shared/", got2[0])
+}
+
+func TestControlledProfileLabels(t *testing.T) {
+	scheduler := &SchedulerConf{ProfileRouteLabelKeys: []string{"workload", "tenant"}}
+	got := scheduler.ControlledProfileLabels(map[string]string{
+		"workload": "burst",
+		"tenant":   "team-a",
+		"secret":   "must-not-leak",
+	})
+	assert.Equal(t, map[string]string{"workload": "burst", "tenant": "team-a"}, got)
+}
+
+func TestSchedulerProfileYAML(t *testing.T) {
+	var parsed struct {
+		Scheduler *WrapperSchedulerConf `yaml:"scheduler"`
+	}
+	err := yaml.Unmarshal([]byte(`
+scheduler:
+  profile_route_label_keys: [workload]
+  profiles:
+    - name: burst
+      route:
+        instance_types: ["S.*"]
+        labels: {workload: burst}
+      filters:
+        - name: idle
+          type: expr
+          expr: node.creating < 8
+      scores:
+        - name: external
+          type: grpc
+          socket_path: /run/scheduler.sock
+          timeout: 100ms
+          weight: 2
+      selection: {top_n: 5, method: spread}
+      failure: {filter: fail-closed, score: default-score, no_candidate: fail}
+`), &parsed)
+	assert.NoError(t, err)
+	if assert.NotNil(t, parsed.Scheduler) && assert.Len(t, parsed.Scheduler.Profiles, 1) {
+		profile := parsed.Scheduler.Profiles[0]
+		assert.Equal(t, "burst", profile.Name)
+		assert.Equal(t, 100*time.Millisecond, profile.Scores[0].Timeout)
+		assert.Equal(t, "spread", profile.Selection.Method)
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"text/tabwriter"
 
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/qos"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/urfave/cli"
 )
@@ -88,6 +89,24 @@ func TestBuildListRequestOldUsesQueryParameters(t *testing.T) {
 	} {
 		if !strings.Contains(url, want) {
 			t.Fatalf("url=%q, missing %q", url, want)
+		}
+	}
+}
+
+func TestStatusWithPauseState(t *testing.T) {
+	cases := []struct {
+		status      int32
+		pauseStatus string
+		want        string
+	}{
+		{5, "", "paused"},
+		{5, "READY", "paused"},
+		{5, "DELETE_FAILED", "paused(delete_failed)"},
+		{1, "", "running"},
+	}
+	for _, tc := range cases {
+		if got := statusWithPauseState(tc.status, tc.pauseStatus); got != tc.want {
+			t.Fatalf("statusWithPauseState(%d, %q)=%q, want %q", tc.status, tc.pauseStatus, got, tc.want)
 		}
 	}
 }
@@ -177,6 +196,10 @@ func TestPrintSandboxInfoBlockIncludesMetadata(t *testing.T) {
 		NameSpace:   "ns-1",
 		Annotations: map[string]string{"a": "b"},
 		Labels:      map[string]string{"user": "alice"},
+		ConfiguredQos: &qos.Config{
+			Network: &qos.NetworkConfig{BandwidthMbps: 100, PacketsPerSecond: 5000},
+			BlockIO: &qos.BlockIOConfig{ThroughputMiBps: 64, IOPS: 1000},
+		},
 		Containers: []*types.ContainerInfo{
 			{Name: "sandbox", ContainerID: "ctr-1", Image: "img", Status: 1, Type: "sandbox"},
 		},
@@ -186,7 +209,7 @@ func TestPrintSandboxInfoBlockIncludesMetadata(t *testing.T) {
 	}
 
 	output := buf.String()
-	for _, want := range []string{"SANDBOX_ID", "host-1", "tpl-1", "LABELS", "CONTAINERS", "ctr-1"} {
+	for _, want := range []string{"SANDBOX_ID", "host-1", "tpl-1", "LABELS", "NETWORK_QOS", "100 Mbit/s per direction", "5000 packets/s per direction", "BLOCK_IO_QOS", "64 MiB/s per block device", "1000 IOPS per block device", "CONTAINERS", "ctr-1"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("output=%q, missing %q", output, want)
 		}

@@ -7,6 +7,10 @@
     "description": "This feature is intended for demos and early validation. APIs, deployment options, and UX may change.",
     "close": "Close preview notice"
   },
+  "env": {
+    "linux": "Linux",
+    "mac": "Personal Mac"
+  },
   "settings": {
     "openAction": "Model Service Settings",
     "title": "Digital Assistant Settings",
@@ -41,7 +45,7 @@
       "label": "Gateway domain",
       "hint": "Optional. When set, each assistant's gateway opens on its own subdomain (port-sandboxId.domain, e.g. cube.app), fully isolating WebSocket sessions and preventing crosstalk. Leave blank to keep using the same-origin proxy path. Requires wildcard DNS and a certificate for the domain."
     },
-    "persistenceDisabled": "No database configured, so the model service configuration cannot be saved. Set DATABASE_URL for CubeAPI and try again.",
+    "persistenceDisabled": "No database configured, so the model service configuration cannot be saved. Set DATABASE_URL for CubeOps and try again.",
     "status": {
       "configured": "Configured {{provider}} / {{model}} (key: {{masked}}, source: {{source}}, mode: {{mode}})",
       "missing": "No LLM API key configured yet — assistants cannot be created."
@@ -70,8 +74,8 @@
         "doneAction": "Configured · Edit"
       },
       "template": {
-        "title": "Prepare a 龙虾助手 template",
-        "desc": "Install the lightweight or all-in-one 龙虾助手 image from the template market as the system template for new assistants.",
+        "title": "Prepare an OpenClaw template",
+        "desc": "Install the lightweight or all-in-one OpenClaw image from the template market as the system template for new assistants.",
         "action": "Open Market",
         "doneAction": "Ready · View"
       }

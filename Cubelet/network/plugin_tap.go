@@ -8,13 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	cubeletconfig "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"net"
 	"time"
 
 	"github.com/containerd/plugin"
 	"github.com/google/uuid"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/internal/tomlext"
 	networkruntime "github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime"
 	. "github.com/tencentcloud/CubeSandbox/Cubelet/network/types"
@@ -25,7 +24,9 @@ import (
 	networkstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/network"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 var (
@@ -132,6 +133,9 @@ func (l *local) Init(ctx context.Context, _ *workflow.InitInfo) error {
 
 func networkRuntimeConfigFromPluginConfig(config *Config) networkruntime.Config {
 	cfg := networkruntime.DefaultConfig()
+	if current := cubeletconfig.GetConfig(); current != nil && current.Common != nil {
+		cfg.OperatorAllowOut = append([]string(nil), current.Common.OperatorAllowOut...)
+	}
 	cfg.EthName = config.EthName
 	cfg.ObjectDir = config.ObjectDir
 	cfg.CIDR = config.CIDR
@@ -175,11 +179,14 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 	if request == nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "RunCubeSandboxRequest nil")
 	}
-	req, err := decodeNetRequest(request.Annotations[constants.MasterAnnotationsNetWork])
+	rawNetworkRequest := request.Annotations[constants.MasterAnnotationsNetWork]
+	req, err := decodeNetRequest(rawNetworkRequest)
 	if err != nil {
+		log.G(ctx).Errorf("decode network request failed: sandbox_id=%s raw=%q err=%v",
+			opts.SandboxID, rawNetworkRequest, err)
 		return err
 	}
-	log.G(ctx).Debugf("network request for %s: %s", opts.SandboxID, request.Annotations[constants.MasterAnnotationsNetWork])
+	log.G(ctx).Debugf("network request for %s: %s", opts.SandboxID, rawNetworkRequest)
 
 	cubeNetworkConfigBeforeDNS, cubeNetworkConfig, resolvedDNSServers, dnsAllowOutCIDRs, err := buildRuntimePolicy(ctx, request)
 	if err != nil {
@@ -190,7 +197,11 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 		formatCubeNetworkAllowInternetAccess(cubeNetworkConfig), lenCubeNetworkList(cubeNetworkConfig, true), lenCubeNetworkList(cubeNetworkConfig, false),
 		resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkRuntimeCubeNetworkConfig(cubeNetworkConfigBeforeDNS), formatNetworkRuntimeCubeNetworkConfig(cubeNetworkConfig))
 
-	ensureReq := l.buildEnsureNetworkRequestFromIntent(opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req, cubeNetworkConfig)
+	// Record the sandbox's resolvers even when they were not merged into the
+	// policy: this create had no domain target, but a later update may add one,
+	// and by then the resolver list is not recoverable from anywhere else.
+	ensureReq := l.buildEnsureNetworkRequestFromIntent(opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req, cubeNetworkConfig,
+		dnsServersToAllowOutCIDRs(ctx, resolvedDNSServers))
 	log.G(ctx).Infof("tap create ensure request: sandbox_id=%s interfaces=%d routes=%d arps=%d port_mappings=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cube_network_config=%s persist_metadata=%s",
 		ensureReq.SandboxID, len(ensureReq.Interfaces), len(ensureReq.Routes), len(ensureReq.ARPNeighbors),
 		len(ensureReq.PortMappings), resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkRuntimeCubeNetworkConfig(ensureReq.CubeNetworkConfig), utils.InterfaceToString(ensureReq.PersistMetadata))
@@ -225,11 +236,12 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 }
 
 func decodeNetRequest(raw string) (*NetRequest, error) {
-	req := &NetRequest{}
-	if raw != "" {
-		if err := utils.Decode(raw, req); err != nil {
-			return nil, ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "decode network params failed: %+v, raw: %s", err, raw)
-		}
+	if raw == "" {
+		return &NetRequest{}, nil
+	}
+	req, err := DecodeNetRequest(raw)
+	if err != nil {
+		return nil, ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "decode network params failed: %+v", err)
 	}
 	return req, nil
 }

@@ -36,6 +36,9 @@ type VirtioBackendFsConfig struct {
 	AllowedDirs []string `json:"allowed_dirs"`
 	ReadOnly    bool     `json:"read_only"`
 	Cache       int      `json:"cache"`
+	// RemapFilter makes restore-time allowed_dirs authoritative for serialized
+	// filter roots. It is enabled only when restoring guest mount state.
+	RemapFilter bool `json:"remap_filter,omitempty"`
 }
 
 type ErofsImagePath struct {
@@ -129,19 +132,22 @@ func GenVirtiofsConfig(shared []string) (*VirtiofsConfig, error) {
 	return virtiofsConfig, nil
 }
 
+// Channel is the device tag that carries a volume of the given access mode.
+func Channel(readOnly bool) string {
+	if readOnly {
+		return constants.PropagationVirtioRo
+	}
+	return constants.PropagationVirtioRw
+}
+
 func GenEmptyVirtiofsConfig(readOnly bool, cache int) (*VirtiofsConfig, error) {
 	virtiofsConfig, _ := GenVirtiofsConfig([]string{})
 	virtiofsConfig.VirtioBackendFsConfig.SharedDir = emptyShareDirPath
 	virtiofsConfig.VirtioBackendFsConfig.AllowedDirs = nil
 	virtiofsConfig.VirtioBackendFsConfig.Cache = cache
 	virtiofsConfig.VirtioBackendFsConfig.ReadOnly = readOnly
-	if readOnly {
-		virtiofsConfig.PropagationMountName = constants.PropagationVirtioRo
-		virtiofsConfig.ID = constants.PropagationVirtioRo
-	} else {
-		virtiofsConfig.PropagationMountName = constants.PropagationVirtioRw
-		virtiofsConfig.ID = constants.PropagationVirtioRw
-	}
+	virtiofsConfig.ID = Channel(readOnly)
+	virtiofsConfig.PropagationMountName = virtiofsConfig.ID
 	return virtiofsConfig, nil
 }
 

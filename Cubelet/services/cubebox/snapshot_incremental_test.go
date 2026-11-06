@@ -5,14 +5,17 @@
 package cubebox
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func TestNormalizeSnapshotTypeAcceptsKnownValues(t *testing.T) {
@@ -85,8 +88,49 @@ func TestBuildCubeRuntimeSnapshotArgsOmitsMemoryVolWhenEmpty(t *testing.T) {
 	assert.NotContains(t, args, "--memory-vol")
 }
 
+func TestDetachedSnapshotWorkContextPreservesDeadlineAndIgnoresCancellation(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), 2*time.Minute)
+	parentDeadline, ok := parent.Deadline()
+	require.True(t, ok)
+
+	workCtx, cancelWork := detachedSnapshotWorkContext(parent)
+	defer cancelWork()
+	workDeadline, ok := workCtx.Deadline()
+	require.True(t, ok)
+	assert.WithinDuration(t, parentDeadline, workDeadline, time.Millisecond)
+
+	cancelParent()
+	assert.NoError(t, workCtx.Err(), "client cancellation must not interrupt a frozen snapshot")
+}
+
+func TestDetachedSnapshotWorkContextUsesDefaultWithoutDeadline(t *testing.T) {
+	startedAt := time.Now()
+	workCtx, cancelWork := detachedSnapshotWorkContext(context.Background())
+	defer cancelWork()
+	deadline, ok := workCtx.Deadline()
+	require.True(t, ok)
+	remaining := deadline.Sub(startedAt)
+	assert.Greater(t, remaining, snapshotDefaultWorkTimeout-time.Second)
+	assert.LessOrEqual(t, remaining, snapshotDefaultWorkTimeout+time.Second)
+}
+
+func TestDetachedSnapshotWorkContextPreservesLongDeadline(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancelParent()
+	workCtx, cancelWork := detachedSnapshotWorkContext(parent)
+	defer cancelWork()
+	parentDeadline, _ := parent.Deadline()
+	workDeadline, ok := workCtx.Deadline()
+	require.True(t, ok)
+	assert.Equal(t, parentDeadline, workDeadline)
+	cancelParent()
+	assert.NoError(t, workCtx.Err())
+}
+
 func TestResolveBaseSnapshotIDPriority(t *testing.T) {
-	t.Run("runtime label wins over annotations", func(t *testing.T) {
+	// Metadata (labels and create-request annotations) is never a memory
+	// base; only the lineage is.
+	t.Run("metadata alone yields no base", func(t *testing.T) {
 		cb := &cubeboxstore.CubeBox{
 			Metadata: cubeboxstore.Metadata{
 				Labels: map[string]string{
@@ -98,10 +142,10 @@ func TestResolveBaseSnapshotIDPriority(t *testing.T) {
 				},
 			},
 		}
-		assert.Equal(t, "rollback-snap", resolveBaseSnapshotID(cb))
+		assert.Empty(t, resolveBaseSnapshotID(cb))
 	})
 
-	t.Run("create-time runtime annotation beats template id", func(t *testing.T) {
+	t.Run("bound runtime base wins", func(t *testing.T) {
 		cb := &cubeboxstore.CubeBox{
 			Metadata: cubeboxstore.Metadata{
 				Annotations: map[string]string{
@@ -110,18 +154,8 @@ func TestResolveBaseSnapshotIDPriority(t *testing.T) {
 				},
 			},
 		}
-		assert.Equal(t, "create-time-snap", resolveBaseSnapshotID(cb))
-	})
-
-	t.Run("falls back to template id", func(t *testing.T) {
-		cb := &cubeboxstore.CubeBox{
-			Metadata: cubeboxstore.Metadata{
-				Annotations: map[string]string{
-					constants.MasterAnnotationAppSnapshotTemplateID: "tpl-original",
-				},
-			},
-		}
-		assert.Equal(t, "tpl-original", resolveBaseSnapshotID(cb))
+		setRuntimeSnapshotBinding(cb, "rollback-snap")
+		assert.Equal(t, "rollback-snap", resolveBaseSnapshotID(cb))
 	})
 
 	t.Run("returns empty when no binding", func(t *testing.T) {
@@ -143,7 +177,7 @@ func TestResolveRollbackTargetsReturnsCatalogMemoryKind(t *testing.T) {
 			MemoryVol: "mem",
 			MetaDir:   "/tmp/meta",
 		}
-		rfs, mem, kind, meta, err := resolveRollbackTargets(nil, req)
+		rfs, mem, kind, meta, err := resolveRollbackTargets(nil, cow.BackendXFS, req)
 		require.NoError(t, err)
 		assert.Equal(t, "rfs", rfs)
 		assert.Equal(t, "mem", mem)
@@ -155,7 +189,7 @@ func TestResolveRollbackTargetsReturnsCatalogMemoryKind(t *testing.T) {
 	// bug, and silently filling in defaults would mask it.
 	t.Run("partial request is rejected", func(t *testing.T) {
 		req := &cubebox.RollbackSandboxRequest{RootfsVol: "rfs"}
-		_, _, _, _, err := resolveRollbackTargets(nil, req)
+		_, _, _, _, err := resolveRollbackTargets(nil, cow.BackendXFS, req)
 		require.Error(t, err)
 	})
 }

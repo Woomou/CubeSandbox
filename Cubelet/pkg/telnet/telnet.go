@@ -15,10 +15,10 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/tatsushid/go-fastping"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 const (
@@ -163,6 +163,11 @@ func Telnet(ctx context.Context, p *ProbeConfig) chan error {
 	return retCh
 }
 
+// DoTCPDetect dials address once. address is host:port.
+func DoTCPDetect(address string, dialTimeout time.Duration) error {
+	return doTCPDetect(address, dialTimeout)
+}
+
 func doTCPDetect(address string, dialTimeout time.Duration) error {
 	conn, err := net.DialTimeout("tcp", address, dialTimeout)
 	if err != nil {
@@ -187,6 +192,11 @@ func logError(err error) error {
 	}
 
 	return fmt.Errorf("network connectivity probe failed: %+v, timeout: %+v", opErr, netErr.Timeout())
+}
+
+// DoPing sends one ICMP (or UDP) echo to address.
+func DoPing(ctx context.Context, address string, dialTimeout time.Duration, udp bool) error {
+	return doPing(ctx, address, dialTimeout, udp)
 }
 
 func doPing(ctx context.Context, address string, dialTimeout time.Duration, udp bool) error {

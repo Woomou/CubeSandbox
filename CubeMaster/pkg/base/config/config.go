@@ -6,6 +6,7 @@
 package config
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +24,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	volumeplugin "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -74,41 +76,72 @@ type CommonConf struct {
 	HttpPort               int           `yaml:"http_port"`
 	// HttpBind is the HTTP listen address. Empty means 0.0.0.0 (all
 	// interfaces); set to 127.0.0.1 to keep the API loopback-only.
-	HttpBind                        string            `yaml:"http_bind"`
-	WriteTimeout                    int               `yaml:"http_writetimeout"`
-	ReadTimeout                     int               `yaml:"http_readtimeout"`
-	IdleTimeout                     int               `yaml:"http_idletimeout"`
-	GraceFullStopTimeoutInSec       int               `yaml:"gracefull_stop_timeout_insec"`
-	SyncMetaDataInterval            time.Duration     `yaml:"sync_meta_data_interval"`
-	SyncMetricDataInterval          time.Duration     `yaml:"sync_metric_data_interval"`
-	CleanSandboxCacheInterval       time.Duration     `yaml:"clean_sandbox_cache_interval"`
-	EnabledListRunningSandboxCache  bool              `yaml:"enabled_list_running_sandbox_cache"`
-	AsyncTaskQueueSize              int               `yaml:"async_task_queue_size"`
-	AsyncTaskWorkerNum              int               `yaml:"async_task_worker_num"`
-	HeadlessServiceName             string            `yaml:"headless_service_name"`
-	DefaultHeadlessServiceNodesNum  int64             `yaml:"default_headless_service_nodes_num"`
-	ListFilterOutLables             map[string]string `yaml:"list_filter_out_lables"`
-	CollectMetricInterval           time.Duration     `yaml:"collect_metric_interval"`
-	ReportLocalCreateNum            bool              `yaml:"report_local_create_num"`
-	ReportStdevMetric               bool              `yaml:"report_stdev_metric"`
-	GwCacheExpiredTime              time.Duration     `yaml:"gw_cache_expired_time"`
-	GwCacheEnable                   bool              `yaml:"gw_cache_enable"`
-	ReportGWRedisGetMetric          bool              `yaml:"report_gw_redis_get_metric"`
-	EnableGetStatusFromCubelet      bool              `yaml:"enable_get_status_from_cubelet"`
-	DisableHardDelete               bool              `yaml:"disable_hard_delete"`
-	CollectSandboxMemoryWhitelist   []string          `yaml:"collect_sandbox_memory_whitelist"`
-	EnableAllCollectSandboxMemory   bool              `yaml:"enable_all_collect_sandbox_memory"`
-	FilterErrMsgErrorCode           map[int]bool      `yaml:"filter_err_msg_error_code"`
-	DescribeInstancesWhiteList      map[string]bool   `yaml:"describe_instances_white_list"`
-	DescribeTaskExpireTime          int               `yaml:"describe_task_expire_time"`
-	EnablePrivateIpQuery            bool              `yaml:"enable_private_ip_query"`
-	DbMaxRetryCount                 int               `yaml:"db_max_retry_count"`
-	DbRetryInterval                 time.Duration     `yaml:"db_retry_interval"`
-	EnableCheckComNetIDParam        bool              `yaml:"enable_check_com_net_id_param"`
-	EnableDescribeInstanceFromRedis bool              `yaml:"enable_describe_instance_from_redis"`
-	MaxNICQueue                     int               `yaml:"max_nic_queue"`
-	DisableCreateImageCluster       map[string]bool   `yaml:"disable_create_image_cluster"`
-	EnableAGSColdStartSwitch        bool              `yaml:"enable_ags_cold_start_switch"`
+	HttpBind                  string `yaml:"http_bind"`
+	WriteTimeout              int    `yaml:"http_writetimeout"`
+	ReadTimeout               int    `yaml:"http_readtimeout"`
+	IdleTimeout               int    `yaml:"http_idletimeout"`
+	GraceFullStopTimeoutInSec int    `yaml:"gracefull_stop_timeout_insec"`
+	// CubeOps node-management base URL.
+	CubeOpsAddr string `yaml:"cube_ops_addr"`
+	// CubeMaster's HTTP base URL, used by CubeTemplateCenter to report build
+	// results. Can be set here (persistent, per-deployment) or overridden by
+	// the CUBE_MASTER_ADDR environment variable (ad-hoc debugging). Env wins
+	// over yaml.
+	//
+	// CubeMaster also reads it (Config.MasterAddr()): it is the address every
+	// other component must use to reach this process, so it is the only
+	// trustworthy value when the incoming request's Host header is a
+	// wildcard/loopback (e.g. `curl http://0.0.0.0:8089`), which is
+	// unreachable from any other node.
+	MasterAddr string `yaml:"master_addr"`
+	// CubeOpsBootRetries: additional LoadNodes attempts (0 = single-shot).
+	// Bridges the systemd startup window.
+	CubeOpsBootRetries             int               `yaml:"cube_ops_boot_retries"`
+	CubeOpsBootBackoff             time.Duration     `yaml:"cube_ops_boot_backoff"`
+	SyncMetaDataInterval           time.Duration     `yaml:"sync_meta_data_interval"`
+	SyncMetricDataInterval         time.Duration     `yaml:"sync_metric_data_interval"`
+	CleanSandboxCacheInterval      time.Duration     `yaml:"clean_sandbox_cache_interval"`
+	EnabledListRunningSandboxCache bool              `yaml:"enabled_list_running_sandbox_cache"`
+	AsyncTaskQueueSize             int               `yaml:"async_task_queue_size"`
+	AsyncTaskWorkerNum             int               `yaml:"async_task_worker_num"`
+	HeadlessServiceName            string            `yaml:"headless_service_name"`
+	DefaultHeadlessServiceNodesNum int64             `yaml:"default_headless_service_nodes_num"`
+	ListFilterOutLables            map[string]string `yaml:"list_filter_out_lables"`
+	CollectMetricInterval          time.Duration     `yaml:"collect_metric_interval"`
+	ReportLocalCreateNum           bool              `yaml:"report_local_create_num"`
+	ReportStdevMetric              bool              `yaml:"report_stdev_metric"`
+	GwCacheExpiredTime             time.Duration     `yaml:"gw_cache_expired_time"`
+	GwCacheEnable                  bool              `yaml:"gw_cache_enable"`
+	ReportGWRedisGetMetric         bool              `yaml:"report_gw_redis_get_metric"`
+	EnableGetStatusFromCubelet     bool              `yaml:"enable_get_status_from_cubelet"`
+	DisableHardDelete              bool              `yaml:"disable_hard_delete"`
+
+	// TemplateCacheTTL is how long template metadata stays in the local cache
+	// before expiring. Default 6 hours, matching the historical behavior.
+	// Shorter values reduce the stale-read window in multi-replica deployments
+	// at the cost of more frequent DB queries.
+	TemplateCacheTTL time.Duration `yaml:"template_cache_ttl"`
+	// TemplateCenterAddrValue is CubeTemplateCenter's HTTP base URL from conf.yaml.
+	// Named with a Value suffix to avoid colliding with the TemplateCenterAddr()
+	// method on Config. Access via Config.TemplateCenterAddr() which handles the
+	// env > yaml priority.
+	TemplateCenterAddrValue string `yaml:"template_center_addr"`
+	// DistributionWorkers is the max concurrency of one rootfs artifact
+	// distribution call. Default 4.
+	DistributionWorkers             int             `yaml:"distribution_workers"`
+	CollectSandboxMemoryWhitelist   []string        `yaml:"collect_sandbox_memory_whitelist"`
+	EnableAllCollectSandboxMemory   bool            `yaml:"enable_all_collect_sandbox_memory"`
+	FilterErrMsgErrorCode           map[int]bool    `yaml:"filter_err_msg_error_code"`
+	DescribeInstancesWhiteList      map[string]bool `yaml:"describe_instances_white_list"`
+	DescribeTaskExpireTime          int             `yaml:"describe_task_expire_time"`
+	EnablePrivateIpQuery            bool            `yaml:"enable_private_ip_query"`
+	DbMaxRetryCount                 int             `yaml:"db_max_retry_count"`
+	DbRetryInterval                 time.Duration   `yaml:"db_retry_interval"`
+	EnableCheckComNetIDParam        bool            `yaml:"enable_check_com_net_id_param"`
+	EnableDescribeInstanceFromRedis bool            `yaml:"enable_describe_instance_from_redis"`
+	MaxNICQueue                     int             `yaml:"max_nic_queue"`
+	DisableCreateImageCluster       map[string]bool `yaml:"disable_create_image_cluster"`
+	EnableAGSColdStartSwitch        bool            `yaml:"enable_ags_cold_start_switch"`
 }
 
 type AuthConf struct {
@@ -190,6 +223,9 @@ type RedisConf struct {
 	// must list one or more sentinel endpoints (host:port, comma-separated).
 	MasterName string `yaml:"master_name"`
 
+	// ClusterNodes enables native Redis Cluster; DB must be zero.
+	ClusterNodes string `yaml:"cluster_nodes"`
+
 	// SentinelNodes lists sentinel endpoints used when MasterName is set.
 	SentinelNodes string `yaml:"sentinel_nodes"`
 
@@ -239,18 +275,30 @@ type SchedulerConf struct {
 	ThirtpartyFilterInstanceType     map[string]bool                   `yaml:"thirtparty_filter_instance_type"`
 	InstanceTypeConf                 map[string]InstanceTypeConf       `yaml:"instance_type_conf"`
 	NodeAffinitySelectorAllowedKeys  []string                          `yaml:"node_affinity_selector_allowed_keys"`
+	// ProfileRouteLabelKeys is the allow-list of request labels that may be
+	// used by scheduler profile routes or sent to external scheduler plugins.
+	// Route labels not present in this list make the profile configuration
+	// invalid at scheduler startup.
+	ProfileRouteLabelKeys []string               `yaml:"profile_route_label_keys"`
+	Profiles              []SchedulerProfileConf `yaml:"profiles"`
+
+	// DisableFactoryProfiles opts out of the factory scheduler profile
+	// injection: when true and no scheduler policy is configured (profiles,
+	// filter and score all empty), the scheduler keeps the legacy empty-config
+	// behavior instead of injecting the built-in profiles. It is an explicit
+	// escape hatch for upgrades; new deployments should leave it off.
+	DisableFactoryProfiles bool `yaml:"disable_factory_profiles"`
 
 	// IgnoreRedisAllocation, when true, makes the scheduler ignore the
 	// per-node allocated CPU/Mem usage recorded in Redis (treat allocated as
 	// 0). A pointer is used so an unset value can default to false while still
 	// allowing operators to explicitly enable it. Defaults to false.
 	IgnoreRedisAllocation *bool `yaml:"ignore_redis_allocation"`
-	// OvercommitRatio is the global CPU/Mem overcommit ratio applied to the
-	// node-reported quota during scheduling. Defaults to CPU=3, Mem=2.
-	OvercommitRatio *OvercommitRatioConf `yaml:"overcommit_ratio"`
-	// OvercommitRatioByType overrides OvercommitRatio for specific instance
-	// types and takes precedence over the global ratio.
-	OvercommitRatioByType map[string]OvercommitRatioConf `yaml:"overcommit_ratio_conf"`
+	// Deprecated: overcommit_ratio is no longer used by CubeMaster.
+	// These fields are kept only so leftover YAML is parsed without error;
+	// the values are ignored at runtime.
+	DeprecatedOvercommitRatio       *deprecatedOvercommitRatioConf           `yaml:"overcommit_ratio"`
+	DeprecatedOvercommitRatioByType map[string]deprecatedOvercommitRatioConf `yaml:"overcommit_ratio_conf"`
 }
 
 var defaultNodeAffinitySelectorAllowedKeys = []string{
@@ -289,55 +337,16 @@ func IsReservedLabelKey(k string) bool {
 	return false
 }
 
-// OvercommitRatioConf describes the CPU/Mem overcommit multipliers applied to
-// a node's reported quota when computing schedulable capacity.
-type OvercommitRatioConf struct {
+type deprecatedOvercommitRatioConf struct {
 	CPURatio float64 `yaml:"cpu_ratio"`
 	MemRatio float64 `yaml:"mem_ratio"`
 }
 
-const (
-	defaultCPUOvercommitRatio = 3.0
-	defaultMemOvercommitRatio = 2.0
-)
-
-// GetEffectiveOvercommitRatio returns the overcommit ratio for the given
-// instance type, falling back to the global ratio and then to the built-in
-// defaults (CPU=3, Mem=2).
-func (s *SchedulerConf) GetEffectiveOvercommitRatio(instanceType string) OvercommitRatioConf {
-	if s.OvercommitRatioByType != nil {
-		if v, ok := s.OvercommitRatioByType[instanceType]; ok {
-			return v.sanitized()
-		}
-	}
-	if s.OvercommitRatio != nil {
-		return s.OvercommitRatio.sanitized()
-	}
-	return OvercommitRatioConf{CPURatio: defaultCPUOvercommitRatio, MemRatio: defaultMemOvercommitRatio}
-}
-
-// sanitized guarantees non-positive, NaN, or infinite ratios fall back to the
-// defaults so a malformed config never shrinks a node's schedulable capacity to
-// zero or produces a garbage (NaN/Inf) capacity when multiplied with the quota.
-func (c OvercommitRatioConf) sanitized() OvercommitRatioConf {
-	out := c
-	if !isValidRatio(out.CPURatio) {
-		out.CPURatio = defaultCPUOvercommitRatio
-	}
-	if !isValidRatio(out.MemRatio) {
-		out.MemRatio = defaultMemOvercommitRatio
-	}
-	return out
-}
-
-// isValidRatio reports whether r is a usable overcommit multiplier: it must be
-// a finite, positive number. NaN and ±Inf (e.g. ".nan"/".inf" in YAML) are
-// rejected so they never propagate into capacity arithmetic.
-func isValidRatio(r float64) bool {
-	if math.IsNaN(r) || math.IsInf(r, 0) {
+func (s *SchedulerConf) hasDeprecatedOvercommitConfig() bool {
+	if s == nil {
 		return false
 	}
-	return r > 0
+	return s.DeprecatedOvercommitRatio != nil || len(s.DeprecatedOvercommitRatioByType) > 0
 }
 
 // ShouldIgnoreRedisAllocation reports whether the scheduler must ignore the
@@ -347,40 +356,6 @@ func (s *SchedulerConf) ShouldIgnoreRedisAllocation() bool {
 		return false
 	}
 	return *s.IgnoreRedisAllocation
-}
-
-// EffectiveQuotaCpu returns the schedulable CPU capacity (milli-cores) for a
-// node after applying the configured overcommit ratio to its reported quota.
-func (s *SchedulerConf) EffectiveQuotaCpu(instanceType string, quotaCpu int64) int64 {
-	ratio := s.GetEffectiveOvercommitRatio(instanceType)
-	return floatToInt64Clamped(float64(quotaCpu) * ratio.CPURatio)
-}
-
-// EffectiveQuotaMem returns the schedulable memory capacity (MB) for a node
-// after applying the configured overcommit ratio to its reported quota.
-func (s *SchedulerConf) EffectiveQuotaMem(instanceType string, quotaMem int64) int64 {
-	ratio := s.GetEffectiveOvercommitRatio(instanceType)
-	return floatToInt64Clamped(float64(quotaMem) * ratio.MemRatio)
-}
-
-// floatToInt64Clamped safely converts a float64 to int64. Converting an
-// out-of-range or non-finite float64 to int64 is implementation-defined in Go
-// and yields a garbage value, so NaN maps to 0 and values beyond the int64
-// range (including ±Inf) are clamped to math.MaxInt64 / math.MinInt64. This
-// guards capacity computation against quota * ratio overflowing int64.
-func floatToInt64Clamped(f float64) int64 {
-	if math.IsNaN(f) {
-		return 0
-	}
-	// float64(math.MaxInt64) rounds up to 2^63, so use >= to treat the
-	// boundary and any larger value (incl. +Inf) as overflow.
-	if f >= float64(math.MaxInt64) {
-		return math.MaxInt64
-	}
-	if f <= float64(math.MinInt64) {
-		return math.MinInt64
-	}
-	return int64(f)
 }
 
 // EffectiveAllocated returns the allocated usage the scheduler should account
@@ -534,6 +509,78 @@ type SchedulerFilterConf struct {
 	EnableFilters []string `yaml:"enable_filters"`
 }
 
+// SchedulerProfileConf selects and configures one scheduling pipeline. The
+// first matching non-default profile wins; an optional default profile is used
+// when no route matches. With no profiles configured, the scheduler compiles a
+// legacy profile from Filter, Score, PostScore and PrioritySelectNum.
+type SchedulerProfileConf struct {
+	Name      string                       `yaml:"name"`
+	Default   bool                         `yaml:"default"`
+	Route     SchedulerProfileRouteConf    `yaml:"route"`
+	Filters   []SchedulerProfilePluginConf `yaml:"filters"`
+	Scores    []SchedulerProfilePluginConf `yaml:"scores"`
+	Selection SchedulerSelectionConf       `yaml:"selection"`
+	Failure   SchedulerFailureConf         `yaml:"failure"`
+}
+
+type SchedulerProfileRouteConf struct {
+	InstanceTypes []string          `yaml:"instance_types"`
+	Labels        map[string]string `yaml:"labels"`
+}
+
+// SchedulerProfilePluginConf is shared by built-in Go, CEL expression and
+// external gRPC plugins. Type defaults to "go". External plugins use a Unix
+// socket by default, while tests and development may use a host:port target.
+type SchedulerProfilePluginConf struct {
+	Name                   string         `yaml:"name"`
+	Type                   string         `yaml:"type"`
+	Enabled                *bool          `yaml:"enabled"`
+	Weight                 float64        `yaml:"weight"`
+	DefaultScore           float64        `yaml:"default_score"`
+	Expr                   string         `yaml:"expr"`
+	SocketPath             string         `yaml:"socket_path"`
+	Timeout                time.Duration  `yaml:"timeout"`
+	CircuitBreakerFailures int            `yaml:"circuit_breaker_failures"`
+	CircuitBreakerCooldown time.Duration  `yaml:"circuit_breaker_cooldown"`
+	Args                   map[string]any `yaml:"args"`
+}
+
+type SchedulerSelectionConf struct {
+	TopN   int    `yaml:"top_n"`
+	Method string `yaml:"method"`
+}
+
+type SchedulerFailureConf struct {
+	Filter      string `yaml:"filter"`
+	Score       string `yaml:"score"`
+	NoCandidate string `yaml:"no_candidate"`
+}
+
+// ControlledProfileLabels returns a defensive copy containing only labels
+// explicitly allowed for profile routing. This prevents arbitrary user labels
+// from changing scheduler policy or leaking to external plugins.
+func (s *SchedulerConf) ControlledProfileLabels(labels map[string]string) map[string]string {
+	if s == nil || len(labels) == 0 || len(s.ProfileRouteLabelKeys) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(s.ProfileRouteLabelKeys))
+	for _, key := range s.ProfileRouteLabelKeys {
+		if key = strings.TrimSpace(key); key != "" {
+			allowed[key] = struct{}{}
+		}
+	}
+	out := make(map[string]string, len(allowed))
+	for key := range allowed {
+		if value, ok := labels[key]; ok {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 type PostScoreConf struct {
 	Disable              bool               `yaml:"disable"`
 	ParamFactor          float64            `yaml:"param_factor"`
@@ -593,6 +640,7 @@ type CubeletConf struct {
 	Grpc                    *GrpcConf `yaml:"grpc"`
 	CommonTimeoutInsec      int       `yaml:"common_timeout_insec"`
 	CreateImageTimeoutInSec int       `yaml:"create_image_timeout_insec"`
+	AppSnapshotTimeoutInSec int       `yaml:"app_snapshot_timeout_insec"`
 	// Server default idle TTL when the client omits timeout. See docs/guide/lifecycle.md.
 	DefaultTimeoutInsec int `yaml:"default_timeout_insec"`
 	// Create RPC / scheduling deadline; decoupled from idle TTL.
@@ -611,9 +659,11 @@ type CubeletConf struct {
 	DestroyConcurentLimit int64                `yaml:"destroy_concurent_limit"`
 	ExposedPortList       []string             `yaml:"exposed_port_list"`
 	EnableExposedPort     bool                 `yaml:"enable_exposed_port"`
-	DisableRedisProxyPort bool                 `yaml:"disable_redis_proxy_port"`
-	MaxDelayInSecond      int64                `yaml:"max_delay_in_second"`
-	BackoffRetryDelay     time.Duration        `yaml:"backoff_retry_delay"`
+	// MaxRestartsCap clamps restart_backoff.max_restarts. 0 means no cap.
+	MaxRestartsCap        int32         `yaml:"max_restarts_cap"`
+	DisableRedisProxyPort bool          `yaml:"disable_redis_proxy_port"`
+	MaxDelayInSecond      int64         `yaml:"max_delay_in_second"`
+	BackoffRetryDelay     time.Duration `yaml:"backoff_retry_delay"`
 }
 
 type GrpcConf struct {
@@ -694,6 +744,12 @@ type SoftDeletePurgeConf struct {
 // configure the path; we'd rather try the canonical path than refuse
 // to start).
 const DefaultCubeEgressCAPath = "/etc/cube/ca/cube-root-ca.crt"
+
+// DefaultDistributionWorkers is the default max concurrency for pushing a
+// rootfs artifact to cubelet nodes (common.distribution_workers), matching
+// the historical hardcoded behavior. Exported so templatecenter can derive
+// its own fallback from this single source of truth.
+const DefaultDistributionWorkers = 4
 
 type AppHookConfig struct {
 	PrestartHookByEnvKeys map[string][]*types.Hook `yaml:"prestart_hook_by_env_keys"`
@@ -846,8 +902,17 @@ func preComHandleConf(config *Config) error {
 		config.Common.IdleTimeout = 360
 	}
 
+	if config.Common.CubeOpsBootRetries == 0 {
+		// 1s base + 5 retries → ~31s wait window covers a slow CubeOps start.
+		config.Common.CubeOpsBootRetries = 5
+	}
+	if config.Common.CubeOpsBootBackoff == time.Duration(0) {
+		config.Common.CubeOpsBootBackoff = 1 * time.Second
+	}
+
 	if config.Common.SyncMetaDataInterval == time.Duration(0) {
-		config.Common.SyncMetaDataInterval = 30 * time.Second
+		// Node changes must converge within ~1s for fast scheduling reaction.
+		config.Common.SyncMetaDataInterval = 1 * time.Second
 	}
 
 	if config.Common.SyncMetricDataInterval == time.Duration(0) {
@@ -867,6 +932,10 @@ func preComHandleConf(config *Config) error {
 
 	if config.Common.AsyncTaskWorkerNum == 0 {
 		config.Common.AsyncTaskWorkerNum = runtime.NumCPU()
+	}
+	if config.Common.DistributionWorkers <= 0 {
+		// Template rootfs artifact distribution concurrency.
+		config.Common.DistributionWorkers = DefaultDistributionWorkers
 	}
 	if config.Common.DefaultHeadlessServiceNodesNum == 0 {
 		config.Common.DefaultHeadlessServiceNodesNum = 1
@@ -916,6 +985,9 @@ func preComHandleConf(config *Config) error {
 	if config.Common.MaxNICQueue == 0 {
 		config.Common.MaxNICQueue = 4
 	}
+	if config.Common.TemplateCacheTTL == 0 {
+		config.Common.TemplateCacheTTL = 360 * time.Minute
+	}
 	return nil
 }
 func preHandleAuthConf(config *Config) error {
@@ -934,6 +1006,10 @@ func preHandleCubeletConf(config *Config) error {
 	}
 	if config.CubeletConf.CreateImageTimeoutInSec == 0 {
 		config.CubeletConf.CreateImageTimeoutInSec = 300
+	}
+
+	if config.CubeletConf.AppSnapshotTimeoutInSec <= 0 {
+		config.CubeletConf.AppSnapshotTimeoutInSec = 300
 	}
 
 	if config.CubeletConf.BufferQueueMinJob == 0 {
@@ -972,7 +1048,7 @@ func preHandleCubeletConf(config *Config) error {
 	}
 	// DefaultTimeoutInsec is left untouched — see docs/guide/lifecycle.md.
 	if config.CubeletConf.CreateTimeoutInsec <= 0 {
-		config.CubeletConf.CreateTimeoutInsec = 300
+		config.CubeletConf.CreateTimeoutInsec = 600
 	}
 	if config.CubeletConf.MaxRetries == 0 {
 		config.CubeletConf.MaxRetries = 5
@@ -1016,6 +1092,79 @@ func preHandOverhead(config *Config) error {
 	}
 	return nil
 }
+
+// preHandleScheduler fills in scheduler config defaults: node limits,
+// filter/score plugin parameters, selection algorithm names, etc.
+// schedulerFactoryYAML is the factory scheduler policy embedded in the binary
+// (three built-in profiles: burst_balance / template_reuse / mixed_binpack).
+// As the single source of truth, the default behavior referenced by
+// docs/guide/scheduler-plugin.md is defined by this file.
+//
+//go:embed scheduler_factory.yaml
+var schedulerFactoryYAML []byte
+
+// factoryProfileInjectWarnOnce keeps the behavior-change warning for
+// "empty-config factory injection" to one output per process: hot reloads
+// re-run injection repeatedly, and repeating this warn adds no value.
+var factoryProfileInjectWarnOnce sync.Once
+
+// injectFactorySchedulerProfiles injects the factory policy when the user has
+// configured no scheduling policy at all: scheduler.profiles and the legacy
+// scheduler.filter / scheduler.score / scheduler.postscore must all be empty,
+// and scheduler.disable_factory_profiles must not be set explicitly. If the
+// user configured any one of them, the factory policy is skipped entirely
+// (all-or-nothing) so the legacy compile path existing deployments rely on is
+// never overridden (profile.Compile ignores legacy when profiles are present).
+//
+// The factory YAML also carries the legacy score subtree: in profile mode it
+// does not participate in pipeline compilation, but the enable_weight_factors
+// of the built-in scorers (real_time_weighted_average / image_score) live only
+// in that legacy subtree; without them those scorers no-op (see
+// pkg/selector/score/realtimescore.go).
+func injectFactorySchedulerProfiles(config *Config) error {
+	sched := config.Scheduler
+	if sched.DisableFactoryProfiles {
+		CubeLog.Infof("scheduler.disable_factory_profiles is true; skipping factory scheduler profile injection, " +
+			"keeping the legacy empty-config scheduling behavior")
+		return nil
+	}
+	if len(sched.Profiles) != 0 || sched.Filter != nil || sched.Score != nil || sched.PostScore != nil {
+		return nil
+	}
+	var factory struct {
+		Scheduler struct {
+			ProfileRouteLabelKeys []string               `yaml:"profile_route_label_keys"`
+			Score                 *SchedulerScoreConf    `yaml:"score"`
+			Profiles              []SchedulerProfileConf `yaml:"profiles"`
+		} `yaml:"scheduler"`
+	}
+	if err := yaml.Unmarshal(schedulerFactoryYAML, &factory); err != nil {
+		return fmt.Errorf("unmarshal embedded factory scheduler profiles: %w", err)
+	}
+	if len(factory.Scheduler.Profiles) == 0 {
+		return errors.New("embedded factory scheduler profiles is empty")
+	}
+	sched.Profiles = factory.Scheduler.Profiles
+	sched.Score = factory.Scheduler.Score
+	if len(sched.ProfileRouteLabelKeys) == 0 {
+		sched.ProfileRouteLabelKeys = factory.Scheduler.ProfileRouteLabelKeys
+	}
+	names := make([]string, 0, len(sched.Profiles))
+	for _, profileConf := range sched.Profiles {
+		names = append(names, profileConf.Name)
+	}
+	// Injection changes placement for empty-config deployments and must be
+	// made visible to operators; the warn fires once per process via
+	// factoryProfileInjectWarnOnce.
+	factoryProfileInjectWarnOnce.Do(func() {
+		CubeLog.Warnf("no scheduler policy configured (scheduler.profiles/filter/score/postscore all empty); "+
+			"injecting factory scheduler profiles %v: placement now follows mandatory guards + factory scorers + spread selection, "+
+			"which differs from the legacy empty-config behavior; set scheduler.disable_factory_profiles: true "+
+			"or configure any of those keys explicitly to keep legacy scheduling", names)
+	})
+	return nil
+}
+
 func preHandleScheduler(config *Config) error {
 	if config.Scheduler == nil {
 		config.Scheduler = &WrapperSchedulerConf{}
@@ -1028,22 +1177,8 @@ func preHandleScheduler(config *Config) error {
 		ignore := false
 		config.Scheduler.IgnoreRedisAllocation = &ignore
 	}
-	// Default overcommit ratio: CPU=3, Mem=2. sanitized() guards against
-	// non-positive, NaN, or infinite values supplied by operators.
-	if config.Scheduler.OvercommitRatio == nil {
-		config.Scheduler.OvercommitRatio = &OvercommitRatioConf{
-			CPURatio: defaultCPUOvercommitRatio,
-			MemRatio: defaultMemOvercommitRatio,
-		}
-	} else {
-		sanitized := config.Scheduler.OvercommitRatio.sanitized()
-		config.Scheduler.OvercommitRatio = &sanitized
-	}
-	// Sanitize per-instance-type overrides at init time as well so malformed
-	// (non-positive/NaN/Inf) ratios are normalized once up front rather than
-	// relying solely on the lazy sanitize in GetEffectiveOvercommitRatio.
-	for k, v := range config.Scheduler.OvercommitRatioByType {
-		config.Scheduler.OvercommitRatioByType[k] = v.sanitized()
+	if config.Scheduler.hasDeprecatedOvercommitConfig() {
+		CubeLog.Warnf("scheduler.overcommit_ratio / overcommit_ratio_conf are deprecated and ignored; CubeMaster no longer applies overcommit to node-reported quota")
 	}
 
 	if config.Scheduler.NodeMaxMvmNum == 0 {
@@ -1115,6 +1250,12 @@ func preHandleScheduler(config *Config) error {
 				}
 			}
 		}
+	}
+
+	// After factory injection, apply the score default-value pass; the injected
+	// config flows through the same path as user-provided config.
+	if err := injectFactorySchedulerProfiles(config); err != nil {
+		return err
 	}
 
 	preHandSchedulerScore(config)
@@ -1231,6 +1372,54 @@ func validate(cfg *Config) error {
 //go:noinline
 func GetConfig() *Config {
 	return cfg
+}
+
+// EnvMasterAddr is the deployment-wide "how to reach CubeMaster" address.
+// Read on every call so it can be changed without reloading conf.yaml.
+const EnvMasterAddr = "CUBE_MASTER_ADDR"
+
+// MasterAddr returns CubeMaster's own externally-reachable HTTP base URL with
+// no trailing slash, or "" when unset.
+//
+// CubeMaster needs it for one specific job: the artifact download base URL it
+// hands to CubeTemplateCenter (and stores in
+// rootfs_artifacts.master_node_ip) must be an address every Cubelet can
+// actually reach. Deriving it from the incoming request's Host header is
+// wrong whenever the caller used a wildcard/loopback address (`curl
+// http://0.0.0.0:8089`, `curl http://localhost:8089`): that value is
+// meaningless to any other node, so Cubelet's artifact download 404s/fails
+// while the build itself looks perfectly healthy.
+func (c *Config) MasterAddr() string {
+	if addr := strings.TrimSpace(os.Getenv(EnvMasterAddr)); addr != "" {
+		return strings.TrimRight(addr, "/")
+	}
+	if c != nil && c.Common != nil {
+		return strings.TrimRight(strings.TrimSpace(c.Common.MasterAddr), "/")
+	}
+	return ""
+}
+
+// EnvTemplateCenterAddr is how CubeMaster finds CubeTemplateCenter. It mirrors
+// CUBE_MASTER_ADDR, the variable every other component uses to find CubeMaster:
+// one name per target component, shared by whoever needs to reach it, so a
+// deployment sets each address exactly once. An address is a deployment fact,
+// not a process tunable, which is why it is an environment variable and not a
+// conf.yaml key.
+const EnvTemplateCenterAddr = "CUBE_TEMPLATE_CENTER_ADDR"
+
+// TemplateCenterAddr returns CubeTemplateCenter's base URL with no trailing
+// slash, or "" when unset. Read from the environment on every call so it can
+// be changed without editing (or even loading) conf.yaml.
+func (c *Config) TemplateCenterAddr() string {
+	// Priority: env > yaml. Env is for ad-hoc debugging (override without
+	// editing conf.yaml); yaml is the persistent deployment value.
+	if addr := strings.TrimSpace(os.Getenv(EnvTemplateCenterAddr)); addr != "" {
+		return strings.TrimRight(addr, "/")
+	}
+	if c.Common != nil {
+		return strings.TrimRight(strings.TrimSpace(c.Common.TemplateCenterAddrValue), "/")
+	}
+	return ""
 }
 
 var defaultAllowedHostMountPrefixes = []string{"/data/shared/"}

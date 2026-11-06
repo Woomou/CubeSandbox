@@ -16,7 +16,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // submitTemplateCommitFn indirects templatecenter.SubmitTemplateCommit so tests
@@ -68,6 +68,16 @@ func handleSandboxCommitAction(c *gin.Context) {
 			Res: &types.Res{Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
 				RetMsg:  "sandbox_id is required",
+			}},
+		})
+		return
+	}
+	if err := rejectCallerSuppliedQos(req.CreateRequest); err != nil {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		common.WriteAPI(c, &commitTemplateResponse{
+			Res: &types.Res{Ret: &types.Ret{
+				RetCode: int(errorcode.ErrorCode_MasterParamsError),
+				RetMsg:  err.Error(),
 			}},
 		})
 		return
@@ -211,9 +221,9 @@ func handleTemplateBuildStatusAction(c *gin.Context) {
 	}
 	job, err := templatecenter.GetTemplateImageJobInfo(c.Request.Context(), buildID)
 	if err != nil {
-		code := int(errorcode.ErrorCode_MasterInternalError)
-		if errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized) {
-			code = int(errorcode.ErrorCode_DBError)
+		code := templateImageJobErrorCode(err)
+		if rt != nil {
+			rt.RetCode = int64(code)
 		}
 		common.WriteAPI(c, &templateBuildStatusResponse{
 			Res:     &types.Res{Ret: &types.Ret{RetCode: code, RetMsg: err.Error()}},

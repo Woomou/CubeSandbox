@@ -1,24 +1,20 @@
 # Roadmap
 
+Release milestones, planned work, and current progress are tracked in the
+[CubeSandbox Version Iteration Plan](https://github.com/orgs/TencentCloud/projects/3/views/1).
+This page summarizes the longer-term direction; use the GitHub project for the latest iteration status.
+
 ---
 
 ## Coming Soon
 
-### Cross-Node Pause and Resume
+### Cross-Node Pause/Resume Performance
 
-Suspend a running sandbox on one node and resume it on a different node, with full memory and filesystem state preserved. Unlocks flexible bin-packing, host drain workflows, and cross-node sandbox migration.
-
-### Cross-Node Snapshot-Based Sandbox Launch
-
-Create new sandboxes from a snapshot on a different node than the one where the snapshot was taken, backed by a cluster-shared, on-demand-loading storage layer. The scheduler picks the source node first and transparently falls back to any node with the snapshot synced, so callers get elastic, cluster-wide scheduling from a single snapshot without waiting for a full data copy.
+Cross-node pause/resume landed in v0.7.0 as a preview. The next step is performance: cut pause/resume latency and speed up snapshot transfer so that resuming on another node approaches same-node speed.
 
 ### E2B API Compatibility
 
 Close the remaining gaps between CubeSandbox's API surface and the E2B specification. The goal is full drop-in compatibility so that workloads and SDK clients targeting E2B can run against a self-hosted CubeSandbox cluster without modification.
-
-### Control Plane / Data Plane Separation
-
-Separate the control plane (cluster management, scheduling, health checks) from the data plane (sandbox create/run/snapshot) so that a failure or rolling upgrade of the control plane does not affect sandboxes already in flight. Achieving full end-to-end high availability requires that the two planes are independently deployable and fault-isolated.
 
 ### Sandbox Fault Recovery
 
@@ -27,6 +23,18 @@ Automatic detection and recovery of sandboxes in abnormal states — crashed VMs
 ### Scheduling and Operations Enhancements
 
 Richer scheduling capabilities including resource-aware placement, affinity/anti-affinity rules, and priority classes. Also covers operational tooling: live resource rebalancing and node drain with sandbox migration.
+
+### S3 Performance and Cost Optimization
+
+Cross-node pause/resume and volumes already persist through S3-compatible object storage. Next is to cut both latency and bill: incremental uploads, better local cache, and cheaper storage classes so snapshot transfer and volume I/O stay fast without paying full-object prices every time.
+
+### Filesystem-Only Snapshots
+
+Today a snapshot captures memory and the writable filesystem together. A filesystem-only snapshot skips the memory dump so clone and restore are cheaper and faster when the workload can cold-start from disk — installed packages, workspace files, and envd state — without a live RAM image.
+
+### GPU Sandboxes
+
+Attach host GPUs to sandboxes so Agent and inference workloads can run CUDA (and similar accelerators) inside the same isolated VM model, with the scheduler accounting for GPU inventory and placement.
 
 ---
 

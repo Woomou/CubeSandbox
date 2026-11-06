@@ -27,15 +27,6 @@ type fakeCMHandler struct {
 	listTemplates   func(ctx context.Context, templateID string, includeRequest bool) (json.RawMessage, error)
 }
 
-func (f *fakeCMHandler) GetNodes(ctx context.Context) (json.RawMessage, error) {
-	return nil, errMethodNotConfigured("GetNodes")
-}
-func (f *fakeCMHandler) ClusterVersions(ctx context.Context) (json.RawMessage, error) {
-	return nil, errMethodNotConfigured("ClusterVersions")
-}
-func (f *fakeCMHandler) GetNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
-	return nil, errMethodNotConfigured("GetNode")
-}
 func (f *fakeCMHandler) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	return nil, errMethodNotConfigured("ListSandboxes")
 }
@@ -93,6 +84,9 @@ func (f *fakeCMHandler) CreateSnapshot(ctx context.Context, body interface{}) (j
 func (f *fakeCMHandler) ListSnapshots(ctx context.Context, params map[string]string) (json.RawMessage, error) {
 	cubemaster.EnsureRequestIDQuery(ctx, params)
 	return nil, errMethodNotConfigured("ListSnapshots")
+}
+func (f *fakeCMHandler) GetSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error) {
+	return nil, errMethodNotConfigured("GetSnapshot")
 }
 func (f *fakeCMHandler) DeleteSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error) {
 	if f.deleteSnapshot == nil {

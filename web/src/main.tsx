@@ -17,8 +17,12 @@ import SandboxNewPage from '@/pages/SandboxNew';
 import TemplatesPage from '@/pages/Templates';
 import NodesPage from '@/pages/Nodes';
 import VersionsPage from '@/pages/Versions';
+import WarehousePage from '@/pages/Warehouse';
+import WarehouseComponentPage from '@/pages/WarehouseComponent';
+import WarehouseJobsPage from '@/pages/WarehouseJobs';
 import SettingsPage from '@/pages/Settings';
 import TemplateDetailPage from '@/pages/TemplateDetail';
+import SnapshotDetailPage from '@/pages/SnapshotDetail';
 import NodeDetailPage from '@/pages/NodeDetail';
 import NetworkPage from '@/pages/Network';
 import ObservabilityPage from '@/pages/Observability';
@@ -54,9 +58,13 @@ const App = () => (
                 <Route path="/sandboxes/:sandboxID" element={<SandboxDetailPage />} />
                 <Route path="/templates" element={<TemplatesPage />} />
                 <Route path="/templates/:templateID" element={<TemplateDetailPage />} />
+                <Route path="/snapshots/:snapshotID" element={<SnapshotDetailPage />} />
                 <Route path="/nodes" element={<NodesPage />} />
                 <Route path="/nodes/:nodeID" element={<NodeDetailPage />} />
                 <Route path="/versions" element={<VersionsPage />} />
+                <Route path="/warehouse" element={<WarehousePage />} />
+                <Route path="/warehouse/jobs" element={<WarehouseJobsPage />} />
+                <Route path="/warehouse/:component" element={<WarehouseComponentPage />} />
                 <Route path="/network" element={<NetworkPage />} />
                 <Route path="/observability" element={<ObservabilityPage />} />
                 <Route path="/store" element={<TemplateStorePage />} />

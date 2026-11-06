@@ -15,6 +15,9 @@
 | `paused`    | 沙箱已暂停，VM 内存已落盘为快照，**不消耗** CPU 与内存，状态完整保留 |
 | `resuming`  | 平台正在从快照恢复沙箱，瞬时态                                       |
 | `terminated`| 沙箱被显式销毁（`kill`）或因 `on_timeout="kill"` 超时被回收，无法恢复 |
+| `unknown`   | CubeAPI 无法把沙箱映射为上表任一状态：沙箱仍在创建、容器已退出，或无法从节点读取其状态 |
+
+`unknown` 并不等于"已经没了"：上述三种情况 CubeAPI 都会报 `unknown`。上表的 `terminated` 描述的是 `kill()` 与 `on_timeout="kill"` 的结果；容器自行退出时报的是 `unknown`，而不是另一个独立的终态。因为这几种情况共用一个取值，只看 `GET /sandboxes/<id>` 无法区分沙箱是还在启动还是已经死了——判据是 `POST /sandboxes/<id>/connect`：容器已经退出时返回 HTTP 409（`... is not connectable in state 'stopped'`），另外两种情况仍能正常 connect。
 
 状态转换主要由两个参数驱动：
 
@@ -38,14 +41,17 @@ Go：`cubesandbox.NeverTimeout`；Python：`from cubesandbox import NEVER_TIMEOU
    create()       ┌────▼────┐   timeout & on_timeout=pause   ┌─────────┐
   ───────────────►│ running │ ──────────────────────────────►│ paused  │
                   │         │◄──────── connect() 或          │         │
-                  └─┬─────┬─┘     auto_resume 触发的请求     └────┬────┘
-                    │     │                                       │
-        kill()      │     │ timeout & on_timeout=kill             │ kill()
-        ────────────┘     └─────────────────┐                     │
-                                            ▼                     ▼
-                                      ┌────────────┐
-                                      │ terminated │
-                                      └────────────┘
+                  └──┬────┬─┘     auto_resume 触发的请求      └──┬────┬─┘
+                     │    │                                     │    │
+                     │    │ timeout & on_timeout=kill           │    │ timeout & on_timeout=kill
+                     │    └────────────────┐                    │    └──────────────┐
+                     │                     ▼                    │                   ▼
+                     │               ┌────────────┐◄────────────┘
+                     │               │ terminated │
+                     │               └──────▲─────┘
+                     │                      │
+                     │ kill()               │ kill()
+                     └──────────────────────┘
 ```
 
 ## 创建沙箱
@@ -90,7 +96,7 @@ print(info)
 # }
 ```
 
-`endAt` 表示按当前 `timeout` 估算的下一次超时时间。每次接收到新请求或调用 `set_timeout`（若有），`endAt` 会被刷新。对于**永不超时**的沙箱没有截止时间，因此响应中会**省略** `endAt`，而不是把它渲染成等于 `startedAt`。
+`endAt` 表示按当前 `timeout` 估算的下一次超时时间。每次接收到新请求或调用 `set_timeout`（若有），`endAt` 会被刷新。暂停不会取消有限的空闲截止时间，因此沙箱处于暂停状态时，详情和列表 API 仍会返回相同的 `endAt`。对于**永不超时**的沙箱没有截止时间，因此响应中会**省略** `endAt`，而不是把它渲染成等于 `startedAt`。
 
 ## 列出运行中的沙箱
 
@@ -134,11 +140,34 @@ sandbox.kill()
 ```python
 sandbox.pause()                       # 主动保存快照，释放 CPU/内存
 # ... 一段时间过去 ...
-sandbox.connect()                     # 从快照恢复
+sandbox = Sandbox.connect(sandbox.sandbox_id, timeout=300)  # 从快照恢复，并重置空闲超时
 sandbox.run_code("print('back!')")    # 像没暂停过一样继续用
 ```
 
-可参考示例：[`examples/code-sandbox-quickstart/pause.py`](https://github.com/tencentcloud/CubeSandbox/blob/master/examples/code-sandbox-quickstart/pause.py)。
+`pause()` **不会取消**空闲回收。默认 `on_timeout="kill"` 时，之后被暂停的沙箱空闲仍超过 `timeout` 一样会被销毁。若要保住暂停中的沙箱，请传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、或把 `timeout` 设得足够大——见下文 [行为说明](#行为说明)。
+
+`connect(timeout=...)` 可以更新空闲超时，无论沙箱已经在运行，还是需要先从暂停状态恢复。对于运行中的沙箱，正数 timeout 只会在请求窗口更长时延长 deadline；如果要主动缩短生命周期，请使用 `set_timeout(...)`：
+
+| `connect(timeout=...)` | 效果 |
+|---|---|
+| 不传 / `None` | 保持当前超时 |
+| `NEVER_TIMEOUT`（`-1`） | 连接后永不超时 |
+| `N > 0` | 确保至少剩余 N 秒；运行中或暂停中的沙箱保留更长的现有 deadline，否则在连接后重新开 N 秒窗口 |
+| `0` 或 `N < -1` | 拒绝请求并返回 HTTP 400 |
+
+连接暂停中的沙箱时，底层 Resume 如果与另一个生命周期操作同时切换，可能返回 HTTP 409；请等沙箱进入稳定状态后重试。connect 返回 409 也可能是沙箱容器已经退出：这种状态不可恢复，重试不会成功，详见[状态模型](#状态模型)。
+
+已弃用的 `resume(timeout=...)` 保留原有的 `0` 语义：
+
+| `resume(timeout=...)` | 效果 |
+|---|---|
+| 不传 / `None` | 保持当前超时 |
+| `0` | 保持当前超时（立刻到期请用 `set_timeout(0)`） |
+| `NEVER_TIMEOUT`（`-1`） | 恢复后永不超时 |
+| `N > 0` | 从恢复时刻起重新开 N 秒窗口 |
+| `N < -1` | 拒绝请求并返回 HTTP 400 |
+
+可参考示例：[`examples/code-sandbox-quickstart/pause.py`](https://github.com/tencentcloud/CubeSandbox/blob/master/examples/code-sandbox-quickstart/pause.py)。跨机 Resume（`jfs` 或 `s3`，且 `remote_status=ready`）见[跨机迁移](./cross-node-snapshot/requirements.md)。
 
 ### Resume 后的 CubeProxy 缓存
 
@@ -176,7 +205,7 @@ sandbox = Sandbox.create(
 
 ### 自动恢复后的 timeout 重置
 
-每次自动恢复成功后，沙箱获得一个**全新的 `timeout` 计时窗口**（与 e2b 同样语义），所以"恢复 → 短暂使用 → 再次空闲超时 → 再次暂停"的循环可以无缝持续。
+每次自动恢复成功后，**空闲计时重置**，但超时时长不变。所以"恢复 → 短暂使用 → 再次空闲超时 → 再次暂停"的循环可以无缝持续。
 
 ### 何时算"活跃"
 
@@ -185,7 +214,7 @@ sandbox = Sandbox.create(
 - 通过 SDK 调用：`sandbox.run_code(...)`、`sandbox.commands.run(...)`、`sandbox.files.read(...)` / `write(...)`。
 - 通过 HTTP 直连沙箱内的服务（例如 `getHost()` 返回的 URL）。
 
-未配置 `auto_pause` / 不传 `lifecycle` 的沙箱默认行为是 `on_timeout="kill"`：空闲超过 `timeout` 秒后，平台会主动销毁该沙箱。这与 e2b `lifecycle.on_timeout="kill"` 语义一致。若不希望被自动回收，可传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、把 `timeout` 设得足够大，或通过定期活动刷新空闲计时。
+未配置 `auto_pause` / 不传 `lifecycle` 的沙箱默认行为是 `on_timeout="kill"`：空闲超过 `timeout` 秒后，平台会主动销毁该沙箱。这与 e2b `lifecycle.on_timeout="kill"` 语义一致。手动 `pause()` **不会取消** auto-kill：之后被暂停的沙箱，空闲仍超过 `timeout` 时一样会被销毁。若要保住暂停中的沙箱，请传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、把 `timeout` 设得足够大，或通过定期活动刷新空闲计时。
 
 ### 端到端示例
 
@@ -220,7 +249,7 @@ python examples/code-sandbox-quickstart/auto-kill.py
 同一段里的 `create_timeout_insec` 与空闲 TTL 无关，仅限制创建/调度 RPC 的截止时间。更多 CubeMaster 配置项见[服务管理 — CubeMaster 配置项](service-management.md#cubemaster-settings)。
 
 - **暂停的状态保真度**：CPU 寄存器、进程内存、TCP 连接（无外部对端）、文件系统改动都会随快照保留；面向外部的连接（如 sandbox 主动建立的 outbound socket）会在暂停时断开，恢复后由应用层自行重连。
-- **集群一致性**：自动暂停由部署在 control 节点上的 `cube-lifecycle-manager` 服务统一协调；它消费 CubeMaster 通过 Redis stream 发布的生命周期事件，通过 Redis 注册表实时发现所有在线的 CubeProxy 副本并广播状态。多副本环境下用 Redis SETNX 互斥锁确保同一沙箱不会被并发暂停或恢复。
+- **集群一致性**：自动暂停由 `cube-lifecycle-manager` 协调。Helm chart 与 Terraform 一键部署默认都是两个温备副本。两个副本都消费生命周期事件、发现 CubeProxy 并处理恢复回调，由 Redis 租约选出一个副本执行空闲扫描、销毁和过期注册清理。leader 故障切换后沙箱可能多一次 pause/resume，下次请求会照常 auto-resume（见 [Kubernetes FAQ](kubernetes/faq.md)）。每沙箱 Redis 状态转换与 CubeMaster lifecycle lock 共同串行化跨副本的有效暂停/恢复操作。
 - **失败回退**：自动恢复 RPC 失败时，CubeProxy 直接对客户端返回 503 + `Retry-After`，不会让用户卡在长超时上；当沙箱已经被销毁（`killing` / `killed`），则返回 410 Gone 让客户端立即停止重试。
 - **故障排查**：控制节点上执行 `docker logs cube-lifecycle-manager` 查看运行日志，关键事件包括 `create event applied`、`auto-paused sandbox`、`auto-resumed sandbox`、`timeout-killed sandbox`。每个 CubeProxy 副本额外提供 `GET http://<node-ip>:8082/admin/healthz`，其中 `heartbeat_last_pushed_ms` 表示该副本最近一次向 manager 上报心跳的时间戳。管理端口默认为 `8082`；由于 CubeProxy 使用主机网络，当该端口已被占用时可通过 `CUBE_PROXY_ADMIN_PORT` 覆盖。
 
@@ -259,7 +288,50 @@ resume rejected by paused_resource_release_ratio policy: need 1024MB > quota 512
 - 磁盘和 MvmNum **不受 ratio 影响**——暂停快照始终占用存储空间，沙箱对象始终存在。
 - `ratio=0` 是零值安全的默认值：如果从未配置过此项，行为与旧版本完全一致，升级不会产生意外。
 - 此项为**节点级配置**，不同节点可以设置不同的比值，灵活应对异构硬件或分池部署的需求。
-- 当节点上一大批沙箱同时被唤醒、单节点无法承载时，控制面会返回 409 并给出具体配额数字。后续版本将支持**跨节点恢复**，让沙箱可以在集群内自由漂移，最大化整集群利用率。
+- 当节点上一大批沙箱同时被唤醒、单节点无法承载时，控制面会返回 409 并给出具体配额数字。使用共享后端时，调度器可以回退到其他兼容节点——具体条件见[跨机迁移](./cross-node-snapshot/requirements.md)。
+
+## 进程退出后的重启
+
+创建沙箱时可以带 `restartPolicy`。语义和 Kubernetes 的 `restartPolicy` 一样：重启由沙箱主进程（主容器的 init 进程）退出或存活探针失败触发，单位是整台沙箱（一台 microVM），不是沙箱里的某个进程。
+
+| 取值 | 行为 |
+|------|------|
+| `Never`（默认） | 退出后不重启 |
+| `OnFailure` | 非 0 退出、OOM、沙箱崩溃，或存活探针失败时重启 |
+| `Always` | 任何退出都重启，包括正常退出；存活探针失败也会重启 |
+
+### 退避与重启上限
+
+重启会保留磁盘、网络、卷与宿主目录挂载，以及沙箱 ID，再冷启动一次；内存不保留。
+
+连续失败从 10 秒开始退避，每次加倍，最长 300 秒；运行满 10 分钟视为稳定，重启计数清零。重启次数上限由 `restartBackoff.maxRestarts` 控制，默认 `0` 表示不限；集群可以用 `cubelet_conf.max_restarts_cap` 设全局上限，配置后，`0`（不限）也会被收紧到该值。达到上限后不再重启，沙箱不再自动拉起，但仍计入节点 `MvmNum` 配额，直到空闲超时或被显式销毁。
+
+### 存活探针
+
+存活探针写在创建请求里。没有探针、且镜像带 envd（暴露 `49983`）时，节点会默认请求 `GET /health`。没有 envd 的镜像不会被探测，避免误重启。`Never` 配存活探针会被拒绝，返回 HTTP 400：探测永远不可能触发重启，只会把沙箱杀掉。
+
+### 查询重启状态
+
+`GET /sandboxes/<id>` 和列表接口会返回 `restartStatus`，它是 `state` 之外的独立对象：`state` 回答"沙箱在生命周期哪一站"，`restartStatus` 回答"重启状态机走到哪、为什么停下"。容器自行退出后，`state` 只会报 `unknown`，只有靠这个对象才能分清正常退出、崩溃和放弃重启。
+
+它不改变 `state`，只在策略为 `OnFailure` / `Always`、或沙箱发生过退出时出现；默认 `Never` 且从未退出过的沙箱没有它。
+
+`restartState` 的取值如下（首字母大写，和 `state` 的小写枚举不是一套）。表中的"主进程"指主容器的 init 进程：
+
+| 取值 | 含义 |
+|------|------|
+| `Running` | 重启状态机空闲：创建成功或最近一次重启成功。**不代表沙箱正在运行**，是否在运行看 `state` |
+| `Restarting` | 正在重建：销毁旧 VM，再冷启动新 VM |
+| `BackOff` | 已退出，等待退避结束；`nextRestartAt` 是下次尝试时间 |
+| `GaveUp` | 达到 `maxRestarts`，或重建/销毁遇到不可恢复的失败，不再重试 |
+| `Succeeded` | 主进程正常退出（退出码 0），策略决定不重启（`Never`，或 `OnFailure` 且退出码为 0） |
+| `Failed` | 主进程异常退出，策略决定不重启（`Never` 下的任何失败） |
+
+`Restarting`、`BackOff` 是重启流程中的瞬时态；`GaveUp`、`Succeeded`、`Failed` 是终态，不会再自动拉起。`Always` 不会停在 `Succeeded` / `Failed`：它会一直重启；如果设了 `maxRestarts`，达到上限后进入 `GaveUp`。
+
+这两个瞬时态期间不会自动暂停；但空闲超时照常生效，重启操作也不会重置空闲计时（空闲按[客户端活动](#何时算-活跃)计算）。对象里还有 `restartCount`、`lastExitCode`、`lastExitReason`、`lastRestartAt` 等字段，可用于定位退出原因。
+
+暂停不算一次重启：`pause()` 后恢复会保留 `restartCount` 与退出诊断信息，退避间隔也从该计数继续计算。只有稳定期重置才会清零它，因此已经达到 `maxRestarts` 的沙箱即便中间暂停再恢复，下一次退出后仍会停止重启。
 
 ## 下一步
 

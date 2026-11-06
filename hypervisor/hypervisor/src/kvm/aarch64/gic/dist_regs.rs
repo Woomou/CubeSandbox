@@ -77,44 +77,54 @@ static VGIC_DIST_REGS: &[DistReg] = &[
     VGIC_DIST_REG!(GICD_IPRIORITYR, 8, 0),
 ];
 
-fn dist_attr_access(gic: &DeviceFd, offset: u32, val: &u32, set: bool) -> Result<()> {
+/// Read a distributor register.
+///
+/// The destination buffer must be a local `mut` whose address is handed to
+/// KVM_GET_DEVICE_ATTR; going through a `&u32` would let LLVM treat the kernel
+/// write-back as a readonly-noalias violation and fold the result to 0.
+fn dist_attr_get(gic: &DeviceFd, offset: u32) -> Result<u32> {
+    let mut val: u32 = 0;
     let mut gic_dist_attr = kvm_device_attr {
         group: KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
         attr: offset as u64,
-        addr: val as *const u32 as u64,
+        addr: &mut val as *mut u32 as u64,
         flags: 0,
     };
-    if set {
-        gic.set_device_attr(&gic_dist_attr).map_err(|e| {
-            Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into()))
-        })?;
-    } else {
-        gic.get_device_attr(&mut gic_dist_attr).map_err(|e| {
-            Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
-        })?;
-    }
-    Ok(())
+    gic.get_device_attr(&mut gic_dist_attr).map_err(|e| {
+        Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
+    })?;
+    Ok(val)
+}
+
+/// Write a distributor register.
+fn dist_attr_set(gic: &DeviceFd, offset: u32, val: u32) -> Result<()> {
+    let gic_dist_attr = kvm_device_attr {
+        group: KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+        attr: offset as u64,
+        addr: &val as *const u32 as u64,
+        flags: 0,
+    };
+    gic.set_device_attr(&gic_dist_attr)
+        .map_err(|e| Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into())))
 }
 
 /// Get the distributor control register.
 pub fn read_ctlr(gic: &DeviceFd) -> Result<u32> {
-    let val: u32 = 0;
-    dist_attr_access(gic, GICD_CTLR, &val, false)?;
-    Ok(val)
+    dist_attr_get(gic, GICD_CTLR)
 }
 
 /// Set the distributor control register.
 pub fn write_ctlr(gic: &DeviceFd, val: u32) -> Result<()> {
-    dist_attr_access(gic, GICD_CTLR, &val, true)
+    dist_attr_set(gic, GICD_CTLR, val)
 }
 
 fn get_interrupts_num(gic: &DeviceFd) -> Result<u32> {
-    let num_irq = 0;
+    let mut num_irq = 0;
 
     let mut nr_irqs_attr = kvm_device_attr {
         group: KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
         attr: 0,
-        addr: &num_irq as *const u32 as u64,
+        addr: &mut num_irq as *mut u32 as u64,
         flags: 0,
     };
     gic.get_device_attr(&mut nr_irqs_attr).map_err(|e| {
@@ -149,17 +159,41 @@ fn compute_reg_len(gic: &DeviceFd, reg: &DistReg, base: u32) -> Result<u32> {
     Ok(end)
 }
 
-/// Set distributor registers of the GIC.
+/// Distributor registers whose saved zero can be skipped on restore:
+/// I{S,C}* are W1S/W1C bitmaps (a zero write is an architectural no-op),
+/// IROUTER/IPRIORITYR are per-IRQ RAM zeroed by KVM's vgic init
+/// (arch/arm64/kvm/vgic/vgic-init.c); IGROUPR is excluded because KVM GICv3
+/// inits irq->group to 1, so it resets to all-ones.
+fn dist_reg_resets_to_zero(base: u32) -> bool {
+    matches!(
+        base,
+        GICD_ISENABLER
+            | GICD_ICENABLER
+            | GICD_IROUTER
+            | GICD_ISPENDR
+            | GICD_ICPENDR
+            | GICD_ISACTIVER
+            | GICD_ICACTIVER
+            | GICD_IPRIORITYR
+    )
+}
+
+/// Set distributor registers of the GIC. Only valid on a freshly created
+/// vGIC: the zero-skip in `dist_reg_resets_to_zero` assumes the vGIC still
+/// holds its reset values.
 pub fn set_dist_regs(gic: &DeviceFd, state: &[u32]) -> Result<()> {
     let mut idx = 0;
 
     for dreg in VGIC_DIST_REGS {
         let mut base = dreg.base + REG_SIZE as u32 * dreg.bpi as u32;
         let end = compute_reg_len(gic, dreg, base)?;
+        let skip_zero = dist_reg_resets_to_zero(dreg.base);
 
         while base < end {
             let val = state[idx];
-            dist_attr_access(gic, base, &val, true)?;
+            if val != 0 || !skip_zero {
+                dist_attr_set(gic, base, val)?;
+            }
             idx += 1;
             base += REG_SIZE as u32;
         }
@@ -175,11 +209,60 @@ pub fn get_dist_regs(gic: &DeviceFd) -> Result<Vec<u32>> {
         let end = compute_reg_len(gic, dreg, base)?;
 
         while base < end {
-            let val: u32 = 0;
-            dist_attr_access(gic, base, &val, false)?;
-            state.push(val);
+            state.push(dist_attr_get(gic, base)?);
             base += REG_SIZE as u32;
         }
     }
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::aarch64::gic::VgicConfig;
+    use crate::kvm::KvmGicV3Its;
+
+    fn test_vgic_config() -> VgicConfig {
+        VgicConfig {
+            vcpu_count: 1,
+            dist_addr: 0x0900_0000 - 0x01_0000,
+            dist_size: 0x01_0000,
+            redists_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000,
+            redists_size: 0x02_0000,
+            msi_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000 - 0x02_0000,
+            msi_size: 0x02_0000,
+            nr_irqs: 256,
+        }
+    }
+
+    // The zero-skip is reset-value-dependent only for the RAM classes
+    // (IROUTER/IPRIORITYR); the W1S/W1C bitmaps ignore a zero write
+    // whatever the current state. Pin the RAM banks against the running
+    // kernel.
+    #[test]
+    fn test_fresh_vgic_ram_skip_list_reads_zero() {
+        let hv = crate::new().unwrap();
+        let vm = hv.create_vm().unwrap();
+        vm.create_vcpu(0, None).unwrap();
+        let gic = KvmGicV3Its::new(&*vm, test_vgic_config()).expect("Cannot create gic");
+
+        let state = get_dist_regs(&gic.device).unwrap();
+        let mut idx = 0;
+        for dreg in VGIC_DIST_REGS {
+            let base = dreg.base + REG_SIZE as u32 * dreg.bpi as u32;
+            let end = compute_reg_len(&gic.device, dreg, base).unwrap();
+            let words = ((end - base) / REG_SIZE as u32) as usize;
+            if matches!(dreg.base, GICD_IROUTER | GICD_IPRIORITYR) {
+                for w in &state[idx..idx + words] {
+                    assert_eq!(
+                        *w, 0,
+                        "RAM skip-list register {:#06x} is non-zero on a fresh vGIC",
+                        dreg.base
+                    );
+                }
+            }
+            idx += words;
+        }
+        assert_eq!(idx, state.len());
+    }
 }

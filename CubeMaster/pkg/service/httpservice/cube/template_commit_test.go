@@ -23,7 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // invokeCommitHandler drives the gin handler handleSandboxCommitAction with a
@@ -155,6 +155,23 @@ func TestHandleSandboxCommitActionSanitizesInternalErrors(t *testing.T) {
 	assert.Equal(t, int(errorcode.ErrorCode_MasterInternalError), got.Res.Ret.RetCode)
 	assert.Equal(t, "failed to submit template commit", got.Res.Ret.RetMsg)
 	assert.NotContains(t, got.Res.Ret.RetMsg, "10.0.0.2:3306")
+}
+
+func TestHandleSandboxCommitActionRejectsCallerSuppliedNetworkQos(t *testing.T) {
+	body := `{
+		"requestID":"req-qos",
+		"sandbox_id":"sb-1",
+		"create_request":{
+			"annotations":{"cube.master.net":"{}"}
+		}
+	}`
+	req := httptest.NewRequest("POST", "/cube/sandbox/commit", strings.NewReader(body))
+	rt := &CubeLog.RequestTrace{}
+	got := invokeCommitHandler(t, req, rt)
+
+	assert.Equal(t, int(errorcode.ErrorCode_MasterParamsError), got.Res.Ret.RetCode)
+	assert.Contains(t, got.Res.Ret.RetMsg, "template-managed")
+	assert.Equal(t, int64(errorcode.ErrorCode_MasterParamsError), rt.RetCode)
 }
 
 func TestHandleSandboxCommitActionIgnoresProvidedTemplateID(t *testing.T) {

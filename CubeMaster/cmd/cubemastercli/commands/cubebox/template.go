@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -20,10 +22,12 @@ import (
 
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
-	api "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	commands "github.com/tencentcloud/CubeSandbox/CubeMaster/cmd/cubemastercli/commands"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/qos"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
+	api "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/urfave/cli"
 )
 
@@ -47,31 +51,39 @@ type templateResponse struct {
 	Status                     string                      `json:"status,omitempty"`
 	LastError                  string                      `json:"last_error,omitempty"`
 	DisplayName                string                      `json:"display_name,omitempty"`
+	StorageBackend             string                      `json:"storage_backend,omitempty"`
+	Backend                    string                      `json:"backend,omitempty"`
 	CreatedAt                  string                      `json:"created_at,omitempty"`
 	ImageInfo                  string                      `json:"image_info,omitempty"`
 	JobID                      string                      `json:"job_id,omitempty"`
 	Replicas                   []templateReplicaStatus     `json:"replicas,omitempty"`
 	CreateRequest              *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
+	ConfiguredQos              *qos.Config                 `json:"configured_qos,omitempty"`
 	CubeEgressCABaked          bool                        `json:"cube_egress_ca_baked,omitempty"`
 	CubeEgressCAFingerprint    string                      `json:"cube_egress_ca_fingerprint,omitempty"`
 	CubeEgressCATargetsWritten int                         `json:"cube_egress_ca_targets_written,omitempty"`
 }
 
 type templateListResponse struct {
-	Ret  *types.Ret        `json:"ret,omitempty"`
-	Data []templateSummary `json:"data,omitempty"`
+	Ret   *types.Ret        `json:"ret,omitempty"`
+	Data  []templateSummary `json:"data,omitempty"`
+	Total int               `json:"total,omitempty"`
 }
 
 type templateSummary struct {
-	TemplateID   string `json:"template_id,omitempty"`
-	InstanceType string `json:"instance_type,omitempty"`
-	Version      string `json:"version,omitempty"`
-	Status       string `json:"status,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
-	DisplayName  string `json:"display_name,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	ImageInfo    string `json:"image_info,omitempty"`
-	JobID        string `json:"job_id,omitempty"`
+	TemplateID     string `json:"template_id,omitempty"`
+	InstanceType   string `json:"instance_type,omitempty"`
+	Version        string `json:"version,omitempty"`
+	Status         string `json:"status,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	StorageBackend string `json:"storage_backend,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	OriginNodeID   string `json:"origin_node_id,omitempty"`
+	OriginNodeIP   string `json:"origin_node_ip,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	ImageInfo      string `json:"image_info,omitempty"`
+	JobID          string `json:"job_id,omitempty"`
 }
 
 type templateImageJobResponse struct {
@@ -118,6 +130,12 @@ type templateDeleteRequest struct {
 	TemplateID   string `json:"template_id,omitempty"`
 	InstanceType string `json:"instance_type,omitempty"`
 	Sync         bool   `json:"sync,omitempty"`
+	Force        bool   `json:"force,omitempty"`
+}
+
+type templateMigrateRequest struct {
+	RequestID  string `json:"requestID,omitempty"`
+	TemplateID string `json:"template_id,omitempty"`
 }
 
 func mergeCubeNetworkConfigFlags(c *cli.Context, existing *types.CubeNetworkConfig) *types.CubeNetworkConfig {
@@ -318,6 +336,7 @@ var TemplateCommand = cli.Command{
 		TemplateCreateCommand,
 		TemplateCommitCommand,
 		TemplateCreateFromImageCommand,
+		TemplateMergeCommand,
 		TemplateRedoCommand,
 		TemplateDeleteCommand,
 		TemplateSetAliasCommand,
@@ -604,16 +623,20 @@ var TemplateRenderCommand = cli.Command{
 var TemplateDeleteCommand = cli.Command{
 	Name:      "delete",
 	Usage:     "delete template metadata and node replicas",
-	ArgsUsage: "<template-id>",
+	ArgsUsage: "<template-id> [template-id ...]",
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  "template-id",
 			Usage: "template id to delete",
 		},
+		cli.BoolFlag{
+			Name:  "force",
+			Usage: "clear stuck builds before deleting; templates in use cannot be deleted",
+		},
 	},
 	Action: func(c *cli.Context) error {
-		templateID := resolveTemplateID(c)
-		if templateID == "" {
+		templateIDs := resolveTemplateIDs(c)
+		if len(templateIDs) == 0 {
 			return errors.New("template-id is required")
 		}
 
@@ -622,34 +645,53 @@ var TemplateDeleteCommand = cli.Command{
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
-		requestID := uuid.New().String()
 		host := serverList[rand.Int()%len(serverList)]
 		url := fmt.Sprintf("http://%s/cube/template", net.JoinHostPort(host, port))
 
-		req := &templateDeleteRequest{
-			RequestID:  requestID,
-			TemplateID: templateID,
+		var deleteErr error
+		for _, templateID := range templateIDs {
+			if err := deleteTemplate(c, url, templateID); err != nil {
+				deleteErr = errors.Join(deleteErr, fmt.Errorf("%s: %w", templateID, err))
+				continue
+			}
+			log.Printf("template deleted: %s\n", templateID)
 		}
-		body, err := jsoniter.Marshal(req)
-		if err != nil {
-			return err
-		}
-
-		rsp := &templateResponse{}
-		if err := doHttpReq(c, url, http.MethodDelete, requestID, bytes.NewBuffer(body), rsp); err != nil {
-			log.Printf("template delete request err. %s. RequestId: %s\n", err.Error(), requestID)
-			return err
-		}
-		if rsp.Ret == nil {
-			return errors.New("empty response")
-		}
-		if rsp.Ret.RetCode != 200 {
-			log.Printf("template delete failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
-			return errors.New(rsp.Ret.RetMsg)
-		}
-		log.Printf("template deleted: %s\n", templateID)
-		return nil
+		return deleteErr
 	},
+}
+
+func resolveTemplateIDs(c *cli.Context) []string {
+	if id := c.String("template-id"); id != "" {
+		return []string{id}
+	}
+	return c.Args()
+}
+
+func deleteTemplate(c *cli.Context, url, templateID string) error {
+	requestID := uuid.New().String()
+	req := &templateDeleteRequest{
+		RequestID:  requestID,
+		TemplateID: templateID,
+		Force:      c.Bool("force"),
+	}
+	body, err := jsoniter.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	rsp := &templateResponse{}
+	if err := doHttpReq(c, url, http.MethodDelete, requestID, bytes.NewBuffer(body), rsp); err != nil {
+		log.Printf("template delete request err. %s. TemplateId: %s. RequestId: %s\n", err.Error(), templateID, requestID)
+		return err
+	}
+	if rsp.Ret == nil {
+		return errors.New("empty response")
+	}
+	if rsp.Ret.RetCode != 200 {
+		log.Printf("template delete failed. %s. TemplateId: %s. RequestId: %s\n", rsp.Ret.RetMsg, templateID, requestID)
+		return errors.New(rsp.Ret.RetMsg)
+	}
+	return nil
 }
 
 // templateSetAliasRequest is the JSON body for PUT /cube/template/:id/alias.
@@ -849,20 +891,23 @@ var TemplateCreateFromImageCommand = cli.Command{
 		cli.StringFlag{Name: "writable-layer-size", Usage: "immutable writable layer size, e.g. 20Gi"},
 		cli.StringSliceFlag{Name: "expose-port", Usage: "container port to expose for the template; repeat the flag to specify multiple ports"},
 		cli.StringFlag{Name: "instance-type", Value: "cubebox", Usage: "instance type"},
+		cli.StringFlag{Name: "backend", Usage: "CoW backend for this template and its sandboxes/snapshots (xfs|s3|jfs; jfs keeps volumes and snapshots on the JuiceFS mount); omit to keep the historical xfs path"},
 		cli.StringFlag{Name: "network-type", Value: "tap", Usage: "network type"},
 		cli.StringSliceFlag{Name: "node", Usage: "create template only on the specified node id or host ip; repeat to specify multiple nodes"},
 		cli.BoolFlag{Name: "allow-internet-access", Usage: "set allowInternetAccess on the network config for the generated template request"},
 		cli.StringSliceFlag{Name: "allow-out-cidr", Usage: "append an allowed egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
 		cli.StringSliceFlag{Name: "deny-out-cidr", Usage: "append a denied egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
+		cli.StringFlag{Name: "qos", Usage: "template QoS JSON or @path to a JSON file, e.g. '{\"network\":{\"bandwidthMbps\":100,\"packetsPerSecond\":5000},\"blockIo\":{\"throughputMiBps\":64,\"iops\":1000}}'"},
 		cli.StringFlag{Name: "registry-username", Usage: "registry username"},
 		cli.StringFlag{Name: "registry-password", Usage: "registry password"},
 		cli.BoolFlag{Name: "enable-ivshmem", Usage: "boot the template build sandbox with ivshmem enabled"},
 
 		cli.StringSliceFlag{Name: "cmd", Usage: "override container ENTRYPOINT (command); repeat for multiple elements, e.g. --cmd /bin/sh --cmd -c"},
 		cli.StringSliceFlag{Name: "arg", Usage: "override container CMD (args); repeat for multiple elements"},
-		cli.StringSliceFlag{Name: "env", Usage: "set environment variable, KEY=VALUE format; repeat for multiple envs"},
+		cli.StringSliceFlag{Name: "env", Usage: "set environment variable, KEY=VALUE format; repeat for multiple envs. Merged over the image ENV (same key overrides, like docker run -e)"},
+		cli.StringFlag{Name: "user", Usage: "container user for the template build and later sandboxes: uid, uid:gid, username, or username:gid (gid must be numeric). Omit to keep the default root user"},
 		cli.StringSliceFlag{Name: "dns", Usage: "set container DNS nameserver; repeat for multiple servers"},
-		cli.IntFlag{Name: "probe", Usage: "enable HTTP GET probe on the specified port (e.g. --probe 9000); sets timeout_ms=30000, period_ms=500"},
+		cli.IntFlag{Name: "probe", Usage: "enable HTTP GET probe on the specified port (e.g. --probe 9000); sets timeout_ms=30000, period_ms=100, probe_timeout_ms=300"},
 		cli.StringFlag{Name: "probe-path", Value: "/health", Usage: "HTTP path for the readiness probe (default: /health); only effective when --probe is set"},
 		cli.IntFlag{Name: "cpu", Value: 2000, Usage: "CPU millicores for the template container (default: 2000, i.e. 2 cores)"},
 		cli.IntFlag{Name: "memory", Value: 2000, Usage: "Memory for the template container in MB (default: 2000 MB)"},
@@ -894,6 +939,10 @@ var TemplateCreateFromImageCommand = cli.Command{
 		if err != nil {
 			return err
 		}
+		qosConfig, err := parseCreateFromImageQos(c)
+		if err != nil {
+			return err
+		}
 		req := &types.CreateTemplateFromImageReq{
 			Request:        &types.Request{RequestID: uuid.New().String()},
 			SourceImageRef: c.String("image"),
@@ -904,8 +953,10 @@ var TemplateCreateFromImageCommand = cli.Command{
 			ExposedPorts:       exposedPorts,
 			InstanceType:       c.String("instance-type"),
 			NetworkType:        c.String("network-type"),
+			Backend:            c.String("backend"),
 			RegistryUsername:   c.String("registry-username"),
 			RegistryPassword:   c.String("registry-password"),
+			Qos:                qosConfig,
 			ContainerOverrides: containerOverrides,
 		}
 		// --with-cube-ca defaults true (BoolTFlag). We always materialise
@@ -957,6 +1008,65 @@ var TemplateCreateFromImageCommand = cli.Command{
 		}
 		log.Printf("submitted template image job: job_id=%s template_id=%s\n", rsp.Job.JobID, rsp.Job.TemplateID)
 		return runImageJobWatch(c, rsp.Job.JobID)
+	},
+}
+
+var TemplateMergeCommand = cli.Command{
+	Name: "merge",
+	// "merge" is the CLI spelling of the /cube/template/migrate API; the usage
+	// text keeps the word "migrate" so docs/errors that mention `tpl migrate`
+	// still lead here.
+	Usage:     "migrate one template artifact to the template center (the CLI command is `merge`; the API is /cube/template/migrate)",
+	ArgsUsage: "<template-id>",
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "template-id", Usage: "template id (or alias) to migrate"},
+		cli.BoolFlag{Name: "detach, no-wait", Usage: "submit and exit immediately instead of watching the merge job to completion"},
+		cli.DurationFlag{Name: "interval", Value: defaultWatchInterval, Usage: "poll interval while watching the job"},
+		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
+	},
+	Action: func(c *cli.Context) error {
+		templateID := resolveTemplateID(c)
+		if templateID == "" {
+			return errors.New("template-id is required")
+		}
+		serverList = getServerAddrs(c)
+		if len(serverList) == 0 {
+			return errors.New("no server addr")
+		}
+		port = c.GlobalString("port")
+		host := serverList[rand.Int()%len(serverList)]
+		req := &templateMigrateRequest{
+			RequestID:  uuid.New().String(),
+			TemplateID: templateID,
+		}
+		body, err := jsoniter.Marshal(req)
+		if err != nil {
+			return err
+		}
+		url := fmt.Sprintf("http://%s/cube/template/migrate", net.JoinHostPort(host, port))
+		rsp := &templateImageJobResponse{}
+		if err := doHttpReq(c, url, http.MethodPost, req.RequestID, bytes.NewBuffer(body), rsp); err != nil {
+			return err
+		}
+		if rsp.Ret == nil {
+			return errors.New("empty response")
+		}
+		if rsp.Ret.RetCode != 200 {
+			return errors.New(rsp.Ret.RetMsg)
+		}
+		if c.Bool("json") {
+			commands.PrintAsJSON(rsp)
+			return nil
+		}
+		if detachRequested(c) || rsp.Job == nil {
+			printTemplateImageJob(rsp.Job)
+			return nil
+		}
+		log.Printf("submitted merge job: job_id=%s template_id=%s\n", rsp.Job.JobID, rsp.Job.TemplateID)
+		// Watch through the dedicated migrate endpoint, not the from-image one:
+		// the from-image status handler happens to return MIGRATE rows today
+		// only because it does not filter by operation.
+		return runMigrateJobWatch(c, rsp.Job.JobID)
 	},
 }
 
@@ -1021,7 +1131,7 @@ var TemplateRedoCommand = cli.Command{
 
 var TemplateStatusCommand = cli.Command{
 	Name:  "status",
-	Usage: "show create-from-image job status",
+	Usage: "show template image/merge job status",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "job-id", Usage: "template image job id"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
@@ -1046,7 +1156,7 @@ var TemplateStatusCommand = cli.Command{
 
 var TemplateWatchCommand = cli.Command{
 	Name:  "watch",
-	Usage: "watch create-from-image job progress until completion",
+	Usage: "watch template image/merge job progress until completion",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "job-id", Usage: "template image job id"},
 		cli.DurationFlag{Name: "interval", Value: 2 * time.Second, Usage: "poll interval"},
@@ -1112,6 +1222,14 @@ var TemplateListCommand = cli.Command{
 			Name:  "json",
 			Usage: "print raw json response",
 		},
+		cli.IntFlag{
+			Name:  "limit",
+			Usage: "max templates to return (0 = all)",
+		},
+		cli.IntFlag{
+			Name:  "offset",
+			Usage: "number of templates to skip",
+		},
 		cli.StringFlag{
 			Name:  "output,o",
 			Usage: "output format, set to wide for more columns",
@@ -1127,6 +1245,11 @@ var TemplateListCommand = cli.Command{
 		requestID := uuid.New().String()
 		host := serverList[rand.Int()%len(serverList)]
 		url := fmt.Sprintf("http://%s/cube/template", net.JoinHostPort(host, port))
+		paged := false
+		if query := templateListQuery(c); query != "" {
+			url += "?" + query
+			paged = true
+		}
 
 		rsp := &templateListResponse{}
 		if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
@@ -1144,11 +1267,14 @@ var TemplateListCommand = cli.Command{
 			commands.PrintAsJSON(rsp)
 			return nil
 		}
+		if paged {
+			log.Printf("total: %d\n", rsp.Total)
+		}
 		wideOutput := strings.EqualFold(strings.TrimSpace(c.String("output")), "wide")
 		w := tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
-		tabHeader := "TEMPLATE_ID\tALIAS\tSTATUS\tJOB_ID\tCREATED_AT\tIMAGE_INFO"
+		tabHeader := "TEMPLATE_ID\tALIAS\tSTATUS\tBACKEND\tJOB_ID\tCREATED_AT\tIMAGE_INFO"
 		if wideOutput {
-			tabHeader = "TEMPLATE_ID\tALIAS\tSTATUS\tJOB_ID\tLAST_ERROR\tCREATED_AT\tIMAGE_INFO"
+			tabHeader = "TEMPLATE_ID\tALIAS\tSTATUS\tBACKEND\tJOB_ID\tLAST_ERROR\tCREATED_AT\tIMAGE_INFO"
 		}
 		fmt.Fprintln(w, tabHeader)
 		for _, item := range rsp.Data {
@@ -1160,16 +1286,39 @@ var TemplateListCommand = cli.Command{
 			if alias == "" {
 				alias = "-"
 			}
+			backend := firstNonEmptyCLI(item.Backend, item.StorageBackend)
+			var row string
 			if wideOutput {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					item.TemplateID, alias, item.Status, jobID, item.LastError, item.CreatedAt, item.ImageInfo)
-				continue
+				row = fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+					item.TemplateID, alias, item.Status, backend, jobID, item.LastError, item.CreatedAt, item.ImageInfo)
+			} else {
+				row = fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s",
+					item.TemplateID, alias, item.Status, backend, jobID, item.CreatedAt, item.ImageInfo)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.TemplateID, alias, item.Status, jobID, item.CreatedAt, item.ImageInfo)
+			fmt.Fprintln(w, row)
 		}
 		return w.Flush()
 	},
+}
+
+// templateListQuery builds the paging query string for tpl ls; empty when no
+// paging flag is set, keeping the request identical to the historical one.
+func templateListQuery(c *cli.Context) string {
+	query := url.Values{}
+	if c.IsSet("limit") {
+		if limit := c.Int("limit"); limit > 0 {
+			query.Set("limit", strconv.Itoa(limit))
+		}
+	}
+	if c.IsSet("offset") {
+		if offset := c.Int("offset"); offset > 0 {
+			query.Set("offset", strconv.Itoa(offset))
+		}
+	}
+	if len(query) == 0 {
+		return ""
+	}
+	return query.Encode()
 }
 
 func printTemplateSummary(rsp *templateResponse) {
@@ -1178,6 +1327,9 @@ func printTemplateSummary(rsp *templateResponse) {
 		log.Printf("alias: %s\n", rsp.DisplayName)
 	}
 	log.Printf("instance_type: %s\n", rsp.InstanceType)
+	if backend := firstNonEmptyCLI(rsp.Backend, rsp.StorageBackend); backend != "" {
+		log.Printf("backend: %s\n", backend)
+	}
 	log.Printf("version: %s\n", rsp.Version)
 	log.Printf("status: %s\n", rsp.Status)
 	if rsp.CreatedAt != "" {
@@ -1191,6 +1343,16 @@ func printTemplateSummary(rsp *templateResponse) {
 	}
 	if jobID := strings.TrimSpace(rsp.JobID); jobID != "" {
 		log.Printf("job_id: %s\n", jobID)
+	}
+	if rsp.ConfiguredQos == nil || rsp.ConfiguredQos.Network == nil {
+		log.Printf("network_qos: disabled\n")
+	} else {
+		log.Printf("network_qos: %s\n", formatNetworkQosLimits(rsp.ConfiguredQos.Network.BandwidthMbps, rsp.ConfiguredQos.Network.PacketsPerSecond))
+	}
+	if rsp.ConfiguredQos == nil || rsp.ConfiguredQos.BlockIO == nil {
+		log.Printf("block_io_qos: disabled\n")
+	} else {
+		log.Printf("block_io_qos: %s\n", formatBlockIOQosLimits(rsp.ConfiguredQos.BlockIO.ThroughputMiBps, rsp.ConfiguredQos.BlockIO.IOPS))
 	}
 	// CubeEgress CA bake status. Always print so an operator can tell
 	// at a glance whether sandboxes from this template will trust
@@ -1209,6 +1371,28 @@ func printTemplateSummary(rsp *templateResponse) {
 			replica.NodeID, replica.NodeIP, replica.Status, replica.Phase, replica.Spec, replica.ErrorMessage)
 	}
 	_ = w.Flush()
+}
+
+func formatNetworkQosLimits(bandwidthMbps, packetsPerSecond uint32) string {
+	var limits []string
+	if bandwidthMbps > 0 {
+		limits = append(limits, fmt.Sprintf("%d Mbit/s per direction", bandwidthMbps))
+	}
+	if packetsPerSecond > 0 {
+		limits = append(limits, fmt.Sprintf("%d packets/s per direction", packetsPerSecond))
+	}
+	return strings.Join(limits, ", ")
+}
+
+func formatBlockIOQosLimits(throughputMiBps, iops uint32) string {
+	var limits []string
+	if throughputMiBps > 0 {
+		limits = append(limits, fmt.Sprintf("%d MiB/s per block device", throughputMiBps))
+	}
+	if iops > 0 {
+		limits = append(limits, fmt.Sprintf("%d IOPS per block device", iops))
+	}
+	return strings.Join(limits, ", ")
 }
 
 // fingerprintShortOrEmpty trims a sha256 hex fingerprint to the first
@@ -1258,6 +1442,28 @@ func fetchTemplateImageJob(c *cli.Context, jobID string) (*templateImageJobRespo
 	requestID := uuid.New().String()
 	host := serverList[rand.Int()%len(serverList)]
 	url := fmt.Sprintf("http://%s/cube/template/from-image?job_id=%s", net.JoinHostPort(host, port), jobID)
+	rsp := &templateImageJobResponse{}
+	if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
+		return nil, err
+	}
+	if rsp.Ret == nil {
+		return nil, errors.New("empty response")
+	}
+	if rsp.Ret.RetCode != 200 {
+		return nil, errors.New(rsp.Ret.RetMsg)
+	}
+	return rsp, nil
+}
+
+func fetchTemplateMigrateJob(c *cli.Context, jobID string) (*templateImageJobResponse, error) {
+	serverList = getServerAddrs(c)
+	if len(serverList) == 0 {
+		return nil, errors.New("no server addr")
+	}
+	port = c.GlobalString("port")
+	requestID := uuid.New().String()
+	host := serverList[rand.Int()%len(serverList)]
+	url := fmt.Sprintf("http://%s/cube/template/migrate?job_id=%s", net.JoinHostPort(host, port), jobID)
 	rsp := &templateImageJobResponse{}
 	if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
 		return nil, err
@@ -1330,11 +1536,20 @@ func formatTemplateImageJobWatchPhase(job *types.TemplateImageJobInfo) string {
 	phase := "UNKNOWN"
 	if job != nil {
 		if job.Status == "READY" {
+			if job.Operation == "MIGRATE" {
+				return "READY"
+			}
 			return "[7/7] READY"
 		}
 		if job.Phase != "" {
 			phase = job.Phase
 		}
+	}
+
+	// Migrate jobs have a single transfer phase; the 7-step build progress
+	// display is meaningless for them.
+	if job != nil && job.Operation == "MIGRATE" {
+		return phase
 	}
 
 	phaseOrder := map[string]int{
@@ -1469,6 +1684,52 @@ func parseExposePortFlags(values []string) ([]int32, error) {
 	return out, nil
 }
 
+// maxCreateFromImageQosPayloadBytes bounds both inline JSON and @file input;
+// the file path reads at most one byte beyond it to detect an oversized file.
+const maxCreateFromImageQosPayloadBytes = 64 << 10
+
+func parseCreateFromImageQos(c *cli.Context) (*qos.Config, error) {
+	raw := strings.TrimSpace(c.String("qos"))
+	if raw == "" {
+		return nil, nil
+	}
+	var payload []byte
+	if strings.HasPrefix(raw, "@") {
+		path := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+		if path == "" {
+			return nil, errors.New("invalid qos value: @ must be followed by a file path")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("read qos file %q: %w", path, err)
+		}
+		defer file.Close()
+		payload, err = io.ReadAll(io.LimitReader(file, maxCreateFromImageQosPayloadBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read qos file %q: %w", path, err)
+		}
+	} else {
+		if !strings.HasPrefix(raw, "{") {
+			return nil, errors.New("invalid qos value: expected inline JSON object or @path")
+		}
+		payload = []byte(raw)
+	}
+	if len(payload) == 0 {
+		return nil, errors.New("qos configuration must not be empty")
+	}
+	if len(payload) > maxCreateFromImageQosPayloadBytes {
+		return nil, fmt.Errorf("qos configuration exceeds %d bytes", maxCreateFromImageQosPayloadBytes)
+	}
+	configured := &qos.Config{}
+	if err := jsoniter.Unmarshal(payload, configured); err != nil {
+		return nil, fmt.Errorf("parse qos configuration: %w", err)
+	}
+	if err := configured.Validate(); err != nil {
+		return nil, err
+	}
+	return configured, nil
+}
+
 func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) {
 	cmds := c.StringSlice("cmd")
 	args := c.StringSlice("arg")
@@ -1478,8 +1739,9 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 	cpuMillicores := c.Int("cpu")
 	memoryMB := c.Int("memory")
 	enableInjectEnvd := c.Bool("enable-inject-envd")
+	user := strings.TrimSpace(c.String("user"))
 
-	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && len(dnsServers) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") && !enableInjectEnvd {
+	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && len(dnsServers) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") && !enableInjectEnvd && user == "" {
 		return nil, nil
 	}
 
@@ -1529,10 +1791,18 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 				},
 			},
 			TimeoutMs:        30000,
-			PeriodMs:         500,
-			FailureThreshold: 60,
+			PeriodMs:         100,
+			FailureThreshold: 300,
 			SuccessThreshold: 1,
+			ProbeTimeoutMs:   300,
 		}
+	}
+	if user != "" {
+		securityContext, err := templatecenter.ParseTemplateUser(user)
+		if err != nil {
+			return nil, err
+		}
+		overrides.SecurityContext = securityContext
 	}
 	if enableInjectEnvd {
 		if overrides.Annotations == nil {

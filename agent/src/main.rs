@@ -43,6 +43,7 @@ mod config;
 mod console;
 mod device;
 mod fixes;
+mod fsfreeze;
 mod linux_abi;
 mod metrics;
 mod mount;
@@ -540,9 +541,6 @@ mod tests {
             let msg = format!("test[{}]: {:?}", i, d);
             let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
             defer!({
-                // rfd is closed by the use of PipeStream in the crate_logger_task function,
-                // but we will attempt to close in case of a failure
-                let _ = unistd::close(rfd);
                 unistd::close(wfd).unwrap();
             });
 

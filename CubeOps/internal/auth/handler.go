@@ -6,6 +6,8 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/httputil"
@@ -34,6 +36,30 @@ func (h *Handler) RegisterPublic(r *gin.RouterGroup) {
 	//rate-limit login to protect weak default credentials.
 	r.POST("/auth/login", LoginRateLimit(), h.Login)
 	r.POST("/auth/refresh", h.Refresh)
+	if os.Getenv("CUBE_OPS_TRUSTED_SSO_HEADER") != "" {
+		r.POST("/auth/sso", h.SSOLogin)
+	}
+}
+
+// SSOLogin exchanges a reverse-proxy-authenticated identity for a CubeOps
+// session. It is disabled unless CUBE_OPS_TRUSTED_SSO_HEADER is configured.
+func (h *Handler) SSOLogin(c *gin.Context) {
+	header := os.Getenv("CUBE_OPS_TRUSTED_SSO_HEADER")
+	identity := strings.TrimSpace(c.GetHeader(header))
+	if header == "" || identity == "" {
+		httputil.WriteError(c, http.StatusUnauthorized, "trusted SSO identity required")
+		return
+	}
+	res, err := h.svc.LoginTrustedIdentity(c.Request.Context(), identity)
+	if err != nil {
+		logging.G(c.Request.Context()).Errorf("SSO login failed: identity=%q error=%q", identity, err.Error())
+		httputil.WriteError(c, http.StatusInternalServerError, "failed to create SSO session")
+		return
+	}
+	httputil.WriteJSON(c, http.StatusOK, model.LoginResponse{
+		AccessToken: res.AccessToken, RefreshToken: res.RefreshToken,
+		Username: res.Username, ExpiresInSecs: res.ExpiresInSecs,
+	})
 }
 
 // RegisterAuthed installs the auth routes that require a valid JWT

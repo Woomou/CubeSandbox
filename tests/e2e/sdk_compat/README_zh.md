@@ -86,6 +86,40 @@ pytest --run-e2e
 pytest --run-e2e --sdk-e2e-backends=cubesandbox
 ```
 
+## 模板 QoS E2E
+
+QoS 用例会自行创建并清理模板和沙箱，因此单独运行该文件时不需要设置 `CUBE_TEMPLATE_ID`。`CUBE_TEMPLATE_E2E_IMAGE` 指定的镜像需要在 `49983` 端口提供 envd，并在 `49999` 端口响应 `/health`。
+
+运行配置与运行时状态用例：
+
+```bash
+CUBE_TEMPLATE_E2E_IMAGE=cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
+pytest --run-e2e cases/qos/test_template_qos.py::test_template_qos_control_and_runtime_state
+```
+
+带宽用例需要沙箱能够访问 iperf3 server，块设备 I/O 用例需要可写的 virtio-blk 文件系统。先执行 `iperf3 -s -p 5201`，再设置 server IP 并启用数据面测试：
+
+```bash
+CUBE_TEMPLATE_E2E_IMAGE=cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
+CUBE_QOS_IPERF_SERVER=10.0.0.10 \
+CUBE_QOS_DATAPLANE_E2E=1 \
+CUBE_QOS_E2E_INSTALL_TOOLS=1 \
+pytest --run-e2e -m "qos and not qos_node" cases/qos/test_template_qos.py
+```
+
+pytest runner 不需要安装 `iperf3` 或 `fio`，但沙箱中需要。命令缺失时，对应用例会跳过；设置 `CUBE_QOS_E2E_INSTALL_TOOLS=1` 后可以在沙箱内安装，也可以通过 `CUBE_QOS_E2E_INSTALL_COMMAND` 自定义安装命令。临时模板会自动把 IP 形式的 iperf3 server 加入 `allow_out`。配置与运行时状态用例通过 `CUBE_QOS_CONTROL_TEMPLATE_ID` 复用模板，带宽和块设备 I/O 用例通过 `CUBE_QOS_E2E_TEMPLATE_ID` 复用模板，PPS 用例通过 `CUBE_QOS_PPS_TEMPLATE_ID` 复用模板。复用的模板需要提前放通测试端点，并且 QoS 配置需要与对应测试预期一致。
+
+PPS 用例需要在沙箱所在计算节点运行，因为测试会读取 TAP 计数器。它还需要数据面开关，因此要同时设置 `CUBE_QOS_DATAPLANE_E2E=1` 和 `CUBE_QOS_NODE_PPS_E2E=1`，将 `CUBE_QOS_IPERF_SERVER` 设为沙箱可访问的节点 IP，然后执行：
+
+```bash
+CUBE_TEMPLATE_E2E_IMAGE=cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
+CUBE_TEMPLATE_E2E_NODE=<node-id> \
+CUBE_QOS_IPERF_SERVER=<node-ip> \
+CUBE_QOS_DATAPLANE_E2E=1 \
+CUBE_QOS_NODE_PPS_E2E=1 \
+pytest --run-e2e -m qos_node cases/qos/test_template_qos.py
+```
+
 ## 执行范围
 
 ```bash
@@ -98,8 +132,8 @@ pytest --run-e2e -m "smoke or p0" --sdk-e2e-backends=cubesandbox
 # 每日双 SDK 兼容性回归
 SDK_E2E_BACKENDS=e2b,cubesandbox pytest --run-e2e -m "p0 or p1"
 
-# Volume Plugin 回归（需手动部署并配置插件；cubesandbox >= 0.6.0）
-SDK_E2E_VOLUME_PLUGIN=true pytest --run-e2e -m volume --sdk-e2e-backends=cubesandbox
+# Volume Plugin 回归（默认 S3 + MinIO；cubesandbox >= 0.6.0）
+pytest --run-e2e -m volume --sdk-e2e-backends=cubesandbox
 
 # 更广泛的回归
 SDK_E2E_BACKENDS=e2b,cubesandbox \
@@ -160,6 +194,78 @@ export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 export SDK_E2E_BACKENDS=e2b,cubesandbox
 pytest --run-e2e
 ```
+
+## E2B SDK 兼容性
+
+同一个环境里同一个包只能装一个版本，因此上面任何一种执行方式验证的都只是"当前恰好装
+着的那个"版本。`e2b-versions.txt` 记录本套件实际验证过的版本，使用者读它即可判断某个
+CubeSandbox 版本预期能配合哪些 SDK 版本，而不必等线上故障才发现。
+
+验证某个版本时，装上它再照常执行。下面的命令假定"快速开始"里那套 E2B 后端环境变量已经
+导出——如果是从 `e2b-versions.txt` 直接跳到这一节，请先设置，否则 preflight 会在创建任何
+沙箱之前直接结束整个 session（`e2b backend requires E2B_API_KEY`，退出码 2）：
+
+```bash
+export E2B_API_KEY=<e2b-api-key>
+# 自建 HTTPS 端点还需要本地 CA：
+export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
+
+# 完整覆盖：配对安装 interpreter 包，run_code 用例依赖它。
+# 挑一个 pip 能直接解出来的组合：`e2b-code-interpreter` 声明 `e2b>=2.26.0,<3.0.0`，
+# 因此 `e2b-versions.txt` 里 2.21.0 那一行只有覆盖约束才装得上（该行自己有说明），
+# 不适合作为第一次执行时照抄的命令。
+pip install 'e2b==2.26.0' 'e2b-code-interpreter==2.8.1'
+pytest --run-e2e --sdk-e2e-backends=e2b -m "smoke or p0"
+
+# 只装核心 SDK 时**必须**排除依赖 interpreter 的用例：e2b 后端无条件声明了
+# run_code capability，不排除就会被收集、在纯 SDK 上调用 Sandbox.run_code，
+# 最终报成失败——而那只是缺包，不是真的不兼容。
+#
+# 注意选择范围，它决定这个排除条件到底起不起作用：在 `smoke or p0` 之内，依赖 interpreter
+# 的用例只在 cases/run_code/ 下，而它们两个 marker 都带，所以两种写法选出的是同一组用例，
+# 怎么写都一样。（这里刻意不写具体数量——想知道当前值，就在这个范围上跑下面那条 diff。）
+# 一旦范围放宽就不一样了——只装核心 SDK 跑 `p0 or p1`（也就是上
+# 面那套双后端回归）会收集到 p1 的 lifecycle 用例，只有 `requires_code_interpreter` 排得掉。
+#
+# 要按 `requires_code_interpreter` 排除，而不是按 `run_code` marker。后者只存在于
+# cases/run_code/ 下，而依赖 interpreter 的用例在 cases/lifecycle/ 里同样有（写作时是
+# test_pause_resume.py、test_auto_lifecycle.py 与 test_rollback_clone.py），它们带
+# `requires_code_interpreter` 但没有 run_code marker。`requires_code_interpreter`
+# 才是不依赖"用例放在哪个文件"的那个开关——这正是关键，因为用例还在不断新增。
+#（它是由 CODE_INTERPRETER capability 控制的专用 marker。写成通用的
+# `requires_capability(CODE_INTERPRETER)` 效果等价，但本套件统一用专用的那个：
+# skip 信息更清楚，上面的 -m 表达式也是按它来选的。）
+#
+# 想知道两种写法当前差多少，请自己跑，而不要相信这里写死的数字（数字会腐烂，本注释
+# 之前就带过一个过期的）：
+#
+#   diff <(pytest --collect-only -q -m "(p0 or p1) and not run_code") \
+#        <(pytest --collect-only -q -m "(p0 or p1) and not requires_code_interpreter")
+#
+# 差集里也不是每个都会因缺包而失败：对 e2b 后端，auto_lifecycle 那几个还要求
+# platform_lifecycle capability、rollback_clone 那两个要求 rollback_clone，而后端都没有
+# 声明，fixture 会先跳过。按 `requires_code_interpreter` 排除则一次覆盖全部。
+pip install 'e2b==2.29.5'
+pytest --run-e2e --sdk-e2e-backends=e2b -m "(smoke or p0) and not requires_code_interpreter"
+```
+
+每个版本在独立虚拟环境中重复一次，发版时把结果记入 `e2b-versions.txt`。
+
+几条让这份清单不只是版本号的说明：
+
+- **版本号本身不是兼容性信号。** `e2b` 2.26/2.29 的 `commands.run` 在 v0.5.1-rc5 的
+  envd 上静默挂死（SDK 自带的 timeout 不生效），在 v0.5.1 正式版上正常——而两个构建里
+  envd 自报的版本都是 `0.5.11`。所以兼容性必须按 CubeSandbox 版本声明，不能从 envd
+  版本推导。
+- **`e2b-code-interpreter` 有自己的版本序列。** 它的 2.9.0 要求
+  `e2b>=2.26.0,<3.0.0`，因此固定较低 `e2b` 版本的组合无法同时使用当前的 interpreter
+  包，该组合下 `run_code` 用例不可用。
+- **依赖 interpreter 的用例。** 未安装 `e2b-code-interpreter` 的组合应按 capability
+  marker 排除（`-m "(smoke or p0) and not requires_code_interpreter"`），而不是把
+  "缺包"报成失败。只排除 `run_code` marker 不够：它仅覆盖 `cases/run_code/`，而
+  `cases/lifecycle/` 下也有带 `requires_code_interpreter`、但没有 `run_code` marker 的依赖
+  interpreter 用例。注意本套件用的是专用的 `requires_code_interpreter`，而不是通用的
+  `requires_capability(CODE_INTERPRETER)`——两者等价，`-m` 表达式按前者来写。
 
 ## 环境变量
 
@@ -230,13 +336,16 @@ cp env.example .env
 - `SDK_E2E_SKIP_INTERNET_TESTS`：当 runner 或环境没有稳定公网出站时，
   跳过 `requires_internet` 测试，默认 `false`；
 - `SDK_E2E_REPORT_DIR`：JSONL 报告目录；
+- `CUBE_PYTHON_SDK_PATH`：覆盖本地 CubeSandbox Python SDK 路径。该目录必须
+  直接包含 `cubesandbox/__init__.py`，并会在 collection 阶段校验；未设置时使用
+  仓库内的 `sdk/python`；
 - `SDK_E2E_WORKERS`：`--run-e2e` 的 pytest-xdist worker 数量。并行需显式开启，
   未设置（或 `0`/`1`/`no`/`off`）时串行运行，避免压垮同机的控制面；传整数、
   `auto` 或 `logical` 才会并行；显式 `-n`/`--numprocesses`（或 `-p no:xdist`）
   优先。不带 `--run-e2e` 时忽略，因此 hermetic `framework` gate 仍为串行；
 - `SDK_E2E_TEMPLATE_BUILD_CONCURRENCY`：xdist 各 worker 间并发的 live template
   build 上限，默认 `1`（完全串行，使结果与串行运行一致）；小于 `1` 或非整数回退
-  为 `1`；当取值不小于 worker 数时跳过节流；仅 POSIX（无 `fcntl` 时为 no-op）；
+  为 `1`；仅 POSIX（无 `fcntl` 时为 no-op）；
   节流按 UID 而非按 run 命名：同一用户在同一主机上并发的两个 `--run-e2e` 任务会
   共享 slot 并相互串行化其构建。这是有意为之——两个任务都在争用同一台共享构建
   主机——且 `SDK_E2E_TEMPLATE_BUILD_WAIT` 上限会限制任务在降级为不节流前的等待
@@ -249,11 +358,17 @@ cp env.example .env
 - `SDK_E2E_PLATFORM_LIFECYCLE_WAIT_MARGIN`：额外等待时间，默认 `20` 秒；
 - `SDK_E2E_PLATFORM_LIFECYCLE_POLL_TIMEOUT`：轮询窗口，默认 `45` 秒；
 - `CUBE_PROXY_ADMIN_PORT`：CubeProxy admin 端口，默认 `8082`；
-- `SDK_E2E_VOLUME_PLUGIN`：启用 Volume Plugin 用例（CRUD 与 sandbox
-  `volumeMounts` 绑定/解绑），默认 `false`；
-- `SDK_E2E_VOLUME_DRIVER`：`POST /volumes` 使用的 driver，默认 `cos`；
+- `SDK_E2E_MCP_TEMPLATE_ID`：`cases/mcp` 使用的模板 ID 或别名，基于
+  `examples/mcp-gateway/template/Dockerfile` 构建，默认 `mcp-gateway`。该模板不存在时跳过
+  `cases/mcp`；
+- `SDK_E2E_VOLUME_PLUGIN`：运行 Volume Plugin 用例（CRUD 与 sandbox
+  `volumeMounts` 绑定/解绑），默认 `true`；设为 `false` 可跳过；
+- `SDK_E2E_VOLUME_DRIVER`：`POST /volumes` 使用的 driver，默认 `s3`；
 - `SDK_E2E_VOLUME_REFCOUNT_WAIT`：等待绑定中删除 `409` / 解绑后 `204`
-  的秒数，默认 `60`。
+  的秒数，默认 `60`；
+- `SDK_E2E_RESTART_POLICY_WAIT`：每次等待重启状态变化的秒数，默认 `300`。
+  用例随 `--run-e2e` 执行。模板需暴露 envd 49983，guest 里 root 可以写
+  `/proc/sysrq-trigger`。
 
 ### 失败时保留 sandbox
 
@@ -359,6 +474,7 @@ tests/e2e/sdk_compat/
   cases/          按 capability domain 划分的后端无关用例
   docs/           框架设计、用例编写、覆盖盘点与优化建议
   reports/        本地 JSONL 报告
+  e2b-versions.txt  本套件已验证过的 E2B SDK 版本
   README.md
   README_zh.md
 ```
@@ -366,16 +482,19 @@ tests/e2e/sdk_compat/
 当前测试域：
 
 - `cases/lifecycle/`：创建、info、connect、create options、pause/resume、
-  kill、auto-pause、auto-resume、auto-kill；
+  kill、auto-pause、auto-resume、auto-kill、节点本地重启策略
+  （`test_restart_policy.py`），以及文件系统快照与冷启动
+  （`test_filesystem_only_snapshot.py`；两者均仅 CubeSandbox）；
 - `cases/commands/`：stdout、stderr、退出码、环境变量、特殊字符、多行
   输出和缺失命令；
 - `cases/filesystem/`：读写、覆盖、多行内容、文件 API 与 shell 互操作；
 - `cases/run_code/`：表达式结果、stdout、kernel 状态和 Python 错误；
-- `cases/network/`：创建时的 allow/deny 和公网出站策略；
+- `cases/network/`：创建时的 allow/deny 和公网出站策略，以及运行中沙箱的策略原地
+  更新（含存量连接重判，见 `test_policy_update.py`，仅 CubeSandbox）；
 - `cases/concurrency/`：同时运行多个 sandbox 时的数据隔离；
 - `cases/host-mount/`：宿主目录挂载扩展——happy path，以及创建时校验、
   运行期 bind-mount 失败和跨 sandbox 共享等边界用例。
-- `cases/volume/`：Volume Plugin CRUD、sandbox `volumeMounts` 绑定/解绑，以及每个沙箱挂载点的只读约束（需 `SDK_E2E_VOLUME_PLUGIN=true`；仅 CubeSandbox）。插件需手动部署并配置，且要求 `cubesandbox` >= 0.6.0。
+- `cases/volume/`：Volume Plugin CRUD、sandbox `volumeMounts` 绑定/解绑，以及每个沙箱挂载点的只读约束（仅 CubeSandbox；默认 driver `s3`）。随 `--run-e2e` 执行，除非设置 `SDK_E2E_VOLUME_PLUGIN=false`。依赖默认安装的 S3 插件 + MinIO，且要求 `cubesandbox` >= 0.6.0。
 - `cases/auth/`：`CUBE_API_KEY` 简单密钥鉴权，针对 CubeAPI 控制面——
   `X-API-Key`/`Bearer` 通过、错误/缺失返回 401、`/health` 豁免（仅 CubeSandbox）。
   仅当服务端以 `CUBE_API_KEY` 启动且 runner 导出相同 key 时才运行，否则跳过。
@@ -402,8 +521,10 @@ Capability marker：
   覆盖模板 ID；未设置时使用 `CUBE_TEMPLATE_ID` 或 `--cube-template-id`；
 - `@pytest.mark.requires_cubeproxy`：依赖 CubeProxy/lifecycle-manager
   协调，未设置 `SDK_E2E_PLATFORM_LIFECYCLE=true` 时跳过；
-- `@pytest.mark.volume`：Volume Plugin 用例，未设置
-  `SDK_E2E_VOLUME_PLUGIN=true` 时跳过。
+- `@pytest.mark.volume`：Volume Plugin 用例，随 `--run-e2e` 执行；设置
+  `SDK_E2E_VOLUME_PLUGIN=false` 时跳过；
+- `@pytest.mark.restart_policy`：节点本地重启策略用例，随 `--run-e2e` 执行；
+  e2b 因没有 `restart_policy` capability 而跳过。
 - `@pytest.mark.auth`：`CUBE_API_KEY` 简单密钥鉴权用例，未为 runner 设置
   `CUBE_API_KEY` 或后端不支持 `auth_simple_key`（仅 CubeSandbox）时跳过。
 
@@ -411,7 +532,8 @@ Capability marker：
 `filesystem_extended`、`run_code`。可选 capability 包括 `code_interpreter`、
 `pause_resume`、`set_timeout`、`rollback_clone`、`network_allow_deny`、
 `network_public_access`、`network_mask_request_host`、`platform_lifecycle`、
-`host_mount`、`volume_plugin` 和 `auth_simple_key`。
+`host_mount`、`volume_plugin`、`auth_simple_key`、`restart_policy` 和
+`filesystem_only_snapshot`。
 当前分支的 `platform_lifecycle` 与 `volume_plugin` 仅在 CubeSandbox
 capability 集合中启用。
 这不是 E2B 的固有能力限制，而是 E2B SDK 传递的 lifecycle 参数与 CubeAPI
@@ -421,6 +543,9 @@ capability 集合中启用。
 `host_mount` 是 CubeSandbox 独有扩展；`cases/host-mount/` 通过
 `@pytest.mark.requires_capability("host_mount")` 跳过不支持宿主目录挂载的后端（如 e2b）。
 `volume_plugin` 仅用于 CubeSandbox Volume Plugin 用例。
+`restart_policy` 仅用于 CubeSandbox。模板需暴露 envd 49983，以及 guest 内
+root 可以触发 sysrq。运行：
+`pytest --run-e2e -m restart_policy`。
 
 ## 清理
 

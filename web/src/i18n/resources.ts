@@ -10,6 +10,7 @@ import enSandboxes from '@/locales/en/sandboxes.json';
 import enSandboxDetail from '@/locales/en/sandboxDetail.json';
 import enTemplates from '@/locales/en/templates.json';
 import enTemplateDetail from '@/locales/en/templateDetail.json';
+import enSnapshotDetail from '@/locales/en/snapshotDetail.json';
 import enNodes from '@/locales/en/nodes.json';
 import enNodeDetail from '@/locales/en/nodeDetail.json';
 import enVersions from '@/locales/en/versions.json';
@@ -22,6 +23,7 @@ import enObservability from '@/locales/en/observability.json';
 import enStore from '@/locales/en/store.json';
 import enAgentHub from '@/locales/en/agentHub.json';
 import enAuth from '@/locales/en/auth.json';
+import enWarehouse from '@/locales/en/warehouse.json';
 
 import zhCommon from '@/locales/zh/common.json';
 import zhNav from '@/locales/zh/nav.json';
@@ -32,6 +34,7 @@ import zhSandboxes from '@/locales/zh/sandboxes.json';
 import zhSandboxDetail from '@/locales/zh/sandboxDetail.json';
 import zhTemplates from '@/locales/zh/templates.json';
 import zhTemplateDetail from '@/locales/zh/templateDetail.json';
+import zhSnapshotDetail from '@/locales/zh/snapshotDetail.json';
 import zhNodes from '@/locales/zh/nodes.json';
 import zhNodeDetail from '@/locales/zh/nodeDetail.json';
 import zhVersions from '@/locales/zh/versions.json';
@@ -44,6 +47,7 @@ import zhObservability from '@/locales/zh/observability.json';
 import zhStore from '@/locales/zh/store.json';
 import zhAgentHub from '@/locales/zh/agentHub.json';
 import zhAuth from '@/locales/zh/auth.json';
+import zhWarehouse from '@/locales/zh/warehouse.json';
 
 export const resources = {
   en: {
@@ -56,6 +60,7 @@ export const resources = {
     sandboxDetail: enSandboxDetail,
     templates: enTemplates,
     templateDetail: enTemplateDetail,
+    snapshotDetail: enSnapshotDetail,
     nodes: enNodes,
     nodeDetail: enNodeDetail,
     versions: enVersions,
@@ -68,6 +73,7 @@ export const resources = {
     store: enStore,
     agentHub: enAgentHub,
     auth: enAuth,
+    warehouse: enWarehouse,
   },
   zh: {
     common: zhCommon,
@@ -79,6 +85,7 @@ export const resources = {
     sandboxDetail: zhSandboxDetail,
     templates: zhTemplates,
     templateDetail: zhTemplateDetail,
+    snapshotDetail: zhSnapshotDetail,
     nodes: zhNodes,
     nodeDetail: zhNodeDetail,
     versions: zhVersions,
@@ -91,6 +98,7 @@ export const resources = {
     store: zhStore,
     agentHub: zhAgentHub,
     auth: zhAuth,
+    warehouse: zhWarehouse,
   },
 } as const;
 

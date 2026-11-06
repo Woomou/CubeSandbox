@@ -46,6 +46,10 @@ Purchase an **x86_64** cloud server from any cloud provider — no special requi
 
 **OpenCloudOS 9 (RPM-based) is the recommended OS.** The Cube Sandbox PVM host kernel is built on the OpenCloudOS kernel, so choosing OpenCloudOS 9 gives the best compatibility with the fewest distribution-specific differences to handle. Other mainstream distributions — Ubuntu, Debian, CentOS, etc. — are equally supported; just follow the corresponding section below.
 
+> 📌 **Shortcut for OpenCloudOS 9 users**
+> The Cube PVM host kernel package is also available on the official OpenCloudOS yum repository — `dnf install` installs it directly, no manual rpm download needed, and the whole deployment takes about 5 commands.
+> 👉 [One-command CubeSandbox deployment on OpenCloudOS 9 — walkthrough (Chinese)](https://mp.weixin.qq.com/s/oGAaUpze_uB_uzyvuYJSIg)
+
 ::: tip Recommended specifications
 - CPU: ≥ 4 cores
 - RAM: ≥ 8 GB
@@ -54,18 +58,22 @@ Purchase an **x86_64** cloud server from any cloud provider — no special requi
 
 ## Step 1: Install the PVM Host Kernel
 
-Go to the [CubeSandbox GitHub Releases](https://github.com/TencentCloud/CubeSandbox/releases) page, open the latest release that includes PVM kernel assets, then **right-click each asset → Copy link address** and paste the URL into the `wget` commands below.
+### Download the kernel package
 
-Choose the package format that matches your Linux distribution:
+The PVM host kernel package is published on dedicated `kernel-release-*` Releases — download the latest main package from the release page:
+
+1. Open the [GitHub Releases page](https://github.com/TencentCloud/CubeSandbox/releases?q=kernel-release-&expanded=true) (or the [CNB mirror](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases) for mainland China — filter by `kernel-release` there), and open the newest `kernel-release-*` release
+2. Download the **main package** for your distribution:
+   - RPM-based (OpenCloudOS, RHEL, CentOS, TencentOS, Fedora): `kernel-*opencloudos9.cubesandbox.pvm.host*.x86_64.rpm`
+   - DEB-based (Ubuntu, Debian): `linux-image-*opencloudos9.cubesandbox.pvm.host*_amd64.deb`
+
+<small>Optional assets like `kernel-headers-*` and `-dbg` are not needed.</small>
 
 ### RPM-based (OpenCloudOS, RHEL, CentOS, TencentOS, Fedora)
 
-Go to the [Releases page](https://github.com/TencentCloud/CubeSandbox/releases), find `kernel-*opencloudos9.cubesandbox.pvm.host*.x86_64.rpm`, right-click and copy the download link:
+Install the downloaded package:
 
 ```bash
-# Replace the URLs below with the actual download links copied from the Releases page
-wget "<kernel rpm download URL>"
-
 # --oldpackage skips the version check if a newer kernel is already installed
 rpm -ivh --oldpackage kernel-*.rpm
 ```
@@ -92,12 +100,9 @@ bash <(curl -fsSL \
 
 ### DEB-based (Ubuntu, Debian)
 
-Go to the [Releases page](https://github.com/TencentCloud/CubeSandbox/releases), find `linux-image-*opencloudos9.cubesandbox.pvm.host*_amd64.deb`, right-click and copy the download link:
+Install the downloaded package:
 
 ```bash
-# Replace the URLs below with the actual download links copied from the Releases page
-wget "<linux-image deb download URL>"
-
 dpkg -i linux-image-*opencloudos9.cubesandbox.pvm.host*.deb
 ```
 
@@ -230,6 +235,28 @@ lsmod | grep kvm_pvm
 ## Step 4: Create a Template and Get Started
 
 With PVM up and running, the rest of the process is identical to a standard deployment. Follow [Step 3: Create a Template](./quickstart.md#step-3-create-a-template) in the Quick Start guide to create your first template and run a sandbox.
+
+## Uninstall
+
+The one-click installation includes a complete uninstall script. It stops and removes CubeSandbox services, containers, volumes, network configuration, runtime data, and logs. Existing templates, sandboxes, and snapshots are also deleted, so back up anything you need first.
+
+```bash
+sudo /usr/local/services/cubetoolbox/scripts/one-click/uninstall.sh
+```
+
+After uninstalling, check the host for remaining CubeSandbox resources:
+
+```bash
+sudo /usr/local/services/cubetoolbox/scripts/one-click/uninstall.sh check
+```
+
+Once the check passes and you no longer need the uninstall script or installed bundle, remove the preserved toolbox directory manually:
+
+```bash
+sudo rm -rf /usr/local/services/cubetoolbox
+```
+
+> The uninstall script does not uninstall the PVM host kernel or delete Cube-related Docker images. To remove the images as well, follow the command printed by the script.
 
 ## Troubleshooting
 

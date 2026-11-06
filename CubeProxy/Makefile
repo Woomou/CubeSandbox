@@ -1,8 +1,5 @@
-IMAGE_TAG           ?= v0.6.0
+IMAGE_TAG           ?= v0.7.3
 IMAGE_LOCAL         := cube-proxy
-CUBE_VERSION        ?= $(IMAGE_TAG)
-CUBE_COMMIT         ?= $(shell git rev-parse HEAD | cut -c1-8)
-CUBE_BUILD_TIME     ?= $(shell date +'%Y%m%d')
 
 # Base OpenResty image; overridable for private mirrors / pinned digests.
 CUBE_PROXY_BASE_IMAGE ?= cube-sandbox-image.tencentcloudcr.com/opensource/openresty:1.21.4.1-6-alpine-fat
@@ -36,9 +33,6 @@ build:
 	$(Q)docker build --rm $(QUIET) \
 		--platform linux/$(ARCH) \
 		--build-arg CUBE_PROXY_BASE_IMAGE=$(CUBE_PROXY_BASE_IMAGE) \
-		--build-arg CUBE_VERSION=$(CUBE_VERSION) \
-		--build-arg CUBE_COMMIT=$(CUBE_COMMIT) \
-		--build-arg CUBE_BUILD_TIME=$(CUBE_BUILD_TIME) \
 		-t $(IMAGE_LOCAL):$(IMAGE_TAG)-$(ARCH) \
 		.
 
@@ -47,14 +41,25 @@ test:
 	bash tests/test_start.sh
 	bash tests/test_admin_access_log.sh
 	bash tests/test_lua_syntax.sh
-	@if command -v lua >/dev/null 2>&1; then \
+	@set -e; if command -v lua >/dev/null 2>&1; then \
 		lua tests/redis_iresty_sentinel_test.lua; \
+		lua tests/redis_cluster_test.lua; \
 		lua tests/backend_cache_test.lua; \
+		lua tests/sandbox_backend_cache_test.lua; \
+		lua tests/sandbox_route_lookup_test.lua; \
+		lua tests/request_host_test.lua; \
+		lua tests/rewrite_phase_route_test.lua; \
 	elif command -v luajit >/dev/null 2>&1; then \
 		luajit tests/redis_iresty_sentinel_test.lua; \
+		luajit tests/redis_cluster_test.lua; \
 		luajit tests/backend_cache_test.lua; \
+		luajit tests/sandbox_backend_cache_test.lua; \
+		luajit tests/sandbox_route_lookup_test.lua; \
+		luajit tests/request_host_test.lua; \
+		luajit tests/rewrite_phase_route_test.lua; \
 	else \
-		echo "skip lua unit tests (no lua/luajit): redis_iresty_sentinel_test.lua backend_cache_test.lua"; \
+		echo "lua or luajit is required: redis_iresty_sentinel_test.lua redis_cluster_test.lua backend_cache_test.lua sandbox_backend_cache_test.lua sandbox_route_lookup_test.lua request_host_test.lua rewrite_phase_route_test.lua" >&2; \
+		exit 1; \
 	fi
 
 # Push the architecture-specific image to all registries.
@@ -82,7 +87,3 @@ manifest:
 			docker manifest rm $$image:$$tag; \
 		done; \
 	done
-
-.PHONY: clean
-clean:
-	$(Q)rm -rf bin/

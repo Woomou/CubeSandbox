@@ -5,24 +5,31 @@
 package cube
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/qos"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/common"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
-var deleteTemplateFn = templatecenter.DeleteTemplate
+var deleteTemplateFn = templatecenter.DeleteTemplateWithOptions
 var getTemplateInfoFn = templatecenter.GetTemplateInfo
 var getTemplateRequestFn = templatecenter.GetTemplateRequest
 var resolveTemplateIdentifierFn = templatecenter.ResolveTemplateIdentifier
 var setTemplateAliasFn = templatecenter.SetTemplateAlias
+var listTemplatesFn = templatecenter.ListTemplatesWithOptions
+var listReplicasForTemplatesFn = templatecenter.ListReplicasForTemplates
 
 type templateResponse struct {
 	*types.Res
@@ -32,11 +39,14 @@ type templateResponse struct {
 	Status                     string                         `json:"status,omitempty"`
 	LastError                  string                         `json:"last_error,omitempty"`
 	DisplayName                string                         `json:"display_name,omitempty"`
+	StorageBackend             string                         `json:"storage_backend,omitempty"`
+	Backend                    string                         `json:"backend,omitempty"`
 	CreatedAt                  string                         `json:"created_at,omitempty"`
 	ImageInfo                  string                         `json:"image_info,omitempty"`
 	JobID                      string                         `json:"job_id,omitempty"`
 	Replicas                   []templatecenter.ReplicaStatus `json:"replicas,omitempty"`
 	CreateRequest              *types.CreateCubeSandboxReq    `json:"create_request,omitempty"`
+	ConfiguredQos              *qos.Config                    `json:"configured_qos,omitempty"`
 	CubeEgressCABaked          bool                           `json:"cube_egress_ca_baked,omitempty"`
 	CubeEgressCAFingerprint    string                         `json:"cube_egress_ca_fingerprint,omitempty"`
 	CubeEgressCATargetsWritten int                            `json:"cube_egress_ca_targets_written,omitempty"`
@@ -45,18 +55,24 @@ type templateResponse struct {
 type templateListResponse struct {
 	*types.Res
 	Data []templateSummary `json:"data,omitempty"`
+	// Total is the pre-pagination entry count; equals len(Data) when unpaged.
+	Total int `json:"total,omitempty"`
 }
 
 type templateSummary struct {
-	TemplateID   string `json:"template_id,omitempty"`
-	InstanceType string `json:"instance_type,omitempty"`
-	Version      string `json:"version,omitempty"`
-	Status       string `json:"status,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
-	DisplayName  string `json:"display_name,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	ImageInfo    string `json:"image_info,omitempty"`
-	JobID        string `json:"job_id,omitempty"`
+	TemplateID     string `json:"template_id,omitempty"`
+	InstanceType   string `json:"instance_type,omitempty"`
+	Version        string `json:"version,omitempty"`
+	Status         string `json:"status,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	StorageBackend string `json:"storage_backend,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	OriginNodeID   string `json:"origin_node_id,omitempty"`
+	OriginNodeIP   string `json:"origin_node_ip,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	ImageInfo      string `json:"image_info,omitempty"`
+	JobID          string `json:"job_id,omitempty"`
 }
 
 type deleteTemplateRequest struct {
@@ -64,6 +80,11 @@ type deleteTemplateRequest struct {
 	TemplateID   string `json:"template_id,omitempty"`
 	InstanceType string `json:"instance_type,omitempty"`
 	Sync         bool   `json:"sync,omitempty"`
+	// Force unsticks a template whose build job or definition build is still
+	// marked active, by failing that work before cleaning up. It does NOT
+	// override the in-use check: a template a live sandbox still depends on
+	// stays undeletable.
+	Force bool `json:"force,omitempty"`
 }
 
 func createTemplateGinHandler(c *gin.Context) {
@@ -121,11 +142,14 @@ func templateResponseFromInfo(info *templatecenter.TemplateInfo, createReq *type
 		Status:                     info.Status,
 		LastError:                  info.LastError,
 		DisplayName:                info.DisplayName,
+		StorageBackend:             info.StorageBackend,
+		Backend:                    firstNonEmptyTrimmed(info.Backend, info.StorageBackend),
 		CreatedAt:                  info.CreatedAt,
 		ImageInfo:                  info.ImageInfo,
 		JobID:                      info.JobID,
 		Replicas:                   info.Replicas,
-		CreateRequest:              createReq,
+		CreateRequest:              sanitizeTemplateCreateRequest(createReq),
+		ConfiguredQos:              info.ConfiguredQos,
 		CubeEgressCABaked:          info.CubeEgressCABaked,
 		CubeEgressCAFingerprint:    info.CubeEgressCAFingerprint,
 		CubeEgressCATargetsWritten: info.CubeEgressCATargetsWritten,
@@ -264,7 +288,9 @@ func deleteTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 			TemplateID: req.TemplateID,
 		}
 	}
-	err = deleteTemplateFn(ctx, resolvedTemplateID, req.InstanceType)
+	err = deleteTemplateFn(ctx, resolvedTemplateID, req.InstanceType, templatecenter.DeleteTemplateOptions{
+		Force: req.Force,
+	})
 	if err != nil {
 		code := int(errorcode.ErrorCode_MasterInternalError)
 		switch {
@@ -309,6 +335,15 @@ func deleteTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 func createTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	req, err := constructCreateReq(r)
 	if err != nil {
+		return &templateResponse{
+			Res: &types.Res{Ret: &types.Ret{
+				RetCode: int(errorcode.ErrorCode_MasterParamsError),
+				RetMsg:  err.Error(),
+			}},
+		}
+	}
+	if err := rejectCallerSuppliedQos(req); err != nil {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
 		return &templateResponse{
 			Res: &types.Res{Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
@@ -426,7 +461,17 @@ func getTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 }
 
 func listTemplates(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	infos, err := templatecenter.ListTemplates(r.Context())
+	opts, err := parseTemplateListOptions(r)
+	if err != nil {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		return &templateListResponse{
+			Res: &types.Res{Ret: &types.Ret{
+				RetCode: int(errorcode.ErrorCode_MasterParamsError),
+				RetMsg:  err.Error(),
+			}},
+		}
+	}
+	result, err := listTemplatesFn(r.Context(), opts)
 	if err != nil {
 		code := int(errorcode.ErrorCode_MasterInternalError)
 		if errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized) {
@@ -445,21 +490,114 @@ func listTemplates(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 			RetCode: int(errorcode.ErrorCode_Success),
 			RetMsg:  "success",
 		}},
-		Data: make([]templateSummary, 0, len(infos)),
+		Data:  make([]templateSummary, 0, len(result.Templates)),
+		Total: result.Total,
 	}
-	for _, info := range infos {
+	replicasByTemplate, batchErr := batchReadyReplicaOrigins(r.Context(), result.Templates)
+	if batchErr != nil {
+		// Degraded, not failed: origins stay blank rather than breaking the list.
+		log.G(r.Context()).Warnf("list templates: batch replica lookup failed: %v", batchErr)
+		replicasByTemplate = map[string][]templatecenter.ReplicaStatus{}
+	}
+	for _, info := range result.Templates {
+		originNodeID, originNodeIP := resolveOriginNode(info.OriginNodeID)
+		// create-from-image templates often have empty origin_node_id; fall
+		// back to any READY replica so list can still show an origin node.
+		if originNodeIP == "" {
+			originNodeID, originNodeIP = firstReadyReplicaOriginFromList(
+				replicasByTemplate[strings.TrimSpace(info.TemplateID)], originNodeID)
+		}
 		rsp.Data = append(rsp.Data, templateSummary{
-			TemplateID:   info.TemplateID,
-			InstanceType: info.InstanceType,
-			Version:      info.Version,
-			Status:       info.Status,
-			LastError:    info.LastError,
-			DisplayName:  info.DisplayName,
-			CreatedAt:    info.CreatedAt,
-			ImageInfo:    info.ImageInfo,
-			JobID:        info.JobID,
+			TemplateID:     info.TemplateID,
+			InstanceType:   info.InstanceType,
+			Version:        info.Version,
+			Status:         info.Status,
+			LastError:      info.LastError,
+			DisplayName:    info.DisplayName,
+			StorageBackend: info.StorageBackend,
+			Backend:        firstNonEmptyTrimmed(info.Backend, info.StorageBackend),
+			OriginNodeID:   originNodeID,
+			OriginNodeIP:   originNodeIP,
+			CreatedAt:      info.CreatedAt,
+			ImageInfo:      info.ImageInfo,
+			JobID:          info.JobID,
 		})
 	}
 	rt.RetCode = int64(errorcode.ErrorCode_Success)
 	return rsp
+}
+
+// parseTemplateListOptions reads optional limit/offset query params; limit=0
+// means "no limit" per the CLI's "0 = all" contract, other invalids are 400s.
+func parseTemplateListOptions(r *http.Request) (templatecenter.TemplateListOptions, error) {
+	opts := templatecenter.TemplateListOptions{}
+	query := r.URL.Query()
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			return opts, fmt.Errorf("invalid limit %q: want a non-negative integer", raw)
+		}
+		opts.Limit = limit
+	}
+	if raw := strings.TrimSpace(query.Get("offset")); raw != "" {
+		offset, err := strconv.Atoi(raw)
+		if err != nil || offset < 0 {
+			return opts, fmt.Errorf("invalid offset %q: want a non-negative integer", raw)
+		}
+		opts.Offset = offset
+	}
+	return opts, nil
+}
+
+// resolveOriginNode resolves the origin node id and its localcache IP; the IP
+// is empty when the origin is absent or the node lacks a usable IP.
+func resolveOriginNode(originNodeID string) (string, string) {
+	originNodeID = strings.TrimSpace(originNodeID)
+	if originNodeID == "" {
+		return "", ""
+	}
+	n, ok := localcache.GetNode(originNodeID)
+	if !ok || n == nil {
+		return originNodeID, ""
+	}
+	return originNodeID, strings.TrimSpace(n.HostIP())
+}
+
+// batchReadyReplicaOrigins loads replicas for every template whose origin node
+// is absent or resolves to no usable IP in one query, so the list loop below
+// never issues per-template lookups.
+func batchReadyReplicaOrigins(ctx context.Context, infos []templatecenter.TemplateInfo) (map[string][]templatecenter.ReplicaStatus, error) {
+	needFallback := make([]string, 0, len(infos))
+	for _, info := range infos {
+		if _, ip := resolveOriginNode(info.OriginNodeID); ip != "" {
+			continue
+		}
+		needFallback = append(needFallback, strings.TrimSpace(info.TemplateID))
+	}
+	return listReplicasForTemplatesFn(ctx, needFallback)
+}
+
+// firstReadyReplicaOriginFromList picks the first READY replica with a usable
+// node IP, mirroring the per-template query semantics it replaces.
+func firstReadyReplicaOriginFromList(replicas []templatecenter.ReplicaStatus, originNodeID string) (string, string) {
+	for _, replica := range replicas {
+		if !strings.EqualFold(strings.TrimSpace(replica.Status), templatecenter.ReplicaStatusReady) {
+			continue
+		}
+		nodeID := strings.TrimSpace(replica.NodeID)
+		nodeIP := strings.TrimSpace(replica.NodeIP)
+		if nodeIP == "" && nodeID != "" {
+			if n, ok := localcache.GetNode(nodeID); ok && n != nil {
+				nodeIP = strings.TrimSpace(n.HostIP())
+			}
+		}
+		if nodeIP == "" {
+			continue
+		}
+		if originNodeID == "" {
+			originNodeID = nodeID
+		}
+		return originNodeID, nodeIP
+	}
+	return originNodeID, ""
 }

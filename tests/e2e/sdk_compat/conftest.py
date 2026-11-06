@@ -16,27 +16,6 @@ ROOT = Path(__file__).resolve().parents[3]
 SDK_COMPAT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(SDK_COMPAT_ROOT))
 
-from adapters import create_adapter_with_capacity_retry  # noqa: E402
-from framework.capabilities import (  # noqa: E402
-    CODE_INTERPRETER,
-    capabilities_for_backend,
-)
-from framework.cleanup import safe_kill  # noqa: E402
-from framework.config import SdkE2EConfig  # noqa: E402
-from framework.parallel import (  # noqa: E402
-    apply_worker_count,
-    current_worker_count,
-    wants_parallel,
-)
-from framework.preflight import run_preflight  # noqa: E402
-from framework.reporting import JsonlReporter  # noqa: E402
-from framework.trace import (  # noqa: E402
-    TraceCollector,
-    reset_current_trace,
-    set_current_trace,
-)
-
-
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
         return
@@ -60,6 +39,40 @@ def _strip_env_value(value: str) -> str:
 
 
 _load_dotenv(SDK_COMPAT_ROOT / ".env")
+
+
+def _prepare_sdk_import_path() -> None:
+    configured = os.environ.get("CUBE_PYTHON_SDK_PATH")
+    sdk_path = Path(configured) if configured else ROOT / "sdk" / "python"
+    package_init = sdk_path / "cubesandbox" / "__init__.py"
+    if not package_init.is_file():
+        source = "CUBE_PYTHON_SDK_PATH" if configured else "the repository default"
+        raise pytest.UsageError(f"{source} ({sdk_path}) is invalid: expected {package_init}")
+    sys.path.insert(0, str(sdk_path))
+
+
+_prepare_sdk_import_path()
+
+from adapters import create_adapter_with_capacity_retry  # noqa: E402
+from framework.capabilities import (  # noqa: E402
+    CODE_INTERPRETER,
+    capabilities_for_backend,
+    require_capabilities,
+)
+from framework.cleanup import safe_kill  # noqa: E402
+from framework.config import SdkE2EConfig, volume_plugin_enabled_from_env  # noqa: E402
+from framework.parallel import (  # noqa: E402
+    apply_worker_count,
+    current_worker_count,
+    wants_parallel,
+)
+from framework.preflight import run_preflight  # noqa: E402
+from framework.reporting import JsonlReporter  # noqa: E402
+from framework.trace import (  # noqa: E402
+    TraceCollector,
+    reset_current_trace,
+    set_current_trace,
+)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -153,8 +166,11 @@ def pytest_configure(config: pytest.Config):
         "sdk_compat: SDK compatibility E2E tests",
         "requires_capability(name): current SDK backend must support this capability",
         "sandbox_create_options(**kwargs): SDK sandbox create options for this test",
-        "sandbox_template_id(template_id): override template ID for this test or module",
+        "sandbox_template_id(template_id, optional=False): override template ID for this test or module; "
+        "optional templates are left out of preflight and their tests are skipped when the template does not exist",
+        "self_managed_template: test provisions and cleans up its own template",
         "requires_code_interpreter: test requires a stateful Code Interpreter kernel",
+        "requires_run_code_env_inheritance: test requires an opt-in template whose run_code inherits create-time envs",
         "requires_internet: test requires public internet access from the sandbox",
         "requires_cubeproxy: test requires CubeProxy routing to the sandbox",
         "auth: CUBE_API_KEY simple-key authentication control-plane tests",
@@ -199,13 +215,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     config._sdk_e2e_template_ids = {
         template_id
         for item in items
-        if (template_id := _template_id_for_node(item)) is not None
+        if (template_id := _template_id_for_node(item)) is not None and not _template_is_optional(item)
     }
     config._sdk_e2e_default_template_needed = any(
-        _template_id_for_node(item) is None for item in items
+        _template_id_for_node(item) is None
+        and item.get_closest_marker("self_managed_template") is None
+        for item in items
     )
     volume_skip = None
-    if not _env_true("SDK_E2E_VOLUME_PLUGIN"):
+    if not volume_plugin_enabled_from_env():
         from framework.volume import VOLUME_PLUGIN_SKIP_REASON  # noqa: E402
 
         volume_skip = pytest.mark.skip(reason=VOLUME_PLUGIN_SKIP_REASON)
@@ -281,10 +299,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 def _prepare_runtime_env(cfg: SdkE2EConfig) -> None:
-    if cfg.cube_python_sdk_path:
-        sys.path.insert(0, cfg.cube_python_sdk_path)
-    else:
-        sys.path.insert(0, str(ROOT / "sdk" / "python"))
     for key, value in cfg.env().items():
         os.environ.setdefault(key, value)
 
@@ -366,6 +380,33 @@ def gate_internet_tests(request: pytest.FixtureRequest) -> None:
         )
 
 
+@pytest.fixture(scope="session")
+def _optional_template_exists(sdk_e2e_config: SdkE2EConfig):
+    from adapters.api_adapter import ApiClient
+
+    cache: dict[str, bool] = {}
+
+    def exists(template_id: str) -> bool:
+        if template_id not in cache:
+            api = ApiClient(sdk_e2e_config)
+            try:
+                cache[template_id] = bool(api.get_template(template_id))
+            finally:
+                api.close()
+        return cache[template_id]
+
+    return exists
+
+
+@pytest.fixture(autouse=True)
+def skip_missing_optional_template(request: pytest.FixtureRequest) -> None:
+    if not request.config.getoption("--run-e2e") or not _template_is_optional(request.node):
+        return
+    template_id = _template_id_for_node(request.node)
+    if not request.getfixturevalue("_optional_template_exists")(template_id):
+        pytest.skip(f"optional template {template_id!r} does not exist")
+
+
 @pytest.fixture()
 def sdk_sandbox(
     request: pytest.FixtureRequest,
@@ -374,16 +415,25 @@ def sdk_sandbox(
     sdk_e2e_reporter: JsonlReporter,
     sdk_e2e_trace: TraceCollector,
 ):
-    for marker in request.node.iter_markers("requires_capability"):
-        capability = marker.args[0]
-        if capability not in capabilities_for_backend(sdk_backend):
-            pytest.skip(f"backend {sdk_backend!r} does not support capability {capability!r}")
+    require_capabilities(
+        sdk_backend,
+        *[marker.args[0] for marker in request.node.iter_markers("requires_capability")],
+    )
 
     if request.node.get_closest_marker("requires_code_interpreter"):
         if CODE_INTERPRETER not in capabilities_for_backend(sdk_backend):
             pytest.skip(
                 f"backend {sdk_backend!r} does not support stateful Code Interpreter"
             )
+
+    if (
+        request.node.get_closest_marker("requires_run_code_env_inheritance")
+        and not sdk_e2e_config.run_code_env_inheritance_enabled
+    ):
+        pytest.skip(
+            "run_code env inheritance requires "
+            "SDK_E2E_RUN_CODE_ENV_INHERITANCE=true and a compatible template"
+        )
 
     if request.node.get_closest_marker("requires_cubeproxy") and not sdk_e2e_config.platform_lifecycle_enabled:
         pytest.skip(
@@ -512,12 +562,13 @@ def _template_id_for_node(node: pytest.Item) -> str | None:
     marker = node.get_closest_marker("sandbox_template_id")
     if marker is None:
         return None
-    if marker.args and marker.kwargs:
+    kwargs = {k: v for k, v in marker.kwargs.items() if k != "optional"}
+    if marker.args and kwargs:
         raise ValueError("sandbox_template_id accepts either one positional or one keyword template_id value")
-    if marker.kwargs:
-        if set(marker.kwargs) != {"template_id"}:
+    if kwargs:
+        if set(kwargs) != {"template_id"}:
             raise ValueError("sandbox_template_id accepts one template_id value")
-        template_id = marker.kwargs["template_id"]
+        template_id = kwargs["template_id"]
     else:
         if len(marker.args) != 1:
             raise ValueError("sandbox_template_id accepts one template_id value")
@@ -525,6 +576,11 @@ def _template_id_for_node(node: pytest.Item) -> str | None:
     if not isinstance(template_id, str) or not template_id.strip():
         raise ValueError("sandbox_template_id requires a non-empty string")
     return template_id.strip()
+
+
+def _template_is_optional(node: pytest.Item) -> bool:
+    marker = node.get_closest_marker("sandbox_template_id")
+    return marker is not None and bool(marker.kwargs.get("optional", False))
 
 
 def _cleanup_sdk_sandbox(
@@ -586,9 +642,13 @@ def _log_effective_environment(cfg: SdkE2EConfig) -> None:
         "CUBE_PROXY_NODE_IP": cfg.cube_proxy_node_ip,
         "CUBE_PROXY_PORT_HTTP": str(cfg.cube_proxy_port_http),
         "CUBE_SANDBOX_DOMAIN": cfg.cube_sandbox_domain,
+        "SDK_E2E_RUN_CODE_ENV_INHERITANCE": str(
+            cfg.run_code_env_inheritance_enabled
+        ).lower(),
         "SDK_E2E_PLATFORM_LIFECYCLE": str(cfg.platform_lifecycle_enabled).lower(),
         "SDK_E2E_VOLUME_PLUGIN": str(cfg.volume_plugin_enabled).lower(),
         "SDK_E2E_VOLUME_DRIVER": cfg.volume_driver,
+        "SDK_E2E_RESTART_POLICY_WAIT": str(cfg.restart_policy_wait),
     }
     if "e2b" in cfg.backends:
         fields.update(

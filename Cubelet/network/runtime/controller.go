@@ -19,7 +19,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime/systemnet"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 var (
@@ -43,9 +43,9 @@ type managedState struct {
 	// with legacyStatePath. Cleanup retires legacy first and this record second.
 	migrationStateRecord *StateRecord
 
-	// restoreBeforeCleanup asks TapCleaner to re-run TAP restore before removing
+	// restoreAfterCleanup asks TapCleaner to restore the link after removing
 	// residue. Startup recovery uses it for no-state TAPs from smooth upgrades.
-	restoreBeforeCleanup bool
+	restoreAfterCleanup bool
 }
 
 // NetworkController coordinates the embedded runtime's durable state, host
@@ -83,6 +83,10 @@ type NetworkController struct {
 	// paying a netlink probe (and its RTNL queueing under bursts) per create.
 	routeMu      sync.Mutex
 	routeEnsured bool
+
+	// attachedFilters records ifindexes whose AttachFilter succeeded in this
+	// process. Destroy deletes the record.
+	attachedFilters sync.Map
 
 	// cubeEgressAdapter is the loopback admin adapter toward CubeEgress. nil when
 	// CubeEgressAdminURL is empty (dev / test setups). The push and
@@ -221,7 +225,7 @@ func newProductionControllerDeps(cfg Config) (networkControllerDeps, error) {
 		device:            device,
 		cubeDev:           cubeDev,
 		cubeRouter:        cubeRouter,
-		tapAdapter:        newRealTapDeviceAdapter(),
+		tapAdapter:        newRealTapDeviceAdapter(cfg.CIDR),
 		cubevsAdapter:     newRealCubeVSAdapter(),
 		cubeEgressAdapter: newCubeEgressAdapterFromConfig(cfg),
 	}, nil
@@ -289,6 +293,7 @@ func initCubeVS(cfg Config, device *systemnet.HostDevice, cubeDev *systemnet.Cub
 		CubeRouterIfindex:   cubeRouterIfindex,
 		NodeIfindex:         uint32(device.Index),
 		NodeIP:              device.IP,
+		NodeIPMask:          device.IPMask,
 		NodeMacAddr:         device.Mac,
 		NodeGatewayMacAddr:  device.GatewayMac,
 	}
@@ -307,11 +312,20 @@ func initCubeVS(cfg Config, device *systemnet.HostDevice, cubeDev *systemnet.Cub
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_local_port_range", []byte("10000\t19999"), 0644); err != nil {
 		return nil, fmt.Errorf("set ip_local_port_range failed: %w", err)
 	}
+	// Direct mode (no cube-router): the datapath resolves on-link neighbors via
+	// fib and reports into direct_neigh; this scanner drives the kernel's
+	// neighbor learning so fib resolves them. Route-aware mode does not attach
+	// the direct on-link path, so there is nothing to scan.
+	if params.EgressRedirectFlags == 0 {
+		if err := cubevs.StartDirectNeighScanner(params.NodeIP); err != nil {
+			return nil, fmt.Errorf("start direct neighbor scanner failed: %w", err)
+		}
+	}
 	return cubeRouter, nil
 }
 
 // l7MarksConfigPath is the install-time config shared with the
-// cube-proxy-iptables-init script, so the dataplane (eBPF globals) and the
+// cube-egress-iptables-init script, so the dataplane (eBPF globals) and the
 // iptables TPROXY rules stamp/match the same skb->mark values. It is a var so
 // tests can point it at a temp file instead of the real /etc path.
 var l7MarksConfigPath = "/etc/cubeegress/l7-marks.conf"
@@ -391,6 +405,11 @@ func (s *NetworkController) startControllerRuntime() error {
 	// controller to request-serving code so it cannot race a new TAP lifecycle.
 	s.runStaleNetPolicyMapGC()
 	startCubeVSSessionLogDrain()
+
+	// Recovered TAPs attach off this path. acquireTap attaches any ifindex
+	// the background job has not recorded yet. A failure there does not fail
+	// startup; the next acquire retries.
+	s.startAsyncAttachFilters()
 
 	// Pool warmup runs in the background so first-deploy startup
 	// (~63ms × TapInitNum) does not block NewNetworkController and trip
@@ -511,6 +530,70 @@ func (s *NetworkController) EnsureNetwork(ctx context.Context, req *EnsureNetwor
 	return state.ensureResponse(), nil
 }
 
+// UpdateNetworkPolicy replaces the egress policy of a running sandbox.
+//
+// Step order is the contract, not an implementation detail:
+//
+//  1. CubeEgress before CubeVS. Whichever way the rule set moves the transient
+//     state errs towards more interception: a new rule is installed before
+//     anything is steered at it, and a removed rule is gone before the datapath
+//     stops steering, so leftover traffic meets the proxy's default deny.
+//  2. CubeVS second, which also bumps the policy generation and so is the point
+//     where established flows start being re-evaluated.
+//  3. Persist last. A crash before this replays the previous policy on restart
+//     — the safe direction, since the caller was never told it succeeded.
+//
+// There is no rollback. The CubeVS diff is computed from the live maps, so
+// replaying the same request converges.
+func (s *NetworkController) UpdateNetworkPolicy(ctx context.Context, req *UpdateNetworkPolicyRequest) error {
+	if req == nil || req.SandboxID == "" {
+		return fmt.Errorf("sandboxID is required")
+	}
+	unlock := func() {}
+	if s.locks != nil {
+		unlock = s.locks.Lock(req.SandboxID)
+	}
+	defer unlock()
+
+	s.mu.Lock()
+	state, ok := s.states[req.SandboxID]
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: sandbox %q", ErrNetworkNotActive, req.SandboxID)
+	}
+
+	CubeLog.WithContext(ctx).Infof(
+		"network runtime UpdateNetworkPolicy request: sandbox_id=%s sandbox_ip=%s cube_network_config=%s",
+		req.SandboxID, state.SandboxIP, formatCubeNetworkConfig(req.CubeNetworkConfig),
+	)
+
+	// A sandbox created before the runtime recorded its resolvers has them in
+	// its installed AllowOut but nowhere we can identify them, so fall back to
+	// the caller's list rather than silently revoking DNS. Persisting it below
+	// means each sandbox needs the fallback at most once.
+	resolverCIDRs := state.DNSAllowOutCIDRs
+	if len(resolverCIDRs) == 0 {
+		resolverCIDRs = req.DNSAllowOutCIDRs
+	}
+	cfg := withDNSResolverAllowOut(cloneCubeNetworkConfig(req.CubeNetworkConfig), resolverCIDRs)
+	if err := s.syncEgressPolicy(ctx, state, cfg); err != nil {
+		return fmt.Errorf("sync CubeEgress policy for sandbox %s: %w", req.SandboxID, err)
+	}
+	if err := s.updateCubeVSTapPolicy(state.TapIfIndex, req.SandboxID, cfg); err != nil {
+		return fmt.Errorf("update CubeVS policy for sandbox %s: %w", req.SandboxID, err)
+	}
+
+	s.mu.Lock()
+	state.CubeNetworkConfig = cfg
+	state.DNSAllowOutCIDRs = resolverCIDRs
+	s.mu.Unlock()
+
+	if err := s.store.RewriteSuccess(&state.persistedState); err != nil {
+		return fmt.Errorf("persist network policy for sandbox %s: %w", req.SandboxID, err)
+	}
+	return nil
+}
+
 // createState builds the network for a sandbox. It does NOT hold s.mu across
 // the heavy work: the global mutex is only taken briefly inside acquireTap /
 // releaseAcquiredTap / cleanupConflictingTap to mutate the in-memory pools and
@@ -568,6 +651,7 @@ func (s *NetworkController) createState(ctx context.Context, req *EnsureNetworkR
 			ARPNeighbors:      slices.Clone(req.ARPNeighbors),
 			PortMappings:      actualMappings,
 			CubeNetworkConfig: cloneCubeNetworkConfig(req.CubeNetworkConfig),
+			DNSAllowOutCIDRs:  slices.Clone(req.DNSAllowOutCIDRs),
 			PersistMetadata:   s.persistMetadata(req.PersistMetadata, tap.Name, tap.IP.String()),
 		},
 		tap: tap,
@@ -742,6 +826,9 @@ func (s *NetworkController) acquireTap(owner string) (*tapDevice, *TapPoolEntry,
 		// GetTapFile handoff is a cache hit. Nil after a runtime restart;
 		// GetTapFile then falls back to a lazy open.
 		tap.File = s.takePooledTapFD(entry.TapName)
+		if err := s.ensureAttachFilter(tap.Index); err != nil {
+			return nil, nil, s.rollbackUnattachedAcquire(owner, tap, entry, err)
+		}
 		return tap, entry, nil
 	}
 	ip, err := s.allocator.Allocate()
@@ -757,24 +844,29 @@ func (s *NetworkController) acquireTap(owner string) (*tapDevice, *TapPoolEntry,
 		s.allocator.Release(ip)
 		return nil, nil, err
 	}
+	// newTap already attached. Record it so the ensure below does not attach again.
+	s.markFilterAttached(tap.Index)
 	if err := s.resetTapPolicyForPool(tap); err != nil {
 		s.tapAdapter.Close(tap.File)
-		_ = s.tapAdapter.Destroy(tap.Index)
+		_ = s.destroyTapIndex(tap.Index)
 		s.allocator.Release(ip)
 		return nil, nil, err
 	}
 	entry, err = tapPoolEntryFromDevice(tap, "", TapPoolReady)
 	if err != nil {
 		s.tapAdapter.Close(tap.File)
-		_ = s.tapAdapter.Destroy(tap.Index)
+		_ = s.destroyTapIndex(tap.Index)
 		s.allocator.Release(ip)
 		return nil, nil, err
 	}
 	if err := s.tapPool.AddReserved(entry, owner); err != nil {
 		s.tapAdapter.Close(tap.File)
-		_ = s.tapAdapter.Destroy(tap.Index)
+		_ = s.destroyTapIndex(tap.Index)
 		s.allocator.Release(ip)
 		return nil, nil, err
+	}
+	if err := s.ensureAttachFilter(tap.Index); err != nil {
+		return nil, nil, s.rollbackUnattachedAcquire(owner, tap, entry, err)
 	}
 	return tap, entry, nil
 }
@@ -794,7 +886,7 @@ func (s *NetworkController) releaseAcquiredTap(owner string, tap *tapDevice, ent
 					TapName:    tap.Name,
 					TapIfIndex: tap.Index,
 					SandboxIP:  tap.IP.String(),
-				}, tap: tap, restoreBeforeCleanup: true}
+				}, tap: tap, restoreAfterCleanup: true}
 				_ = s.cleanupTapOnce(state, "", "pre_create_reservation_rollback")
 			}
 			return

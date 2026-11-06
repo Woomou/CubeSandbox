@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime/systemnet"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -36,6 +37,7 @@ var netlinkLinkList = func() ([]netlink.Link, error) {
 	return systemnet.WithDumpRetry(netlink.LinkList)
 }
 var netlinkLinkDel = netlink.LinkDel
+var netlinkLinkSetDown = netlink.LinkSetDown
 var deleteTAPDevicePolicyMaps = cubevs.DeleteTAPDevicePolicyMaps
 var unixOpen = unix.Open
 var unixClose = unix.Close
@@ -52,8 +54,9 @@ var unixIoctlSetTunOffload = func(fd int, features uintptr) error {
 var enableTapTXTCPMangleIDSegmentation = enableTXTCPMangleIDSegmentation
 
 const (
-	// TAP names are derived from sandbox IPs so recovery can match live devices
-	// back to allocator addresses without a separate registry.
+	// TAP names are the sandbox IPv4 so recovery can match live devices back to
+	// allocator addresses without a separate registry. Older runtimes prefixed
+	// the same IP with tapNamePrefix; recover still accepts those names.
 	tapNamePrefix    = "z"
 	virtioNetHdrSize = 12
 	tunDevicePath    = "/dev/net/tun"
@@ -77,8 +80,13 @@ type tapDevice struct {
 // TapDeviceAdapter isolates privileged netlink/TUN operations from controller
 // logic so tests can exercise state transitions without creating real devices.
 type TapDeviceAdapter interface {
+	// Create returns a TAP whose filter is already attached. The controller
+	// records the ifindex and does not call AttachFilter again.
 	Create(ip net.IP, mvmMacAddr string, mtu, cubeDevIdx int) (*tapDevice, error)
+	// Restore reconciles link state, MTU, and ARP. It does not attach the filter.
 	Restore(tap *tapDevice, mtu int, mvmMacAddr string, cubeDevIdx int) (*tapDevice, error)
+	// Quarantine disables traffic while policy cleanup is pending.
+	Quarantine(tap *tapDevice) error
 	Open(name string) (*os.File, error)
 	Close(file *os.File)
 	List() (map[string]*tapDevice, error)
@@ -87,11 +95,20 @@ type TapDeviceAdapter interface {
 }
 
 // realTapDeviceAdapter forwards calls to the Linux TAP implementation below.
-type realTapDeviceAdapter struct{}
+type realTapDeviceAdapter struct {
+	sandboxCIDR *net.IPNet
+}
 
-// newRealTapDeviceAdapter returns the production TAP adapter.
-func newRealTapDeviceAdapter() TapDeviceAdapter {
-	return realTapDeviceAdapter{}
+// newRealTapDeviceAdapter returns the production TAP adapter. sandboxCIDR
+// limits recover/list to TAP names whose decoded IPv4 sits in the configured
+// sandbox network; devices outside that prefix are treated as unrelated host
+// TAPs. If cidr does not parse, listCubeTaps claims no devices.
+func newRealTapDeviceAdapter(cidr string) TapDeviceAdapter {
+	var sandboxCIDR *net.IPNet
+	if _, n, err := net.ParseCIDR(cidr); err == nil {
+		sandboxCIDR = n
+	}
+	return realTapDeviceAdapter{sandboxCIDR: sandboxCIDR}
 }
 
 func (realTapDeviceAdapter) Create(ip net.IP, mvmMacAddr string, mtu, cubeDevIdx int) (*tapDevice, error) {
@@ -102,6 +119,24 @@ func (realTapDeviceAdapter) Restore(tap *tapDevice, mtu int, mvmMacAddr string, 
 	return restoreTap(tap, mtu, mvmMacAddr, cubeDevIdx)
 }
 
+func (realTapDeviceAdapter) Quarantine(tap *tapDevice) error {
+	if tap == nil || tap.Index <= 0 || tap.Name == "" {
+		return fmt.Errorf("missing TAP identity for quarantine")
+	}
+	link, err := netlinkLinkByIndex(tap.Index)
+	if err != nil {
+		return err
+	}
+	device, ok := link.(*netlink.Tuntap)
+	if !ok || device.Mode != netlink.TUNTAP_MODE_TAP || device.Name != tap.Name || device.Index != tap.Index {
+		return fmt.Errorf("TAP identity changed before quarantine: %s(%d)", tap.Name, tap.Index)
+	}
+	if err := netlinkLinkSetDown(link); err != nil {
+		return fmt.Errorf("disable TAP %s(%d): %w", tap.Name, tap.Index, err)
+	}
+	return nil
+}
+
 func (realTapDeviceAdapter) Open(name string) (*os.File, error) {
 	return openTapFdByName(name)
 }
@@ -110,12 +145,12 @@ func (realTapDeviceAdapter) Close(file *os.File) {
 	closeTapFile(file)
 }
 
-func (realTapDeviceAdapter) List() (map[string]*tapDevice, error) {
-	return listCubeTaps()
+func (a realTapDeviceAdapter) List() (map[string]*tapDevice, error) {
+	return listCubeTaps(a.sandboxCIDR)
 }
 
-func (realTapDeviceAdapter) GetByName(name string) (*tapDevice, error) {
-	return getTapByName(name)
+func (a realTapDeviceAdapter) GetByName(name string) (*tapDevice, error) {
+	return getTapByName(name, a.sandboxCIDR)
 }
 
 func (realTapDeviceAdapter) Destroy(ifIdx int) error {
@@ -215,8 +250,9 @@ func configureTapFD(fd int, name string) error {
 // tap device identified by name, WITHOUT any netlink/rtnl lookup. It is the hot
 // path used when the caller already knows the device exists and is fully set up
 // (e.g. a pooled tap whose fd was closed while idle). Compared to restoreTap it
-// avoids netlinkLinkByName (an rtnl read), LinkSetUp/SetMTU, the TC AttachFilter
-// and the ARP entry, all of which were already applied when the tap was created.
+// avoids netlinkLinkByName (an rtnl read), LinkSetUp/SetMTU, and the ARP entry,
+// all of which were already applied when the tap was created. Filter attachment
+// is owned by the controller, not by either of these helpers.
 // For recovering taps of unknown state (e.g. after a restart) use restoreTap.
 func openTapFdByName(name string) (*os.File, error) {
 	// Use unix.Ifreq (a properly-sized struct ifreq) rather than the local
@@ -248,9 +284,12 @@ func openTapFdByName(name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), tunDevicePath), nil
 }
 
-// restoreTap reconciles a live TAP discovered after restart. Recovery never
-// opens a TAP fd: fd ownership is acquired lazily by GetTapFile or by the
-// explicit reusable probe after cleanup.
+// restoreTap reconciles a live TAP discovered after restart: link up, MTU, and
+// ARP. It does not call AttachFilter. That work pays synchronize_rcu once per
+// missing inner map, so the controller attaches recovered devices in the
+// background and compensates on acquire. Recovery never opens a TAP fd: fd
+// ownership is acquired lazily by GetTapFile or by the explicit reusable probe
+// after cleanup.
 func restoreTap(tap *tapDevice, mtu int, mvmMacAddr string, cubeDevIdx int) (*tapDevice, error) {
 	if tap == nil {
 		return nil, fmt.Errorf("tap is nil")
@@ -291,9 +330,6 @@ func restoreTap(tap *tapDevice, mtu int, mvmMacAddr string, cubeDevIdx int) (*ta
 			return nil, err
 		}
 	}
-	if err := cubevs.AttachFilter(uint32(restored.Index)); err != nil {
-		return nil, err
-	}
 	if err := systemnet.AddARPEntry(restored.IP, mvmMacAddr, cubeDevIdx); err != nil && !errors.Is(err, syscall.EEXIST) {
 		return nil, err
 	}
@@ -301,8 +337,10 @@ func restoreTap(tap *tapDevice, mtu int, mvmMacAddr string, cubeDevIdx int) (*ta
 }
 
 // listCubeTaps returns live TAP devices whose names follow the runtime's
-// IP-derived naming convention, keyed by sandbox IP string.
-func listCubeTaps() (map[string]*tapDevice, error) {
+// IP-derived naming convention (bare IPv4 or legacy z+IPv4), keyed by sandbox
+// IP string. When sandboxCIDR is set, names that decode to an address outside
+// that prefix are ignored.
+func listCubeTaps(sandboxCIDR *net.IPNet) (map[string]*tapDevice, error) {
 	links, err := netlinkLinkList()
 	if err != nil {
 		return nil, err
@@ -313,12 +351,11 @@ func listCubeTaps() (map[string]*tapDevice, error) {
 		if !ok || tap.Mode != netlink.TUNTAP_MODE_TAP {
 			continue
 		}
-		ipStr, err := extractIP(tap.Name)
+		ip, err := parseCubeTapIP(tap.Name)
 		if err != nil {
 			continue
 		}
-		ip := net.ParseIP(ipStr).To4()
-		if ip == nil {
+		if sandboxCIDR == nil || !sandboxCIDR.Contains(ip) {
 			continue
 		}
 		ipToTap[ip.String()] = &tapDevice{
@@ -341,7 +378,7 @@ func isTapNotFound(err error) bool {
 }
 
 // getTapByName returns identity for one runtime-managed TAP by name.
-func getTapByName(name string) (*tapDevice, error) {
+func getTapByName(name string, sandboxCIDR *net.IPNet) (*tapDevice, error) {
 	link, err := netlinkLinkByName(name)
 	if err != nil {
 		return nil, err
@@ -350,13 +387,12 @@ func getTapByName(name string) (*tapDevice, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s is not tap", name)
 	}
-	ipStr, err := extractIP(tap.Name)
+	ip, err := parseCubeTapIP(tap.Name)
 	if err != nil {
 		return nil, err
 	}
-	ip := net.ParseIP(ipStr).To4()
-	if ip == nil {
-		return nil, fmt.Errorf("invalid tap ip for %s", name)
+	if sandboxCIDR != nil && !sandboxCIDR.Contains(ip) {
+		return nil, fmt.Errorf("not cube tap: %s", name)
 	}
 	return &tapDevice{
 		Name:  tap.Name,
@@ -444,14 +480,30 @@ func deletePersistentTapByName(name string) error {
 }
 
 // tapName derives the deterministic host TAP name for a sandbox IP.
+// New devices use the dotted IPv4; that string is at most 15 bytes and always
+// fits in kernel IFNAMSIZ (16 including the trailing NUL).
 func tapName(ip string) string {
+	return ip
+}
+
+// legacyTapName is the pre-rename host TAP name (z + IPv4). Recover and
+// conflict cleanup still look this up; new creates never use it.
+func legacyTapName(ip string) string {
 	return tapNamePrefix + ip
 }
 
-// extractIP reverses tapName and rejects unrelated host TAP devices.
-func extractIP(name string) (string, error) {
-	if len(name) <= len(tapNamePrefix) || name[:len(tapNamePrefix)] != tapNamePrefix {
-		return "", fmt.Errorf("not cube tap: %s", name)
+// candidateTapNames is the lookup order for an allocated sandbox IP: the
+// current name first, then the leftover z-prefixed device after upgrade.
+func candidateTapNames(ip string) []string {
+	return []string{tapName(ip), legacyTapName(ip)}
+}
+
+// parseCubeTapIP reverses tapName / legacyTapName. A leftover z prefix is
+// stripped and the remainder is parsed as IPv4.
+func parseCubeTapIP(name string) (net.IP, error) {
+	ip := net.ParseIP(strings.TrimPrefix(name, tapNamePrefix)).To4()
+	if ip == nil {
+		return nil, fmt.Errorf("not cube tap: %s", name)
 	}
-	return name[len(tapNamePrefix):], nil
+	return ip, nil
 }

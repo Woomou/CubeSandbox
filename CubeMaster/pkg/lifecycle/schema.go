@@ -11,8 +11,8 @@
 //     value=JSON snapshot. CLM HGETALL it on startup to bootstrap
 //     the registry.
 //   - cube:v1:shared:sandbox:lifecycle:events  Stream, append-only event
-//     log of create/delete/update/state operations. CLM consumes via
-//     XREADGROUP for incremental updates after the bootstrap.
+//     log of create/delete/update/state operations. Every CLM replica consumes
+//     it via XREAD so each warm standby maintains a complete registry.
 //
 // Stream events cover two classes of change:
 //
@@ -41,8 +41,8 @@ var (
 	// know about. Field = sandbox ID, value = JSON-encoded SandboxLifecycleMeta.
 	MetaKey = rediskey.SandboxLifecycleMeta()
 
-	// EventStreamKey is the append-only stream of create/delete events. The
-	// sidecar maintains a consumer group on it; entries trim with MAXLEN ~.
+	// EventStreamKey is the append-only stream of create/delete events. CLM
+	// replicas keep independent XREAD cursors; entries trim with MAXLEN ~.
 	EventStreamKey = rediskey.SandboxLifecycleEvents()
 )
 
@@ -98,12 +98,16 @@ type SandboxLifecycleMeta struct {
 	EndAt int64 `json:"end_at,omitempty"`
 }
 
-// State values carried by StatePayload.State. Only terminal states are
-// broadcast — transition markers ("pausing", "resuming") remain private to
-// the CLM's state-key coordination logic.
+// State values carried by StatePayload.State. Pause and resume broadcast
+// only their terminal states. Restart states are also broadcast so the CLM
+// can leave a sandbox alone while Cubelet is bringing it back. Transition
+// markers ("pausing", "resuming") stay private to the CLM.
 const (
-	StatePaused  = "paused"
-	StateRunning = "running"
+	StatePaused     = "paused"
+	StateRunning    = "running"
+	StateRestarting = "restarting"
+	StateBackOff    = "backoff"
+	StateGaveUp     = "gaveup"
 )
 
 // Actor values distinguishing who initiated the state change. The CLM
